@@ -662,11 +662,15 @@ Return ONLY the JSON array, no other text."""
             "full due diligence", "comprehensive due diligence", "end-to-end",
             "full m&a", "complete deal analysis", "investment committee",
         ))
+        # Narrowing to one agent removes coverage, so (like the planner) it
+        # needs a calibrated backend; LM Studio's self-reported confidence
+        # can pick the agent for a focused task but not shrink the scope.
         laya_narrow = bool(
             laya_agent
             and not broad_request
             and laya_triage
             and laya_triage.get("needs_deep_dive") is False
+            and laya_triage.get("backend") in ("local", "remote")
         )
         focused = not multi_workstream_request and (self._is_focused_request(task) or laya_narrow)
         if focused:

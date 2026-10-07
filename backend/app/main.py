@@ -3978,6 +3978,10 @@ async def laya_status(_: bool = Depends(require_admin_token)):
         "enabled": laya_configured(),
         "mode": client._mode(),
         "backend": client.backend,
+        # Only calibrated backends may skip review / narrow scope / drop tools
+        "calibrated": client.is_calibrated,
+        # Usage guardrails: call counts, failures, latency, circuit breaker
+        "usage": client.stats(),
         "lmstudio": lmstudio,
         "local": {"installed": client._local_importable()},
         "remote": {"url": client._remote_url()},

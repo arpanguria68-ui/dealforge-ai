@@ -147,7 +147,16 @@ class ConfidenceGate:
 
             gate = await get_laya_client().gate_confidence(output or "")
             if gate is not None:
-                if not needs_human and gate["combined"] >= 0.75 and gate["red_flag_p"] < 0.4:
+                # Skipping peer review removes scrutiny, so it needs every
+                # question answered by a calibrated backend. Uncalibrated
+                # (LM Studio) or partial answers may only escalate.
+                can_fast_pass = gate.get("complete") and gate.get("calibrated")
+                if (
+                    can_fast_pass
+                    and not needs_human
+                    and gate["combined"] >= 0.75
+                    and gate["red_flag_p"] < 0.4
+                ):
                     request = PeerValidationRequest(
                         deal_id=deal_id,
                         requesting_agent=agent_name,

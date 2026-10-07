@@ -1250,7 +1250,13 @@ class ToolRouter:
                 return fallback
             if res.confidence < 0.55:
                 return fallback
-            if res.answer == "none" and res.confidence >= 0.55:
+            # "No tools" strips the agent's data access, so only a calibrated
+            # backend may decide it; otherwise keep the keyword shortlist.
+            if (
+                res.answer == "none"
+                and res.confidence >= 0.55
+                and res.backend in ("local", "remote")
+            ):
                 return []
             if res.answer == "none":
                 return fallback
