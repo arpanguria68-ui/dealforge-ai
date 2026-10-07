@@ -1,0 +1,76 @@
+# FastAPI & Web
+fastapi
+uvicorn[standard]
+websockets
+python-socketio
+
+# Database
+sqlalchemy
+asyncpg
+aiosqlite
+alembic
+redis
+
+# LangGraph & AI
+langgraph
+langchain
+langchain-openai
+openai
+google-generativeai
+mistralai==1.1.0
+
+# Pydantic & Validation
+pydantic
+pydantic-settings
+
+# HTTP Clients
+httpx
+aiohttp
+requests
+yfinance
+
+# Document Processing
+pypdf
+python-docx
+openpyxl
+pandas
+
+# PageIndex (self-hosted RAG fallback will be used)
+pymupdf
+tiktoken
+pyyaml
+
+# External Data Tools
+duckduckgo-search
+beautifulsoup4
+financedatabase
+
+# Report Generation (McKinsey-style)
+python-pptx
+fpdf2
+
+# Utilities
+python-multipart
+python-jose[cryptography]
+passlib[bcrypt]
+python-dotenv
+structlog
+orjson
+
+# Testing
+pytest
+pytest-asyncio
+httpx
+
+# Visualization & Infographics
+matplotlib
+seaborn
+plotly
+kaleido
+reportlab
+xlsxwriter
+
+# Filing Due Diligence & Quant Tools
+scikit-learn
+nltk
+sec-api

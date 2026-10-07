@@ -1,0 +1,42 @@
+# DealForge AI Frontend — Docker Build
+# Build context: the 'app/' directory (project root React+Vite app)
+# This is separate from 'dealforge-ai/frontend/Dockerfile' — that one is for the legacy setup
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Copy package files first for layer caching
+COPY package.json package-lock.json* ./
+
+# Install deps (use npm ci for reproducible builds, fallback to npm install)
+RUN npm install --legacy-peer-deps
+
+# Copy full source
+COPY . .
+
+# Set API base to use the backend container name within Docker network
+# (In production, update this to your actual backend URL or use relative paths)
+ENV VITE_API_BASE=http://localhost:8005
+
+# Build for production
+RUN npm run build
+
+# ── Production stage: serve with nginx ──────────────────────────────
+FROM nginx:1.27-alpine
+
+# Set default PORT
+ENV PORT=80
+
+# Copy build artifacts
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# Copy nginx config template (from app/ directory)
+COPY nginx.conf /etc/nginx/conf.d/default.conf.template
+
+# Health check (wgets the dynamic port)
+HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://127.0.0.1:${PORT}/ || exit 1
+
+EXPOSE 80
+
+# Use envsubst to inject $PORT into the nginx config and then start nginx
+CMD ["sh", "-c", "envsubst '${PORT}' < /etc/nginx/conf.d/default.conf.template > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"]
