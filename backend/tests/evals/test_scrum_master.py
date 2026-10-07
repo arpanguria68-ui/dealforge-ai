@@ -1,26 +1,28 @@
+"""Supervisor planning/status contract tests; no LLM or external service needed."""
 import pytest
-from unittest.mock import Mock
-from .conftest import BENCHMARKS
-from backend.app.agents.ofas_supervisor import OFASSupervisorAgent as OfasSupervisor  # Assuming this is the scrum master
+
+from app.agents.ofas_supervisor import OFASSupervisorAgent
+
 
 @pytest.mark.asyncio
-async def test_scrum_master_collaboration():
-    supervisor = OfasSupervisor()
-    agents = [Mock() for _ in range(4)]
-    task = "Deal analysis"
-    
-    result = await supervisor.supervise(agents, task)
-    # Assert number of collaborations or quality
-    assert result.collaboration_score >= 4  # On a scale
+async def test_supervisor_plans_mission_with_raci_and_ready_tasks():
+    supervisor = OFASSupervisorAgent(llm_client=object())
+    result = await supervisor.run(
+        "Assess the target",
+        context={"action": "plan_mission", "deal_id": "eval-deal", "ticker": "EVAL"},
+    )
+    assert result.success
+    mission = result.data["mission"]
+    assert mission["deal_id"] == "eval-deal"
+    assert result.data["task_count"] == len(mission["tasks"]) > 0
+    assert result.data["ready_tasks"]
+    assert all("R" in task["raci"] and "A" in task["raci"] for task in mission["tasks"])
+
 
 @pytest.mark.asyncio
-async def test_scrum_master_error_handling():
-    supervisor = OfasSupervisor()
-    agents = [Mock(side_effect=Exception("Agent error"))]
-    task = "Task with error"
-    
-    result = await supervisor.supervise(agents, task)
-    assert result.recovered  # Assuming recovery mechanism
-
-# Tests for tool usage, completeness in supervision
-
+async def test_supervisor_rejects_unknown_action_without_crashing():
+    result = await OFASSupervisorAgent(llm_client=object()).run(
+        "noop", context={"action": "not-supported"}
+    )
+    assert not result.success
+    assert result.data["error"] == "Unknown action: not-supported"

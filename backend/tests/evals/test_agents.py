@@ -1,76 +1,49 @@
+"""Offline behavioral checks for agent contracts (not subjective LLM benchmarks)."""
 import pytest
-from .conftest import calculate_accuracy, calculate_completeness, BENCHMARKS
-from backend.app.agents.financial_analyst import FinancialAnalystAgent
-from backend.app.agents.legal_advisor import LegalAdvisorAgent
-# Import other agents as needed
+
+from app.agents.financial_analyst import FinancialAnalystAgent
+from app.agents.legal_advisor import LegalAdvisorAgent
+
 
 @pytest.mark.asyncio
-async def test_financial_analyst_accuracy(mock_financial_analyst):
-    # Mock input data
-    input_data = {"company": "TechCorp", "financials": {"revenue": 1000000}}
-    ground_truth = "Expected analysis output"
-    
-    output = await mock_financial_analyst.run(task="analyze financials", context=input_data)
-    # convert to string for matcher
-    text_output = str(output.data or output.reasoning or output)
-    accuracy = calculate_accuracy(text_output, ground_truth)
-    assert accuracy >= BENCHMARKS['accuracy']
+async def test_financial_analyst_input_only_calculates_supported_metrics(mock_financial_analyst, monkeypatch):
+    async def no_op_gate(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(mock_financial_analyst, "_apply_laya_output_gate", no_op_gate)
+    task = (
+        "Using only supplied figures; do not fetch external data. FY2023 revenue $20m, "
+        "FY2025 revenue $30m, EBITDA $4.5m, gross profit $10.8m, debt $20m, "
+        "cash $5m and enterprise value $90m. Calculate growth and valuation metrics."
+    )
+    result = await mock_financial_analyst.run(task=task, context={})
+    assert result.success
+    assert result.data["derived_growth"]["revenue_cagr_percent"] == pytest.approx(22.47, abs=0.02)
+    assert result.data["balance_sheet"]["net_debt"] == pytest.approx(15_000_000)
+    assert result.data["valuation"]["ev_ebitda_multiple"] == pytest.approx(20.0)
+    assert result.data["cash_flow"]["free_cash_flow"] is None
+
 
 @pytest.mark.asyncio
-async def test_financial_analyst_completeness(mock_financial_analyst):
-    input_data = {"company": "TechCorp", "financials": {"revenue": 1000000}}
-    required_elements = ["DCF", "LBO", "valuation"]
-    
-    output = await mock_financial_analyst.run(task="analyze financials", context=input_data)
-    text_output = str(output.data or output.reasoning or output)
-    completeness = calculate_completeness(text_output, required_elements)
-    assert completeness >= BENCHMARKS['completeness']
+async def test_financial_analyst_does_not_invent_missing_metrics(mock_financial_analyst):
+    task = "Use only supplied figures; do not fetch external data."
+    result = await mock_financial_analyst.run(task=task, context={})
+    assert not result.success
+    assert result.data["error"] == "input_metrics_not_found"
 
-@pytest.mark.asyncio
-async def test_financial_analyst_error_handling(mock_financial_analyst):
-    # Simulate error
-    input_data = {"invalid": "data"}
-    try:
-        output = await mock_financial_analyst.run(task="analyze", context=input_data)
-        text_output = str(output.data or output.reasoning or output)
-        # Assert agent returns a failure object rather than crashing
-        assert not output.success or "error" in text_output.lower()
-    except Exception as e:
-        pytest.fail(f"Unexpected error: {e}")
 
-# Similar tests for other agents, e.g., legal_advisor
+def test_legal_prompt_preserves_supplied_clause_and_limits():
+    agent = LegalAdvisorAgent(llm_client=object())
+    prompt = agent._build_analysis_prompt(
+        "Identify change-of-control exposure",
+        {"clauses": [{"text": "Consent required upon change of control."}]},
+        [],
+    )
+    assert "Consent required upon change of control." in prompt
+    assert "Identify change-of-control exposure" in prompt
+    assert "No legal documents retrieved" in prompt
 
-@pytest.mark.asyncio
-async def test_legal_advisor_accuracy():
-    # Fixture or mock here if not in conftest
-    agent = LegalAdvisorAgent()  # use agent class; mocking may be needed separately
-    input_data = {"contract": "Sample contract text"}
-    ground_truth = "Expected legal analysis"
-    
-    output = await agent.run(task="Legal analysis", context=input_data)
-    accuracy = calculate_accuracy(output, ground_truth)
-    assert accuracy >= BENCHMARKS['accuracy']
 
-# Add tests for tool usage, collaboration
-# For collaboration, mock other agents
-
-# Replication consistency test (part of quality overhaul)
-
-@pytest.mark.asyncio
-async def test_financial_analyst_replication(mock_financial_analyst):
-    input_data = {"company": "TechCorp", "financials": {"revenue": 1000000}}
-    outputs = []
-    for _ in range(3):
-        out = await mock_financial_analyst.run(task="analyze financials", context=input_data)
-        outputs.append(str(out.data or out.reasoning or out))
-    # calculate pairwise similarity
-    from difflib import SequenceMatcher
-    sims = []
-    for i in range(len(outputs)):
-        for j in range(i + 1, len(outputs)):
-            sims.append(SequenceMatcher(None, outputs[i], outputs[j]).ratio())
-    mean_sim = sum(sims) / len(sims) if sims else 1.0
-    assert mean_sim >= BENCHMARKS['replication_consistency']
-
-# More tests...
-
+def test_financial_input_only_intent_detection():
+    assert FinancialAnalystAgent.is_input_only_request("Use only supplied data; no external data")
+    assert not FinancialAnalystAgent.is_input_only_request("Fetch recent public financial statements")

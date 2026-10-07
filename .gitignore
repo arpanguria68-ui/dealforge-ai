@@ -38,3 +38,7 @@ temp_diff.txt
 .gemini/
 .env.docker
 *.json.bak
+*.log
+backend/data/pageindex/documents/
+gemini.env
+tmp/

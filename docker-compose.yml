@@ -23,6 +23,7 @@ services:
       # App config
       - REDIS_URL=redis://redis:6379/0
       - DEBUG=${DEBUG:-false}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001}
       - DEFAULT_LLM_PROVIDER=${DEFAULT_LLM_PROVIDER:-gemini}
       - PAGEINDEX_MODE=${PAGEINDEX_MODE:-local}
       - PYTHONUNBUFFERED=1
@@ -32,6 +33,8 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENROUTER_MODEL=${OPENROUTER_MODEL:-openai/gpt-4o-mini}
       # Financial Data API Keys
       - FMP_API_KEY=${FMP_API_KEY:-}
       - FINNHUB_API_KEY=${FINNHUB_API_KEY:-}
@@ -43,6 +46,27 @@ services:
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
       - MISTRAL_MODEL=${MISTRAL_MODEL:-mistral-large-latest}
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+      # NVIDIA
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
+      - NVIDIA_BASE_URL=${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      - NVIDIA_MODEL=${NVIDIA_MODEL:-z-ai/glm5}
+      # Vertex AI
+      - VERTEX_API_KEY=${VERTEX_API_KEY:-}
+      - VERTEX_PROJECT_ID=${VERTEX_PROJECT_ID:-}
+      - VERTEX_LOCATION=${VERTEX_LOCATION:-us-central1}
+      - VERTEX_MODEL=${VERTEX_MODEL:-gemini-1.5-flash-002}
+      # Search
+      - SERPER_API_KEY=${SERPER_API_KEY:-}
+      - SEARXNG_INSTANCE_URL=${SEARXNG_INSTANCE_URL:-}
+      - SEARXNG_API_KEY=${SEARXNG_API_KEY:-}
+      # Google Cloud
+      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT:-}
+      - GOOGLE_CLOUD_LOCATION=${GOOGLE_CLOUD_LOCATION:-global}
+      # PRD Settings
+      - MEMORY_STALENESS_DAYS=${MEMORY_STALENESS_DAYS:-30}
+      - DEAL_ISOLATION_MODE=${DEAL_ISOLATION_MODE:-true}
+      - SEARCH_CACHE_TTL=${SEARCH_CACHE_TTL:-86400}
+      - MAX_CLARIFICATION_DEPTH=${MAX_CLARIFICATION_DEPTH:-3}
     volumes:
       # Persist SQLite DBs across restarts (tasks, quality, items)
       - dealforge-db:/app/data

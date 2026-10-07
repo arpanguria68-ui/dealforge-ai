@@ -1,38 +1,45 @@
-import pytest
-from unittest.mock import Mock
-from .conftest import calculate_completeness, BENCHMARKS
-from backend.app.core.reports.report_generator import generate_pptx, generate_excel
+"""Validate generated deliverable artifacts, not synthetic expected prose."""
+from io import BytesIO
 
-@pytest.mark.asyncio
-async def test_report_completeness():
-    generator = ReportGenerator()
-    input_data = {"analysis": "Sample analysis data"}
-    required_sections = ["Executive Summary", "Financials", "Risks"]
-    
-    report = await generator.generate(input_data)
-    completeness = calculate_completeness(report, required_sections)
-    assert completeness >= BENCHMARKS['completeness']
+from app.core.reports.report_generator import generate_docx, generate_excel, generate_pdf, generate_pptx
 
-@pytest.mark.asyncio
-async def test_report_accuracy():
-    generator = ReportGenerator()
-    input_data = {"analysis": "Accurate data"}
-    ground_truth = "Expected report content"
-    
-    report = await generator.generate(input_data)
-    accuracy = calculate_accuracy(report, ground_truth)
-    assert accuracy >= BENCHMARKS['accuracy']
 
-@pytest.mark.asyncio
-async def test_report_error_handling():
-    generator = ReportGenerator()
-    input_data = {"invalid": "data"}
-    
-    try:
-        report = await generator.generate(input_data)
-        assert "default report" in report  # Assuming handling
-    except Exception as e:
-        pytest.fail(f"Unexpected error: {e}")
+def _sample():
+    return (
+        {"name": "Eval Target", "target_company": "Eval Target", "tenant_id": "default"},
+        {"executive_summary": {"situation": "Review of supplied, fictional case inputs."}},
+        [],
+    )
 
-# More tests for formatting, etc.
 
+def test_docx_is_valid_and_contains_deal_identity():
+    from docx import Document
+
+    deal, analysis, results = _sample()
+    payload = generate_docx(deal, analysis, results)
+    document = Document(BytesIO(payload))
+    text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+    assert payload.startswith(b"PK")
+    assert "Eval Target" in text
+
+
+def test_excel_is_valid_workbook_with_expected_tabs():
+    from openpyxl import load_workbook
+
+    deal, analysis, results = _sample()
+    payload = generate_excel(deal, analysis, results)
+    workbook = load_workbook(BytesIO(payload), read_only=True)
+    assert "Executive Summary" in workbook.sheetnames
+    assert len(workbook.sheetnames) >= 1
+
+
+def test_pdf_and_pptx_are_valid_container_outputs():
+    from pypdf import PdfReader
+    from pptx import Presentation
+
+    deal, analysis, results = _sample()
+    pdf = generate_pdf(deal, analysis, results)
+    pptx = generate_pptx(deal, analysis, results)
+    assert len(PdfReader(BytesIO(pdf)).pages) >= 1
+    presentation = Presentation(BytesIO(pptx))
+    assert len(presentation.slides) >= 1

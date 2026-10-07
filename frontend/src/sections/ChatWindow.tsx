@@ -1,18 +1,19 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import {
     Send, Paperclip, User, Loader2, Sparkles,
     TrendingUp, AlertTriangle, FileText, Scale, Brain,
     Download, ChevronRight, HelpCircle, Cpu, Cloud,
     ListChecks, CheckCircle2, Copy, Check, RotateCcw, Edit2,
-    Zap, Sliders, Star, Globe, BookOpen, Database, ChevronDown, ChevronUp
+    Zap, Sliders, Star, Globe, BookOpen, Database, ChevronDown, ChevronUp,
+    ThumbsUp, ThumbsDown, Quote
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useDealForgeStore } from '@/lib/dealforge-store';
-
-const API_BASE = (import.meta as any).env?.VITE_API_BASE || 'http://localhost:8005';
+import { API_BASE, withAdminAuth } from '@/lib/api-base';
 
 // ─── Types ───
 
@@ -25,13 +26,105 @@ interface Message {
     status?: 'thinking' | 'done' | 'error';
     provider?: string;
     dealId?: string;
-    metadata?: Record<string, unknown>;
+    metadata?: MessageMetadata;
     followUps?: string[];
     missingData?: string[];
 }
 
+interface MessageMetadata extends Record<string, unknown> {
+    action_id?: number;
+    _agentSummary?: string;
+    _agentDetail?: string;
+    pending_clarification?: boolean;
+    is_assumptions_summary?: boolean;
+    questions?: ClarificationQuestion[];
+    deal_id?: string;
+    original_prompt?: string;
+    clarification_round?: number;
+    qa_controls?: { can_ask_more?: boolean };
+    citations?: unknown;
+    confidence?: number;
+}
+
+interface ClarificationQuestion {
+    question: string;
+    reasoning?: string;
+}
+
+interface ClarificationAnswer {
+    question: string;
+    answer: string;
+}
+
+interface TaskPlanItem {
+    id?: string;
+    title: string;
+    description: string;
+    assigned_agent: string;
+    priority?: string;
+    status?: string;
+    result?: unknown;
+    depends_on?: string[];
+}
+
+interface AgentResult extends Record<string, unknown> {
+    _agent_type?: string;
+    agent?: string;
+    reasoning?: string;
+    confidence?: number;
+    execution_time_ms?: number;
+    provider?: string;
+    success?: boolean;
+    error?: string;
+    action_id?: number;
+    data?: Record<string, unknown>;
+}
+
+interface TaskListRecord {
+    id: string;
+    title?: string;
+    company_name?: string;
+    status?: string;
+    created_at?: string;
+    items?: TaskPlanItem[];
+}
+
+interface PlanResponse {
+    reasoning?: string;
+    data?: {
+        todo_list?: TaskListRecord;
+        laya_decision?: { selected_agent?: string };
+    };
+}
+
+function buildExecutionWaves(tasks: TaskPlanItem[], maxParallel = 3): TaskPlanItem[][] {
+    const taskIds = new Set(tasks.map(task => task.id).filter((id): id is string => Boolean(id)));
+    for (const task of tasks) {
+        for (const dependency of task.depends_on || []) {
+            if (!taskIds.has(dependency)) throw new Error(`Plan dependency ${dependency} is missing from the task list.`);
+        }
+    }
+    const pending = tasks.map((task, index) => ({ task, key: task.id || `index:${index}` }));
+    const completed = new Set<string>();
+    const waves: TaskPlanItem[][] = [];
+    while (pending.length) {
+        const ready = pending.filter(({ task }) => (task.depends_on || []).every(id => completed.has(id)));
+        if (!ready.length) throw new Error('The approved task plan contains a dependency cycle. No agents were run.');
+        for (let index = 0; index < ready.length; index += maxParallel) {
+            const wave = ready.slice(index, index + maxParallel);
+            waves.push(wave.map(entry => entry.task));
+            wave.forEach(entry => completed.add(entry.key));
+        }
+        const readyKeys = new Set(ready.map(entry => entry.key));
+        for (let index = pending.length - 1; index >= 0; index--) {
+            if (readyKeys.has(pending[index].key)) pending.splice(index, 1);
+        }
+    }
+    return waves;
+}
+
 type FocusMode = 'speed' | 'balanced' | 'quality';
-type Phase = 'idle' | 'brainstorming' | 'planning' | 'executing' | 'synthesizing';
+type Phase = 'idle' | 'brainstorming' | 'planning' | 'awaiting_approval' | 'executing' | 'synthesizing';
 type DataSource = 'financial' | 'web' | 'docs';
 
 // ─── Constants ───
@@ -69,16 +162,24 @@ const PHASE_LABELS: Record<Phase, { text: string; color: string }> = {
     idle: { text: '', color: '' },
     brainstorming: { text: 'Brainstorming', color: 'text-violet-400' },
     planning: { text: 'Building plan', color: 'text-cyan-400' },
+    awaiting_approval: { text: 'Awaiting approval', color: 'text-amber-400' },
     executing: { text: 'Agents running', color: 'text-amber-400' },
     synthesizing: { text: 'Synthesizing', color: 'text-emerald-400' },
 };
 
-// Speed mode: only top-3 critical
-const SPEED_AGENTS = new Set(['financial_analyst', 'risk_assessor', 'market_researcher']);
-
 // ─── Helpers ───
 
-function generateContextAwareFollowUps(completedResults: any[], taskList: any[], companyName: string): string[] {
+function generateContextAwareFollowUps(completedResults: AgentResult[], taskList: TaskPlanItem[], companyName: string): string[] {
+    const sourceOnlyResults = completedResults.length > 0 && completedResults.every(
+        result => result?.data?.confidence_basis === 'not_calibrated_source_report'
+    );
+    if (sourceOnlyResults) {
+        return [
+            `Show cash flow and balance-sheet metrics with period-specific filing citations for ${companyName}`,
+            `Explain the reported revenue growth calculation for ${companyName}`,
+        ];
+    }
+
     const suggestions: string[] = [];
 
     for (let i = 0; i < completedResults.length; i++) {
@@ -113,6 +214,12 @@ function generateContextAwareFollowUps(completedResults: any[], taskList: any[],
 function detectMissingData(dealText: string): string[] {
     const missing: string[] = [];
     const lower = dealText.toLowerCase();
+    const factualPublicDataRequest = /\b(fetch|retrieve|report|show|list)\b/.test(lower)
+        && /\b(revenue|financial statements?)\b/.test(lower)
+        && /\b(sec|10-k|ticker|public company|filing)\b/.test(lower)
+        && !/\b(valuation|dcf|lbo|recommendation|investment thesis|risk assessment)\b/.test(lower);
+    if (factualPublicDataRequest) return [];
+
     if (!/\$[\d.,]+[mbk]?\b/i.test(dealText) && !lower.includes('revenue') && !lower.includes('arr'))
         missing.push('Annual revenue or ARR');
     if (!lower.includes('ebitda') && !lower.includes('profit') && !lower.includes('margin'))
@@ -122,15 +229,83 @@ function detectMissingData(dealText: string): string[] {
     return missing.slice(0, 3);
 }
 
+function getInitials(name: string): string {
+    return name
+        .split(/[\s_]+/)
+        .filter(Boolean)
+        .slice(0, 2)
+        .map(w => w[0]?.toUpperCase() || '')
+        .join('') || '?';
+}
+
+interface Citation {
+    label: string;
+    source: string;
+}
+
+// Normalize metadata.citations from the backend (RAG v2 responses) into
+// displayable label/source pairs. Accepts strings or {label,source} objects.
+function normalizeCitations(raw: unknown): Citation[] {
+    if (!raw || !Array.isArray(raw)) return [];
+    return (raw as unknown[]).slice(0, 8).map((c, i) => {
+        if (typeof c === 'string') {
+            const m = c.match(/^(.*?)\s*[›|]\s*(.*)$/);
+            return {
+                label: m ? m[1].trim() : `Source ${i + 1}`,
+                source: m ? m[2].trim() : c.slice(0, 120),
+            };
+        }
+        const entry = c && typeof c === 'object' ? c as Record<string, unknown> : {};
+        return {
+            label: String(entry.label || entry.filename || entry.title || `Source ${i + 1}`),
+            source: String(entry.source || entry.citation || entry.chunk_id || ''),
+        };
+    }).filter(c => c.label || c.source);
+}
+
 function extractCompanyName(text: string): string {
+    const tickerMatch = text.match(/\b([A-Z][\w&.'-]*(?:\s+[A-Z][\w&.'-]*){0,5})\s+\((?:(?:NASDAQ|NYSE|NYSEAMERICAN|AMEX|OTC)\s*:\s*)?[A-Z]{1,5}\)/);
+    if (tickerMatch) {
+        return tickerMatch[1].replace(/^(?:fetch|analyze|research|assess|review|screen)\s+/i, '').trim();
+    }
+    const explicit = text.match(/\bfictional\s+([A-Z][\w&.'-]*(?:\s+[A-Z][\w&.'-]*){0,3})(?=\s*(?:[:,.;]|$))/i)
+        || text.match(/\b(?:for|of)\s+(?:the\s+)?([A-Z][\w&.'-]*(?:\s+[A-Z][\w&.'-]*){0,3})(?=\s*(?:[:,.;]|$))/i);
+    if (explicit) return explicit[1].trim();
+    const subject = text.match(/\b(?:fetch|analyze|research|assess|review|screen|value|evaluate)\s+(?:the\s+)?([A-Z][\w&.'-]*(?:\s+[A-Z][\w&.'-]*){0,5}?)(?=\s+(?:using|with|from|for|based|and)\b|\s*[,;:]|\s*$)/i);
+    if (subject) return subject[1].trim();
     const match = text.match(/(?:acquire|acquisition of|merge with|analyze|buy)\s+([A-Z][a-zA-Z\s]+(?:Corp|Inc|LLC|Ltd|Co)?)/i);
-    return match ? match[1].trim() : text.substring(0, 40);
+    return match ? match[1].trim() : 'Target Company';
 }
 
 function formatAgentSummaryLine(agentLabel: string, result: Record<string, unknown>): string {
-    const confidence = typeof result.confidence === 'number' ? `${Math.round((result.confidence as number) * 100)}%` : 'N/A';
+    const data = result.data && typeof result.data === 'object' ? result.data as Record<string, unknown> : {};
+    if (data.confidence_basis === 'not_calibrated_source_report' || data.synthesis_status === 'deterministic_source_report') {
+        const sourceLabel = data.data_source === 'sec_edgar_companyfacts' ? 'SEC-sourced facts' : 'Vendor-sourced facts';
+        const time = typeof result.execution_time_ms === 'number' ? ` · ${Math.round(result.execution_time_ms as number)}ms` : '';
+        const synthesis = data.synthesis_status === 'partial_provider_unavailable'
+            ? '; model synthesis incomplete' : '';
+        return `**${agentLabel}** — ${sourceLabel}${synthesis}; confidence not calibrated${time}`;
+    }
+    const calibrated = data.confidence_calibrated === true
+        || data.confidence_basis === 'calibrated'
+        || data.confidence_basis === 'validated_calibration';
+    const confidence = calibrated && typeof result.confidence === 'number'
+        ? `${Math.round((result.confidence as number) * 100)}%`
+        : 'not calibrated';
     const time = typeof result.execution_time_ms === 'number' ? `${Math.round(result.execution_time_ms as number)}ms` : '';
-    return `**${agentLabel}** — Confidence: ${confidence}${time ? ` · ${time}` : ''}`;
+    return `**${agentLabel}** — ${calibrated ? `Confidence: ${confidence}` : `Agent-reported confidence; not calibrated`}${time ? ` · ${time}` : ''}`;
+}
+
+function extractDealScore(results: AgentResult[]): number | null {
+    for (const result of results) {
+        if (!String(result?._agent_type || '').includes('scoring')) continue;
+        const data = result.data || {};
+        const raw = Number(data.deal_score ?? data.score ?? data.total_score);
+        if (Number.isFinite(raw) && raw >= 0 && raw <= 100) {
+            return raw > 1 ? raw / 100 : raw;
+        }
+    }
+    return null;
 }
 
 function formatAgentDetailBody(result: Record<string, unknown>): string {
@@ -138,6 +313,106 @@ function formatAgentDetailBody(result: Record<string, unknown>): string {
 
     if (result.data && typeof result.data === 'object') {
         const data = result.data as Record<string, unknown>;
+        const historical = Array.isArray(data.historical_financials)
+            ? data.historical_financials as Record<string, unknown>[]
+            : [];
+        const revenueAnalysis = data.revenue_analysis && typeof data.revenue_analysis === 'object'
+            ? data.revenue_analysis as Record<string, unknown>
+            : {};
+        const profitability = data.profitability && typeof data.profitability === 'object'
+            ? data.profitability as Record<string, unknown>
+            : {};
+        const cashFlow = data.cash_flow && typeof data.cash_flow === 'object'
+            ? data.cash_flow as Record<string, unknown>
+            : {};
+        const balanceSheet = data.balance_sheet && typeof data.balance_sheet === 'object'
+            ? data.balance_sheet as Record<string, unknown>
+            : {};
+        const keyFindings = Array.isArray(data.key_findings)
+            ? data.key_findings as Record<string, unknown>[]
+            : [];
+
+        if (historical.length || Object.keys(revenueAnalysis).length) {
+            const amount = (value: unknown) => {
+                if (typeof value !== 'number' || !Number.isFinite(value)) return 'Unknown';
+                if (Math.abs(value) >= 1_000_000_000) return `$${(value / 1_000_000_000).toFixed(1)}bn`;
+                if (Math.abs(value) >= 1_000_000) return `$${(value / 1_000_000).toFixed(1)}m`;
+                return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(value);
+            };
+            const pct = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(2)}%` : 'Unknown';
+            const isSuppliedInput = (row: Record<string, unknown>) =>
+                typeof row.source_type === 'string' && row.source_type.startsWith('user_supplied');
+            const suppliedInputs = historical.some(isSuppliedInput);
+            const rows = historical.map(row => {
+                const year = String(row.fiscal_year || row.period || 'Unknown');
+                if (isSuppliedInput(row)) {
+                    const provenance = row.source_type === 'user_supplied_shorthand_inferred'
+                        ? 'Supplied; metric mapping inferred, verify'
+                        : 'Supplied; unverified';
+                    return `| ${year} | ${amount(row.revenue)} | ${amount(row.gross_profit)} | ${amount(row.ebitda)} | ${provenance} |`;
+                }
+                const endDate = String(row.period_end_date || 'Unknown');
+                const sourceUrl = typeof row.source_url === 'string' ? row.source_url : '';
+                const filing = sourceUrl ? `[${String(row.filing_form || 'SEC filing')}${row.filing_date ? `, filed ${row.filing_date}` : ''}](${sourceUrl})` : 'Source link unavailable';
+                return `| ${year} | ${endDate} | ${amount(row.revenue)} | ${pct(row.revenue_yoy_percent)} | ${amount(row.net_income)} | ${pct(row.operating_margin_percent)} | ${filing} |`;
+            });
+            if (keyFindings.length) {
+                const findingSource = suppliedInputs ? 'derived from supplied, unverified inputs' : 'derived from reported financial data';
+                output += `\n\n### Key Findings\n\n${keyFindings.map(finding => `- ${String(finding.text || 'Finding not established')} (${findingSource})`).join('\n')}`;
+            }
+            if (historical.length) {
+                output += suppliedInputs
+                    ? `\n\n---\n\n### Supplied Financial Inputs (Unverified)\n\n| Fiscal year | Revenue (USD) | Gross profit (USD) | EBITDA (USD) | Provenance |\n| --- | ---: | ---: | ---: | --- |\n${rows.join('\n')}`
+                    : `\n\n---\n\n### Reported Financial Data\n\n| Fiscal year | Period end | Revenue (USD) | YoY growth (derived) | Net income (USD) | Operating margin | Filing source |\n| --- | --- | ---: | ---: | ---: | ---: | --- |\n${rows.join('\n')}`;
+            } else {
+                output += '\n\n---\n\n### Financial Snapshot';
+            }
+            if (!historical.length && revenueAnalysis.annual_revenue !== undefined) {
+                const revenueLabel = revenueAnalysis.growth_basis === 'user supplied' ? 'Latest supplied revenue' : 'Latest reported revenue';
+                output += `\n\n${revenueLabel}: ${amount(revenueAnalysis.annual_revenue)}. Growth: ${pct(revenueAnalysis.growth_rate)}.`;
+            }
+            const valuation = data.valuation && typeof data.valuation === 'object'
+                ? data.valuation as Record<string, unknown> : {};
+            const valuationEntries = Object.entries(valuation).filter(
+                ([key, value]) => /dcf_estimate|multiple_estimate|enterprise_value|equity_value|ev_ebitda_multiple/.test(key)
+                    && typeof value === 'number' && Number.isFinite(value)
+            );
+            const valuationText = valuationEntries.length
+                ? valuationEntries.map(([key, value]) => `${key.replace(/_/g, ' ')}: ${key === 'ev_ebitda_multiple' ? `${Number(value).toFixed(2)}x` : amount(value)}`).join('; ')
+                : (data.valuation ? 'Not estimated' : 'Unknown');
+            output += `\n\nEBITDA: ${amount(profitability.ebitda)}. Valuation: ${valuationText}.`;
+            if (profitability.gross_margin !== undefined || profitability.operating_margin !== undefined) {
+                output += ` Profitability margins: gross ${pct(profitability.gross_margin)}; operating ${pct(profitability.operating_margin)}.`;
+            }
+            if (balanceSheet.cash !== undefined || balanceSheet.long_term_debt !== undefined || balanceSheet.debt !== undefined) {
+                const debtValue = balanceSheet.long_term_debt ?? balanceSheet.debt;
+                output += ` Balance sheet: cash ${amount(balanceSheet.cash)}${balanceSheet.cash_fiscal_year ? ` (${balanceSheet.cash_fiscal_year})` : ''}; debt ${amount(debtValue)}${balanceSheet.debt_fiscal_year ? ` (${balanceSheet.debt_fiscal_year})` : ''}.`;
+            }
+            if (cashFlow.operating_cash_flow !== undefined) {
+                const cashFlowYear = typeof cashFlow.fiscal_year === 'string' ? ` for ${cashFlow.fiscal_year}` : '';
+                const capexYear = typeof cashFlow.capital_expenditures_fiscal_year === 'string'
+                    ? ` for ${cashFlow.capital_expenditures_fiscal_year}` : '';
+                const freeCashFlowYear = typeof cashFlow.free_cash_flow_fiscal_year === 'string'
+                    ? ` for ${cashFlow.free_cash_flow_fiscal_year}` : '';
+                const sourceLink = (url: unknown) => typeof url === 'string' && url ? ` ([source](${url}))` : '';
+                const freeCashFlowSources = Array.isArray(cashFlow.free_cash_flow_source_urls)
+                    ? [...new Set(cashFlow.free_cash_flow_source_urls.filter((url): url is string => typeof url === 'string' && Boolean(url)))]
+                    : [];
+                const freeCashFlowSource = freeCashFlowSources.length
+                    ? ` (calculation sources: ${freeCashFlowSources.map(url => `[source](${url})`).join(', ')})` : '';
+                output += ` Operating cash flow${cashFlowYear}: ${amount(cashFlow.operating_cash_flow)}${sourceLink(cashFlow.operating_cash_flow_source_url)}; capital expenditures${capexYear}: ${amount(cashFlow.capital_expenditures)}${sourceLink(cashFlow.capital_expenditures_source_url)}; free cash flow${freeCashFlowYear}: ${amount(cashFlow.free_cash_flow)}${freeCashFlowSource}.`;
+            }
+            if (typeof data.synthesis_status === 'string') {
+                output += `\n\nSynthesis status: ${data.synthesis_status.replace(/_/g, ' ')}.`;
+            }
+            if (typeof data.provider_warning === 'string' && data.provider_warning) {
+                output += ` Model note: ${data.provider_warning}`;
+            }
+            if (Array.isArray(data.data_limitations) && data.data_limitations.length) {
+                output += `\n\nData limitations:\n${data.data_limitations.map(item => `- ${String(item)}`).join('\n')}`;
+            }
+        }
+
         const longFormKeys = ['memo', 'report', 'markdown', 'content', 'executive_summary'];
         
         for (const key of longFormKeys) {
@@ -150,66 +425,102 @@ function formatAgentDetailBody(result: Record<string, unknown>): string {
     return output;
 }
 
-function buildSynthesisMessage(completedResults: any[], taskList: any[], companyName: string): string {
-    let md = `## 📊 Executive Summary — ${companyName}\n\n`;
-    const metrics: { metric: string; value: string; source: string }[] = [];
-    let recommendation = '';
+function buildSynthesisMessage(completedResults: AgentResult[], taskList: TaskPlanItem[], companyName: string, failedCount: number): string {
+    const metrics: { metric: string; value: string; period: string; source: string }[] = [];
     const risks: string[] = [];
-    let dealScore = 0;
-    let overallConfidence = 0;
-    let agentCount = 0;
+    const findings: string[] = [];
+    const limitations = new Set<string>();
+    let recommendation = '';
+    let dealScore: number | null = null;
+    let sourceCount = 0;
+    let synthesisIncomplete = false;
 
-    for (let i = 0; i < completedResults.length; i++) {
-        const r = completedResults[i];
-        const agent = taskList[i]?.assigned_agent || '';
-        const agentLabel = agent.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase());
-        const reasoning = (r?.reasoning || '').substring(0, 500);
-        const data = r?.data || {};
-        const confidence = r?.confidence ?? 0.5;
-        overallConfidence += confidence;
-        agentCount++;
+    const addMetric = (metric: string, value: unknown, period: unknown, source: string) => {
+        if ((typeof value === 'number' && Number.isFinite(value)) || (typeof value === 'string' && value.trim())) {
+            metrics.push({ metric, value: String(value), period: typeof period === 'string' ? period : 'Not established', source });
+        }
+    };
+
+    for (const result of completedResults) {
+        const agent = result._agent_type || result.agent || 'unknown';
+        const label = agent.replace(/_/g, ' ').replace(/\b\w/g, (char: string) => char.toUpperCase());
+        const data = result.data || {};
+        const historical = Array.isArray(data.historical_financials)
+            ? [...data.historical_financials as Record<string, unknown>[]].sort((a, b) =>
+                String(a.period || '').localeCompare(String(b.period || ''), undefined, { numeric: true })) : [];
+        const latest = historical.at(-1) || {};
+        const revenue = data.revenue_analysis && typeof data.revenue_analysis === 'object'
+            ? data.revenue_analysis as Record<string, unknown> : {};
+        const profitability = data.profitability && typeof data.profitability === 'object'
+            ? data.profitability as Record<string, unknown> : {};
+        const cashFlow = data.cash_flow && typeof data.cash_flow === 'object'
+            ? data.cash_flow as Record<string, unknown> : {};
+        const balance = data.balance_sheet && typeof data.balance_sheet === 'object'
+            ? data.balance_sheet as Record<string, unknown> : {};
 
         if (agent.includes('financial')) {
-            if (data.revenue) metrics.push({ metric: 'Revenue', value: String(data.revenue), source: agentLabel });
-            if (data.ebitda) metrics.push({ metric: 'EBITDA', value: String(data.ebitda), source: agentLabel });
-            if (data.net_income) metrics.push({ metric: 'Net Income', value: String(data.net_income), source: agentLabel });
+            addMetric('Revenue', revenue.annual_revenue ?? latest.revenue, latest.fiscal_year || latest.period, label);
+            addMetric('Revenue growth', revenue.growth_rate ?? latest.revenue_yoy_percent, latest.fiscal_year || latest.period, label);
+            addMetric('Operating margin', profitability.operating_margin ?? latest.operating_margin_percent, latest.fiscal_year || latest.period, label);
+            addMetric('Net income', profitability.net_income ?? latest.net_income, latest.fiscal_year || latest.period, label);
+            addMetric('Operating cash flow', cashFlow.operating_cash_flow, cashFlow.fiscal_year, label);
+            addMetric('Capital expenditures', cashFlow.capital_expenditures, cashFlow.capital_expenditures_fiscal_year, label);
+            addMetric('Free cash flow', cashFlow.free_cash_flow, cashFlow.free_cash_flow_fiscal_year, label);
+            addMetric('Cash', balance.cash, balance.cash_fiscal_year, label);
+            addMetric('Long-term debt', balance.long_term_debt, balance.debt_fiscal_year, label);
+            const sourceRows = Array.isArray(data.sources) ? data.sources : [];
+            sourceCount += sourceRows.filter(source => source && typeof source === 'object' && 'url' in source).length;
         }
-        if (agent.includes('valuation') || agent.includes('dcf')) {
-            if (data.valuation_range) metrics.push({ metric: 'Valuation Range', value: String(data.valuation_range), source: agentLabel });
-            if (data.implied_multiple) metrics.push({ metric: 'Implied Multiple', value: String(data.implied_multiple), source: agentLabel });
+
+        const riskRows = [data.risks, data.key_risks, data.top_risks].filter(Array.isArray).flat() as unknown[];
+        for (const item of riskRows) {
+            const text = typeof item === 'string' ? item
+                : item && typeof item === 'object'
+                    ? String((item as Record<string, unknown>).description || (item as Record<string, unknown>).risk || (item as Record<string, unknown>).text || '')
+                    : '';
+            if (text && !risks.includes(text)) risks.push(text);
         }
-        if (agent.includes('risk')) {
-            const riskItems = Array.isArray(data.key_risks) ? data.key_risks : [];
-            risks.push(...riskItems.map((ri: any) => typeof ri === 'string' ? ri : ri?.description || '').filter(Boolean).slice(0, 3));
-            if (!risks.length && reasoning) {
-                risks.push(...reasoning.split(/[.!]/).filter((s: string) => s.toLowerCase().includes('risk')).slice(0, 2).map((s: string) => s.trim()).filter(Boolean));
-            }
+        for (const item of Array.isArray(data.key_findings) ? data.key_findings : []) {
+            const text = typeof item === 'string' ? item : item && typeof item === 'object'
+                ? String((item as Record<string, unknown>).text || '') : '';
+            if (text && !findings.includes(text)) findings.push(text);
         }
-        if (agent.includes('scoring') || agent.includes('complex_reasoning')) {
-            if (data.recommendation) recommendation = String(data.recommendation);
-            if (data.deal_score) dealScore = Number(data.deal_score);
+        for (const gap of [...(Array.isArray(data.data_limitations) ? data.data_limitations : []), ...(Array.isArray(data.data_gaps) ? data.data_gaps : [])]) {
+            if (typeof gap === 'string' && gap.trim()) limitations.add(gap.trim());
+        }
+        if (data.synthesis_status === 'partial_provider_unavailable' || data.synthesis_status === 'deterministic_source_report') synthesisIncomplete = true;
+        if (typeof data.provider_warning === 'string' && data.provider_warning) limitations.add(`Model synthesis unavailable: ${data.provider_warning}`);
+        if (typeof data.recommendation === 'string' && data.recommendation.trim()) recommendation ||= data.recommendation;
+        if (agent.includes('scoring')) {
+            const candidate = Number(data.deal_score ?? data.score ?? data.total_score);
+            if (Number.isFinite(candidate) && candidate >= 0 && candidate <= 100) dealScore = candidate > 1 ? candidate : candidate * 100;
         }
     }
 
-    const avgConf = agentCount > 0 ? Math.round((overallConfidence / agentCount) * 100) : 0;
-    if (!dealScore && agentCount > 0) dealScore = Math.round((overallConfidence / agentCount) * 100);
-    if (recommendation) md += `> ${recommendation.substring(0, 300)}\n\n`;
+    const seenMetrics = new Set<string>();
+    const uniqueMetrics = metrics.filter(metric => {
+        const key = `${metric.metric}:${metric.period}:${metric.value}`;
+        if (seenMetrics.has(key)) return false;
+        seenMetrics.add(key);
+        return true;
+    });
+    let md = `## Executive Brief — ${companyName}\n\n`;
+    md += `**Review status:** ${failedCount || synthesisIncomplete ? 'Incomplete — human review required' : 'Analysis tasks completed; findings remain subject to source verification'}. `;
+    md += `${completedResults.length}/${taskList.length} tasks returned results`;
+    if (failedCount) md += `; ${failedCount} failed or were blocked`;
+    md += `; ${sourceCount} financial source records captured.\n\n`;
+    md += `**Decision:** ${recommendation ? recommendation.slice(0, 500) : 'No supported transaction recommendation recorded.'}`;
+    if (dealScore !== null) md += `\n\n**Recorded score:** ${dealScore}/100 (model/agent output; not independently calibrated).`;
+    else md += `\n\n**Score:** Not scored.`;
 
-    if (metrics.length > 0) {
-        md += `### Key Metrics\n\n| Metric | Value | Source |\n|--------|-------|--------|\n`;
-        metrics.forEach(m => { md += `| ${m.metric} | ${m.value} | ${m.source} |\n`; });
-        md += `\n`;
+    if (uniqueMetrics.length) {
+        md += `\n\n### Evidence Snapshot\n\n| Measure | Recorded value | Period | Producing agent |\n| --- | ---: | --- | --- |\n`;
+        for (const metric of uniqueMetrics.slice(0, 12)) md += `| ${metric.metric} | ${metric.value} | ${metric.period} | ${metric.source} |\n`;
     }
-
-    if (risks.length > 0) {
-        md += `### ⚠️ Key Risk Factors\n\n`;
-        risks.slice(0, 5).forEach(r => { md += `- ${r}\n`; });
-        md += `\n`;
-    }
-
-    const scoreEmoji = dealScore >= 75 ? '🟢' : dealScore >= 50 ? '🟡' : '🔴';
-    md += `---\n\n**${scoreEmoji} Deal Score: ${dealScore}/100** · Overall Confidence: ${avgConf}% · ${agentCount} Agents Completed\n\n`;
-    md += `*Click on any agent above to expand their full reasoning and data.*`;
+    if (findings.length) md += `\n\n### Derived Findings\n\n${findings.slice(0, 4).map(item => `- ${item}`).join('\n')}`;
+    if (risks.length) md += `\n\n### Key Risks\n\n${risks.slice(0, 5).map(item => `- ${item}`).join('\n')}`;
+    if (limitations.size) md += `\n\n### Diligence Gaps and Caveats\n\n${[...limitations].slice(0, 6).map(item => `- ${item}`).join('\n')}`;
+    md += `\n\n*Values and claims above are reproduced from agent outputs; inspect linked evidence in each agent’s detail. Missing values are not zero. Model confidence scores are not calibrated.*`;
     return md;
 }
 
@@ -331,43 +642,210 @@ export function ChatWindow() {
 
     // Hydrate from Redis on mount (primary persistence)
     useEffect(() => {
-        store.loadFromBackend();
+        void useDealForgeStore.getState().loadFromBackend();
     }, []);
 
     useEffect(() => {
-        if (!activeConv) {
-            const convId = store.createConversation();
-            store.addMessage(convId, {
+        if (!useDealForgeStore.getState().getActiveConversation()) {
+            const currentStore = useDealForgeStore.getState();
+            const convId = currentStore.createConversation();
+            currentStore.addMessage(convId, {
                 role: 'system',
                 content: 'Welcome to **DealForge AI**. Describe a deal and our multi-agent team will analyze it end-to-end.\n\nTry: *"Analyze the acquisition of Stripe, a SaaS company with $50M ARR"*',
                 agentName: 'DealForge AI',
             });
         }
-    }, []);
+    }, [activeConv?.id]);
 
-    const messages: Message[] = (activeConv?.messages || []).map((m: any) => ({
+    const messages: Message[] = (activeConv?.messages || []).map(m => ({
         id: m.id, role: m.role, content: m.content, agentName: m.agentName,
         timestamp: new Date(m.timestamp), status: m.status, provider: m.provider,
         followUps: m.followUps, missingData: m.missingData, metadata: m.metadata,
     }));
+    const lastUserMessageIndex = messages.reduce((last, message, index) => message.role === 'user' ? index : last, -1);
+    const currentTurnAgentError = messages.some((message, index) =>
+        index > lastUserMessageIndex && message.role === 'agent' && message.status === 'error'
+    );
 
     // ─── State ───
     const [input, setInput] = useState('');
     const [phase, setPhase] = useState<Phase>('idle');
     const [activeDealId, setActiveDealId] = useState<string | null>(activeConv?.dealId || null);
     const [dealCompleted, setDealCompleted] = useState(false);
-    const completedResultsRef = useRef<any[]>([]);
-    const taskListRef = useRef<any[]>([]);
+    const completedResultsRef = useRef<AgentResult[]>([]);
+    const taskListRef = useRef<TaskPlanItem[]>([]);
     const [collapsedAgents, setCollapsedAgents] = useState<Record<string, boolean>>({});
     const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
     const [followUps, setFollowUps] = useState<string[]>([]);
     const [copiedId, setCopiedId] = useState<string | null>(null);
+    const [ratedIds, setRatedIds] = useState<Record<number, 'up' | 'down'>>({});
     const [editingMsgId, setEditingMsgId] = useState<string | null>(null);
     const [editValue, setEditValue] = useState('');
     const [focusMode, setFocusMode] = useState<FocusMode>('balanced');
     const [activeSources, setActiveSources] = useState<DataSource[]>(['financial', 'docs']);
     const [focusOpen, setFocusOpen] = useState(false);
     const [executingProgress, setExecutingProgress] = useState({ done: 0, total: 0 });
+    const [approvalRequest, setApprovalRequest] = useState<{
+        taskCount: number;
+        resolve: (approved: boolean) => void;
+    } | null>(null);
+    const eventSourceRef = useRef<EventSource | null>(null);
+
+    // Use ref to avoid stale closure issues
+    const addMessageRef = useRef(addMessage);
+    addMessageRef.current = addMessage;
+
+    // SSE streaming connection (with exponential-backoff reconnect)
+    const sseRetryRef = useRef(0);
+    const sseManualCloseRef = useRef(false);
+    const sseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const SSE_MAX_RETRIES = 5;
+
+    const connectSSE = useCallback((dealId: string) => {
+        if (eventSourceRef.current) {
+            eventSourceRef.current.close();
+        }
+        if (sseTimerRef.current) {
+            clearTimeout(sseTimerRef.current);
+            sseTimerRef.current = null;
+        }
+        sseManualCloseRef.current = false;
+        sseRetryRef.current = 0;
+
+        const openStream = () => {
+            const eventSource = new EventSource(`${API_BASE}/api/v1/stream/events/${dealId}`);
+            eventSourceRef.current = eventSource;
+
+            eventSource.addEventListener('connected', () => {
+                sseRetryRef.current = 0; // reset backoff on healthy connect
+            });
+
+        eventSource.addEventListener('agent_starting', (e) => {
+            const data = JSON.parse(e.data);
+            addMessageRef.current({
+                role: 'agent',
+                agentName: data.agent_type.replace(/_/g, ' ').replace(/\b\w/g, (l: string) => l.toUpperCase()),
+                content: `▶ **${data.task_title}** — Starting...`,
+                status: 'thinking',
+            });
+        });
+
+        eventSource.addEventListener('agent_progress', (e) => {
+            const data = JSON.parse(e.data);
+            setExecutingProgress(prev => ({ ...prev, progress: data.progress || 0 }));
+        });
+
+        eventSource.addEventListener('agent_completed', (e) => {
+            const data = JSON.parse(e.data);
+            setExecutingProgress(prev => ({ done: prev.done + 1, total: prev.total }));
+            const agentLabel = (data.agent_type || '').replace(/_/g, ' ').replace(/\b\w/g, (l: string) => l.toUpperCase());
+            addMessageRef.current({
+                role: 'agent',
+                agentName: agentLabel,
+                content: data.reasoning || `Analysis complete.`,
+                status: 'done',
+                provider: data.provider_used,
+                metadata: {
+                    confidence: data.confidence,
+                    execution_time_ms: data.execution_time_ms,
+                    result: data.result,
+                },
+            });
+        });
+
+        eventSource.addEventListener('agent_error', (e) => {
+            const data = JSON.parse(e.data);
+            addMessageRef.current({
+                role: 'system',
+                content: `⚠️ **${data.agent_type}** failed: ${data.error}`,
+                status: 'error',
+            });
+        });
+
+        eventSource.addEventListener('phase_changed', (e) => {
+            const data = JSON.parse(e.data);
+            setPhase(data.phase as Phase);
+        });
+
+        eventSource.addEventListener('deal_complete', (e) => {
+            const data = JSON.parse(e.data);
+            const scoreLine = data.final_score == null
+                ? 'Deal score: Not scored'
+                : 'Score: ' + data.final_score + '/100';
+            addMessageRef.current({
+                role: 'system',
+                content: '🎉 **Deal Analysis Complete**\n\n' + scoreLine + '\n' + data.recommendation,
+            });
+            setPhase('idle');
+        });
+
+        eventSource.addEventListener('deal_needs_review', (e) => {
+            const data = JSON.parse(e.data);
+            addMessageRef.current({
+                role: 'system',
+                content: `⚠️ **Analysis needs review**\n\n${data.recommendation || 'One or more tasks did not complete successfully.'}`,
+                status: 'error',
+            });
+            setPhase('idle');
+        });
+
+            eventSource.onerror = () => {
+                eventSource.close();
+                if (eventSourceRef.current === eventSource) {
+                    eventSourceRef.current = null;
+                }
+                if (sseManualCloseRef.current || sseRetryRef.current >= SSE_MAX_RETRIES) {
+                    if (sseRetryRef.current >= SSE_MAX_RETRIES) {
+                        console.error('SSE reconnect exhausted after', SSE_MAX_RETRIES, 'attempts');
+                    }
+                    return;
+                }
+                // Exponential backoff: 1s, 2s, 4s, 8s, 8s…
+                const delay = Math.min(1000 * 2 ** sseRetryRef.current, 8000);
+                sseRetryRef.current += 1;
+                sseTimerRef.current = setTimeout(() => {
+                    if (!sseManualCloseRef.current) openStream();
+                }, delay);
+            };
+
+            return eventSource;
+        };
+
+        return openStream();
+    }, []);
+
+    const disconnectSSE = useCallback(() => {
+        sseManualCloseRef.current = true;
+        if (sseTimerRef.current) {
+            clearTimeout(sseTimerRef.current);
+            sseTimerRef.current = null;
+        }
+        if (eventSourceRef.current) {
+            eventSourceRef.current.close();
+            eventSourceRef.current = null;
+        }
+    }, []);
+
+    useEffect(() => {
+        const currentConversation = useDealForgeStore.getState().getActiveConversation();
+        const dealId = currentConversation?.dealId || null;
+        const completed = Boolean(
+            dealId && currentConversation?.messages.some(
+                message => message.agentName === 'DealForge Summary'
+            )
+        );
+
+        setActiveDealId(dealId);
+        setDealCompleted(completed);
+        completedResultsRef.current = [];
+        taskListRef.current = [];
+        setFollowUps([]);
+        disconnectSSE();
+    }, [activeConv?.id, disconnectSSE]);
+
+    // Disconnect SSE on unmount. Deal switches are covered because
+    // connectSSE() always closes the previous stream before opening a new one.
+    useEffect(() => disconnectSSE, [disconnectSSE]);
 
     const isProcessing = phase !== 'idle';
 
@@ -459,33 +937,50 @@ export function ChatWindow() {
         try {
             let dealId = activeDealId;
             let currentPrompt = userText;
-            let userAnswers: any[] = [];
+            let userAnswers: ClarificationAnswer[] = [];
             let currentRound = 0;
 
             if (isAnsweringQuestions) {
+                const isSkipAll = userText.toLowerCase() === 'skip' || userText.toLowerCase() === 'skip all';
+                const isAskMore = userText.toLowerCase() === 'more' || userText.toLowerCase() === 'ask more';
+                
                 updateMessage(lastAgentMsg!.id, { metadata: { ...lastAgentMsg!.metadata, pending_clarification: false } });
                 dealId = lastAgentMsg!.metadata!.deal_id as string;
                 currentPrompt = lastAgentMsg!.metadata!.original_prompt as string;
-                currentRound = Number(lastAgentMsg!.metadata!.clarification_round || 0) + 1;
-                userAnswers = [{ question: "User Response", answer: userText }];
+                currentRound = Number(lastAgentMsg!.metadata!.clarification_round || 0);
+                
+                if (isAskMore) {
+                    // rounds handled by backend
+                } else if (!isSkipAll) {
+                    userAnswers = [{ question: "User Response", answer: userText }];
+                    currentRound += 1;
+                }
+                
                 setActiveDealId(dealId);
 
-                // Tier 2+3: store Q&A pair in memory for self-learning
-                const priorQuestions = lastAgentMsg!.metadata!.questions as any[] || [];
-                const detectedDealType = userText.toLowerCase().includes('lbo') ? 'lbo'
-                    : userText.toLowerCase().includes('ipo') ? 'ipo'
-                        : (currentPrompt || '').toLowerCase().includes('acqui') ? 'm_a' : 'valuation';
-                fetch(`${API_BASE}/api/v1/chat/clarify/feedback`, {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        deal_type: detectedDealType,
-                        questions: priorQuestions,
-                        user_answer: userText,
-                        task_score: 0.75, // default; updated later when agents complete
-                    }),
-                }).catch(() => { }); // fire-and-forget
+                if (!isSkipAll && !isAskMore) {
+                    const detectedDealType = userText.toLowerCase().includes('lbo') ? 'lbo'
+                        : userText.toLowerCase().includes('ipo') ? 'ipo'
+                            : (currentPrompt || '').toLowerCase().includes('acqui') ? 'm_a' : 'valuation';
+                    fetch(`${API_BASE}/api/v1/chat/clarify/feedback`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            deal_type: detectedDealType,
+                            questions: lastAgentMsg!.metadata!.questions || [],
+                            user_answer: userText,
+                            task_score: 0.75,
+                        }),
+                    }).catch(() => { });
+                }
+            } else if (lastAgentMsg?.metadata?.is_assumptions_summary) {
+                updateMessage(lastAgentMsg!.id, { metadata: { ...lastAgentMsg!.metadata, is_assumptions_summary: false } });
+                dealId = lastAgentMsg!.metadata!.deal_id as string;
+                currentPrompt = lastAgentMsg!.metadata!.original_prompt as string;
+                
+                setActiveDealId(dealId);
+                await runPlanningPhase(currentPrompt, dealId!, [], 3, userText);
+                return;
             } else if (dealCompleted && activeDealId) {
-                // ─── Follow-up on completed deal (Context Persistence) ───
                 dealId = activeDealId;
                 setDealCompleted(false);
 
@@ -495,7 +990,6 @@ export function ChatWindow() {
                     status: 'done',
                 });
             } else {
-                // Create deal
                 const createRes = await fetch(`${API_BASE}/api/v1/deals`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -509,12 +1003,13 @@ export function ChatWindow() {
                 const deal = await createRes.json();
                 dealId = deal.id;
                 setActiveDealId(dealId);
+                store.setConversationDealId(convId, dealId!);
                 completedResultsRef.current = [];
                 taskListRef.current = [];
 
                 if (uploadedFiles.length > 0) await uploadFiles(dealId!);
+                connectSSE(dealId!);
 
-                // Clarification
                 const thinkingId = addMessage({
                     role: 'agent', agentName: 'Scrum Master',
                     content: '🧠 **Analyzing your request...**\n\n> Checking data requirements and identifying potential risks...',
@@ -524,29 +1019,51 @@ export function ChatWindow() {
                 const clarifyRes = await fetch(`${API_BASE}/api/v1/chat/clarify`, {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        prompt: userText,
+                        prompt: currentPrompt,
                         deal_id: dealId,
-                        company_name: extractCompanyName(userText),
-                        clarification_round: currentRound
+                        company_name: extractCompanyName(currentPrompt),
+                        clarification_round: currentRound,
+                        user_skipped: userText.toLowerCase() === 'skip' || userText.toLowerCase() === 'skip all',
+                        skipped_questions: (userText.toLowerCase() === 'skip' || userText.toLowerCase() === 'skip all') 
+                            ? (lastAgentMsg?.metadata?.questions || []) : []
                     }),
                 });
 
                 if (clarifyRes.ok) {
                     const clarifyData = await clarifyRes.json();
+                    
+                    if (clarifyData.assumptions_summary?.confirmation_required) {
+                        updateMessage(thinkingId, {
+                            content: clarifyData.assumptions_summary.formatted_message,
+                            status: 'done',
+                            metadata: {
+                                is_assumptions_summary: true,
+                                assumptions: clarifyData.assumptions_summary,
+                                deal_id: dealId ?? undefined,
+                                original_prompt: currentPrompt
+                            }
+                        });
+                        setPhase('idle');
+                        return;
+                    }
+
                     if (clarifyData.clarifying_questions?.length > 0) {
-                        const questions = clarifyData.clarifying_questions;
-                        const nQ = questions.length;
-                        const questionList = questions.map((q: any, i: number) =>
+                        const questions = clarifyData.clarifying_questions as ClarificationQuestion[];
+                        const round = clarifyData.qa_controls?.current_round || (currentRound + 1);
+                        const maxR = clarifyData.qa_controls?.max_rounds || 3;
+                        
+                        const questionList = questions.map((q, i) =>
                             `**Q${i + 1}:** ${q.question}\n*Reasoning: ${q.reasoning}*`).join('\n\n');
                         updateMessage(thinkingId, {
-                            content: `🧠 **Scrum Master — Clarification Needed** *(Round 1 of 1 · ${nQ} question${nQ > 1 ? 's' : ''})*\n\n${questionList}\n\n---\n*Reply to proceed, or type \`skip\` to use smart defaults.*`,
+                            content: `🧠 **Scrum Master — Clarification Round ${round} of ${maxR}**\n\n${questionList}\n\n---\n*Reply to proceed, or use the controls below.*`,
                             status: 'done',
                             metadata: {
                                 pending_clarification: true,
-                                original_prompt: userText,
-                                deal_id: dealId,
-                                clarification_round: currentRound,
-                                questions: clarifyData.clarifying_questions
+                                original_prompt: currentPrompt,
+                                deal_id: dealId ?? undefined,
+                                clarification_round: round,
+                                questions: questions,
+                                qa_controls: clarifyData.qa_controls
                             }
                         });
                         setPhase('idle');
@@ -559,104 +1076,211 @@ export function ChatWindow() {
                 }
             }
 
-            // ─── Planning ───
-            setPhase('planning');
-            const thinkingPlanId = addMessage({
-                role: 'agent', agentName: 'Scrum Master',
-                content: '📋 **Building Plan...**\n\n> Reasoning about the best approach and planning the task pipeline...',
-                status: 'thinking',
+            await runPlanningPhase(currentPrompt, dealId!, userAnswers, currentRound, userText);
+        } catch (err) {
+            addMessage({
+                role: 'system',
+                content: `❌ Error: ${err instanceof Error ? err.message : 'Connection failed'}. Make sure the backend is running.`,
+                status: 'error',
             });
+        }
+        setPhase('idle');
+    }
 
-            const planRes = await fetch(`${API_BASE}/api/v1/chat/plan`, {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    prompt: currentPrompt, deal_id: dealId,
-                    company_name: extractCompanyName(currentPrompt),
-                    user_answers: userAnswers,
-                    focus_mode: focusMode, sources: activeSources,
-                }),
-            });
+    async function runPlanningPhase(currentPrompt: string, dealId: string, userAnswers: ClarificationAnswer[], _currentRound: number, userText: string) {
+        setPhase('planning');
+        const thinkingPlanId = addMessage({
+            role: 'agent', agentName: 'Scrum Master',
+            content: '📋 **Building Plan...**\n\n> Reasoning about the best approach and planning the task pipeline...',
+            status: 'thinking',
+        });
 
-            let taskList: Array<{ title: string; description: string; assigned_agent: string; priority: string; id?: string }> = [];
-
-            if (planRes.ok) {
-                const plan = await planRes.json();
-                taskList = plan.data?.todo_list?.items || [];
-                const reasoning = plan.reasoning || 'Generated task pipeline.';
-
-                // Apply Focus Mode filtering
-                if (focusMode === 'speed') {
-                    taskList = taskList.filter(t => SPEED_AGENTS.has(t.assigned_agent) || t.priority === 'critical');
-                    if (taskList.length > 3) taskList = taskList.slice(0, 3);
-                } else if (focusMode === 'balanced') {
-                    taskList = taskList.filter(t => t.priority === 'critical' || t.priority === 'high');
-                    if (taskList.length > 12) taskList = taskList.slice(0, 12);
+        try {
+            const taskListsUrl = `${API_BASE}/api/v1/deals/${dealId}/tasks`;
+            const knownTaskListIds = new Set<string>();
+            let taskListSnapshotTaken = false;
+            try {
+                const beforeRes = await fetch(taskListsUrl);
+                if (beforeRes.ok) {
+                    const before = await beforeRes.json() as { todo_lists?: TaskListRecord[] };
+                    for (const list of before.todo_lists || []) knownTaskListIds.add(list.id);
+                    taskListSnapshotTaken = true;
                 }
-                // Quality: keep all
+            } catch {
+                // The plan request remains authoritative; this snapshot only helps recover lost responses.
+            }
+
+            const planRequestStartedAt = Date.now();
+            let planResponse: PlanResponse | null = null;
+            let planRes: Response | null = null;
+            let planRequestError: unknown = null;
+            let planRecovered = false;
+            try {
+                planRes = await fetch(`${API_BASE}/api/v1/chat/plan`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        prompt: currentPrompt, deal_id: dealId,
+                        company_name: extractCompanyName(currentPrompt),
+                        user_answers: userAnswers,
+                        focus_mode: focusMode, sources: activeSources,
+                        local_only: /\b(?:local[- ]only|lm\s*studio\s+only|no\s+(?:cloud|remote)\s+(?:llm|models?))\b/i.test(currentPrompt),
+                    }),
+                });
+                if (planRes.ok) planResponse = await planRes.json() as PlanResponse;
+            } catch (error) {
+                planRequestError = error;
+            }
+
+            if (!planResponse && planRequestError) {
+                try {
+                    const recoveryRes = await fetch(taskListsUrl);
+                    if (recoveryRes.ok) {
+                        const recovery = await recoveryRes.json() as { todo_lists?: TaskListRecord[] };
+                        const recoveredPlan = (recovery.todo_lists || [])
+                            .filter(list => taskListSnapshotTaken
+                                ? !knownTaskListIds.has(list.id)
+                                : Date.parse(list.created_at || '') >= planRequestStartedAt - 5000)
+                            .filter(list => (list.items?.length || 0) > 0)
+                            .sort((a, b) => Date.parse(b.created_at || '') - Date.parse(a.created_at || ''))[0];
+                        if (recoveredPlan) {
+                            planRecovered = true;
+                            planResponse = {
+                                reasoning: 'The task plan was recovered from the backend after its response was interrupted.',
+                                data: { todo_list: recoveredPlan },
+                            };
+                        }
+                    }
+                } catch {
+                    // Preserve the original planning error if recovery is unavailable.
+                }
+            }
+
+            if (!planResponse && !planRes) throw planRequestError;
+
+            let taskList: TaskPlanItem[] = [];
+            let taskListId: string | null = null;
+            let planMessageContent = '';
+            if (planResponse && (planRes?.ok || planRecovered)) {
+                const plan = planResponse;
+                taskList = plan.data?.todo_list?.items || [];
+                taskListId = plan.data?.todo_list?.id || null;
+                const reasoning = plan.reasoning || 'Generated task pipeline.';
 
                 const agentCount = new Set(taskList.map(t => t.assigned_agent)).size;
                 const taskListMd = taskList.map((t, i) =>
                     `${i + 1}. **${t.title}** → \`${(t.assigned_agent || '').replace(/_/g, ' ')}\` *(${t.priority})*\n   ${t.description}`
                 ).join('\n');
+                const selectedAgent = plan.data?.laya_decision?.selected_agent;
 
-                updateMessage(thinkingPlanId, {
-                    content: `🧠 **Scrum Master — Task Plan Created**\n\n` +
-                        `> **💭 Reasoning:** ${reasoning.split('\\n').join('\\n> ')}\n\n` +
-                        `📋 **${taskList.length} tasks** assigned to **${agentCount} agents**:\n\n${taskListMd}\n\n---\n⏳ Starting execution...`,
-                    status: 'done',
-                });
+                planMessageContent = `🧠 **Scrum Master — Task Plan ${planRecovered ? 'Recovered' : 'Created'}**\n\n` +
+                    `> **💭 Reasoning:** ${reasoning.split('\n').join('\n> ')}\n\n` +
+                    `${selectedAgent ? `Laya routed this scope to **${selectedAgent.replace(/_/g, ' ')}**.\n\n` : ''}` +
+                    `📋 **${taskList.length} tasks** assigned to **${agentCount} agents**:\n\n${taskListMd}\n\n---\nAwaiting your approval to run.`;
+                updateMessage(thinkingPlanId, { content: planMessageContent, status: 'done' });
             } else {
-                updateMessage(thinkingPlanId, { content: '🧠 **Scrum Master** — Using standard analysis pipeline', status: 'done' });
                 taskList = [
                     { title: 'Financial Analysis', description: `Perform financial analysis for: ${userText}`, assigned_agent: 'financial_analyst', priority: 'critical' },
                     { title: 'Market Research', description: `Research the market for: ${userText}`, assigned_agent: 'market_researcher', priority: 'high' },
                     { title: 'Legal Review', description: `Perform legal due diligence for: ${userText}`, assigned_agent: 'legal_advisor', priority: 'high' },
                     { title: 'Risk Assessment', description: `Assess risks for: ${userText}`, assigned_agent: 'risk_assessor', priority: 'high' },
                 ];
+                const fallbackItems = taskList.map((item, i) => `${i + 1}. **${item.title}** → \`${item.assigned_agent.replace(/_/g, ' ')}\` *(${item.priority})*\n   ${item.description}`).join('\n');
+                planMessageContent = `🧠 **Scrum Master** — Backend plan unavailable. Review this fallback plan before execution.\n\n📋 **${taskList.length} tasks**:\n\n${fallbackItems}\n\n---\nAwaiting your approval to run.`;
+                updateMessage(thinkingPlanId, { content: planMessageContent, status: 'done' });
             }
+
+            if (!taskList.length) {
+                throw new Error('The planner returned no executable tasks. No work was started.');
+            }
+            const executionWaves = buildExecutionWaves(taskList);
+
+            setPhase('awaiting_approval');
+            const approved = await new Promise<boolean>(resolve => {
+                setApprovalRequest({ taskCount: taskList.length, resolve });
+            });
+            setApprovalRequest(null);
+            if (!approved) {
+                addMessage({ role: 'system', content: 'Plan saved. Execution was cancelled; no agents were run.' });
+                setPhase('idle');
+                return;
+            }
+            if (taskListId) {
+                const approvalRes = await fetch(`${API_BASE}/api/v1/tasks/${taskListId}/approve`, { method: 'POST' });
+                if (!approvalRes.ok) throw new Error(`Plan approval failed (HTTP ${approvalRes.status}). No tasks were run.`);
+            }
+            updateMessage(thinkingPlanId, {
+                content: planMessageContent.replace('Awaiting your approval to run.', 'Approved. Execution started.'),
+            });
 
             // ─── Execute Tasks ───
             setPhase('executing');
-            const agentResults: string[] = [];
-            const completedResults: any[] = [];
+            const completedResults: AgentResult[] = [];
             let completedCount = 0;
+            let failedCount = 0;
+            let attemptedCount = 0;
             setExecutingProgress({ done: 0, total: taskList.length });
+
+            // Emit SSE: phase changed to planning
+            fetch(
+                `${API_BASE}/api/v1/stream/emit/${dealId}`,
+                withAdminAuth({
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ event_type: 'phase_changed', data: { phase: 'planning' } }),
+                })
+            ).catch(() => { });
 
             // Mark the deal as running on the Dashboard
             fetch(`${API_BASE}/api/v1/deals/${dealId}`, {
                 method: 'PATCH', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ status: 'running', current_stage: 'analysis' }),
             }).catch(() => { });
+            if (taskListId) {
+                const statusRes = await fetch(`${API_BASE}/api/v1/tasks/${taskListId}/status`, {
+                    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ status: 'in_progress' }),
+                });
+                if (!statusRes.ok) throw new Error(`Could not start approved task list (HTTP ${statusRes.status}).`);
+            }
 
             const progressId = addMessage({
                 role: 'system', agentName: 'Progress',
                 content: `📊 **Progress:** 0/${taskList.length} agents complete`,
             });
 
-            for (const task of taskList) {
-                const agentLabel = (task.assigned_agent || 'analyst').replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+            const taskOutcomes = new Map<string, 'done' | 'blocked'>();
+            for (const taskWave of executionWaves) {
+                const priorOutputs: Record<string, unknown> = {};
+                for (const result of completedResults) {
+                    if (result._agent_type && result.data) priorOutputs[result._agent_type] = result.data;
+                }
+                await Promise.all(taskWave.map(async task => {
+                let taskStatus: 'done' | 'blocked' = 'blocked';
+                let taskResult: Record<string, unknown> = {};
+                const agentLabel = (task.assigned_agent || 'analyst').replace(/_/g, ' ').replace(/\b\w/g, (l: string) => l.toUpperCase());
                 const taskMsgId = addMessage({
                     role: 'agent', agentName: agentLabel,
                     content: `⏳ **${task.title}** — Analyzing...`, status: 'thinking',
                 });
-                // Add slight delay to mitigate LLM 429 rate limit errors (Task 5)
-                await new Promise(resolve => setTimeout(resolve, 500));
-
-                // Accumulate prior agent outputs for DataCurator/ComplexReasoning (Task 4)
-                const priorOutputs: Record<string, any> = {};
-                for (let i = 0; i < completedResults.length; i++) {
-                    const t = taskList[i];
-                    if (t && t.assigned_agent && completedResults[i]?.data) {
-                        priorOutputs[t.assigned_agent] = completedResults[i].data;
-                    }
-                }
-
-                try {
+                const unmetDependencies = (task.depends_on || []).filter(id => taskOutcomes.get(id) !== 'done');
+                if (unmetDependencies.length) {
+                    failedCount++;
+                    taskResult = { error: 'blocked_by_failed_dependencies', blocked_by: unmetDependencies };
+                    updateMessage(taskMsgId, {
+                        content: `⚠️ **${task.title}** — Blocked because prerequisite task(s) did not complete: ${unmetDependencies.join(', ')}.`,
+                        status: 'error',
+                    });
+                } else {
+                  try {
+                    await new Promise(resolve => setTimeout(resolve, 500));
                     const taskRes = await fetch(`${API_BASE}/api/v1/chat/execute-task`, {
                         method: 'POST', headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             agent_type: task.assigned_agent, task: task.description,
+                            user_prompt: userText,
+                            local_only: /\b(?:local[- ]only|lm\s*studio\s+only|no\s+(?:cloud|remote)\s+(?:llm|models?))\b/i.test(userText),
                             deal_id: dealId, task_id: task.id || `task-${completedCount}`,
+                            task_list_id: taskListId,
                             title: task.title, sources: activeSources,
                             company_name: extractCompanyName(userText), // Added company_name propagation
                             agent_outputs: priorOutputs, // Injected prior contextual data
@@ -664,19 +1288,23 @@ export function ChatWindow() {
                     });
 
                     if (taskRes.ok) {
-                        const result = await taskRes.json();
+                        const result = await taskRes.json() as AgentResult;
+                        if (result.success === false || result.error) {
+                            throw new Error(result.reasoning || result.error || 'Agent reported failure');
+                        }
                         result._agent_type = task.assigned_agent;
                         const summaryLine = formatAgentSummaryLine(agentLabel, result);
                         const detailBody = formatAgentDetailBody(result);
-                        agentResults.push(summaryLine);
                         completedResults.push(result);
                         completedCount++;
+                        taskStatus = 'done';
+                        taskResult = result.data || {};
 
                         setCollapsedAgents(prev => ({ ...prev, [taskMsgId]: true }));
                         updateMessage(taskMsgId, {
                             content: `${summaryLine}\n\n---\n\n${detailBody}`, status: 'done',
                             provider: result.provider || 'unknown',
-                            metadata: { ...result.data, _agentSummary: summaryLine, _agentDetail: detailBody },
+                            metadata: { ...result.data, _agentSummary: summaryLine, _agentDetail: detailBody, action_id: result.action_id },
                         });
 
                         // Forward real agent data to activity log
@@ -693,37 +1321,137 @@ export function ChatWindow() {
                         }).catch(() => { });
 
                     } else {
-                        completedCount++;
-                        updateMessage(taskMsgId, { content: `⚠️ **${task.title}** — Agent error. Check Settings.`, status: 'error' });
+                        throw new Error(`Agent request failed (HTTP ${taskRes.status})`);
                     }
-                } catch {
-                    completedCount++;
-                    updateMessage(taskMsgId, { content: `⚠️ **${task.title}** — Could not reach agent.`, status: 'error' });
+                } catch (error) {
+                    failedCount++;
+                    const detail = error instanceof Error ? error.message : 'Could not reach agent';
+                    taskResult = { error: detail };
+                    updateMessage(taskMsgId, { content: `⚠️ **${task.title}** — ${detail}`, status: 'error' });
+                }
                 }
 
-                setExecutingProgress({ done: completedCount, total: taskList.length });
+                attemptedCount++;
+                if (taskListId && task.id) {
+                    try {
+                        const saveRes = await fetch(`${API_BASE}/api/v1/tasks/${taskListId}/items/${task.id}`, {
+                            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ status: taskStatus, result: taskResult }),
+                        });
+                        if (!saveRes.ok) throw new Error(`HTTP ${saveRes.status}`);
+                    } catch (error) {
+                        failedCount++;
+                        taskStatus = 'blocked';
+                        updateMessage(taskMsgId, {
+                            content: `⚠️ **${task.title}** — Agent result could not be persisted (${error instanceof Error ? error.message : 'network error'}); human review required.`,
+                            status: 'error',
+                        });
+                    }
+                }
+                if (task.id) taskOutcomes.set(task.id, taskStatus);
+                setExecutingProgress({ done: attemptedCount, total: taskList.length });
                 updateMessage(progressId, {
-                    content: `📊 **Progress:** ${completedCount}/${taskList.length} agents complete ${completedCount === taskList.length ? '✅' : ''}`,
+                    content: `📊 **Progress:** ${attemptedCount}/${taskList.length} attempted · ${completedCount} succeeded · ${failedCount} failed`,
+                });
+                }));
+            }
+
+            // Emit SSE: phase changed to synthesizing
+            fetch(
+                `${API_BASE}/api/v1/stream/emit/${dealId}`,
+                withAdminAuth({
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ event_type: 'phase_changed', data: { phase: 'synthesizing' } }),
+                })
+            ).catch(() => { });
+
+            const dealScore = extractDealScore(completedResults);
+            const needsReview = failedCount > 0;
+            let statusPersistenceFailed = false;
+            if (taskListId) {
+                try {
+                    const statusRes = await fetch(`${API_BASE}/api/v1/tasks/${taskListId}/status`, {
+                        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ status: needsReview ? 'needs_review' : 'completed' }),
+                    });
+                    if (!statusRes.ok) statusPersistenceFailed = true;
+                } catch {
+                    statusPersistenceFailed = true;
+                }
+            }
+            let finalNeedsReview = needsReview || statusPersistenceFailed;
+            let recommendation = finalNeedsReview
+                ? `${completedCount}/${taskList.length} tasks succeeded; ${failedCount} failed. Human review required.`
+                : `${completedCount}/${taskList.length} tasks completed${dealScore === null ? '; deal not scored' : ''}.`;
+            try {
+                const dealStatusRes = await fetch(`${API_BASE}/api/v1/deals/${dealId}`, {
+                    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        status: finalNeedsReview ? 'needs_review' : 'completed',
+                        current_stage: finalNeedsReview ? 'review' : 'completed',
+                        ...(dealScore !== null ? { final_score: dealScore } : {}),
+                        final_recommendation: recommendation,
+                    }),
+                });
+                if (!dealStatusRes.ok) throw new Error(`HTTP ${dealStatusRes.status}`);
+            } catch (error) {
+                finalNeedsReview = true;
+                recommendation = `${completedCount}/${taskList.length} tasks attempted; deal status could not be persisted. Human review required.`;
+                addMessage({
+                    role: 'system',
+                    content: `⚠️ Analysis results may be saved, but the deal status could not be confirmed (${error instanceof Error ? error.message : 'network error'}). Refresh the deal before relying on its status.`,
+                    status: 'error',
+                });
+                fetch(`${API_BASE}/api/v1/deals/${dealId}`, {
+                    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ status: 'needs_review', current_stage: 'review', final_recommendation: recommendation }),
+                }).catch(() => { });
+            }
+            if (statusPersistenceFailed) {
+                addMessage({
+                    role: 'system',
+                    content: '⚠️ Agent results are shown below, but task-list status could not be saved. Human review is required.',
+                    status: 'error',
                 });
             }
 
-            // ─── Mark deal as completed on Dashboard ───
-            const scores = completedResults.map((r: any) => r.confidence ?? 0.5);
-            const avgScore = scores.length > 0 ? (scores.reduce((a: number, b: number) => a + b, 0) / scores.length) : 0.8;
-            fetch(`${API_BASE}/api/v1/deals/${dealId}`, {
-                method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    status: 'completed',
-                    current_stage: 'completed',
-                    final_score: parseFloat(avgScore.toFixed(4)),
-                    final_recommendation: `${completedCount}/${taskList.length} tasks completed`,
-                }),
-            }).catch(() => { });
+            // Emit SSE: deal complete
+            if (!finalNeedsReview) {
+                fetch(
+                    `${API_BASE}/api/v1/stream/emit/${dealId}`,
+                    withAdminAuth({
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        event_type: 'deal_complete',
+                        data: {
+                            final_score: dealScore === null ? null : Math.round(dealScore * 100),
+                            recommendation,
+                            agent_results: completedResults.map((r, i) => ({
+                                agent_type: r._agent_type || taskList[i]?.assigned_agent,
+                                confidence: r.confidence,
+                                reasoning: r.reasoning?.slice(0, 500)
+                            }))
+                        }
+                    }),
+                    })
+                ).catch(() => { });
+            } else {
+                fetch(
+                    `${API_BASE}/api/v1/stream/emit/${dealId}`,
+                    withAdminAuth({
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ event_type: 'deal_needs_review', data: { recommendation } }),
+                    })
+                ).catch(() => { });
+            }
 
             // ─── Synthesis (Perplexity-style) ───
             setPhase('synthesizing');
             const companyName = extractCompanyName(userText);
-            const synthesisContent = buildSynthesisMessage(completedResults, taskList, companyName);
+            const synthesisContent = buildSynthesisMessage(completedResults, taskList, companyName, failedCount);
             addMessage({
                 role: 'agent', agentName: 'DealForge Summary',
                 content: synthesisContent,
@@ -732,10 +1460,10 @@ export function ChatWindow() {
 
             // Store completed results for follow-up context persistence
             completedResultsRef.current = completedResults.map((r, i) => ({
-                ...r, agent: taskList[i]?.assigned_agent,
+                ...r, agent: completedResults[i]?._agent_type || taskList[i]?.assigned_agent,
             }));
             taskListRef.current = taskList;
-            setDealCompleted(true);
+            setDealCompleted(!finalNeedsReview);
 
             const suggestions = generateContextAwareFollowUps(completedResults, taskList, companyName);
             setFollowUps(suggestions);
@@ -751,16 +1479,47 @@ export function ChatWindow() {
         setPhase('idle');
     }
 
-    function handleExport() {
-        const data = messages.filter(m => m.role !== 'system' || m.agentName).map(m => ({
-            role: m.role, agent: m.agentName, content: m.content,
-            provider: m.provider, timestamp: m.timestamp.toISOString(),
-        }));
-        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a'); a.href = url;
-        a.download = `dealforge-analysis-${activeDealId?.substring(0, 8) || 'draft'}.json`;
-        a.click();
+    async function handleExport(format: 'json' | 'docx' = 'json') {
+        try {
+            const dealId = activeDealId;
+            if (format === 'docx') {
+                if (!dealId) throw new Error('Save or complete an analysis before downloading its Word report.');
+                const response = await fetch(
+                    `${API_BASE}/api/v1/deals/${dealId}/exports/docx`,
+                    withAdminAuth()
+                );
+                if (!response.ok) {
+                    const body = await response.json().catch(() => ({}));
+                    throw new Error(body.detail || `Word report generation failed (HTTP ${response.status}).`);
+                }
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `DealForge-${dealId.slice(0, 8)}.docx`;
+                a.click();
+                window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+                return;
+            }
+            if (!dealId) throw new Error('Save or complete an analysis before downloading its structured data.');
+            const response = await fetch(
+                `${API_BASE}/api/v1/deals/${dealId}/exports/json`,
+                withAdminAuth()
+            );
+            if (!response.ok) {
+                const body = await response.json().catch(() => ({}));
+                throw new Error(body.detail || `Structured data export failed (HTTP ${response.status}).`);
+            }
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `dealforge-analysis-${dealId.substring(0, 8)}.json`;
+            a.click();
+            window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+        } catch (error) {
+            addMessage({ role: 'system', content: `Export failed: ${error instanceof Error ? error.message : 'Could not create analysis export.'}`, status: 'error' });
+        }
     }
 
     const handleCopy = (text: string, id: string) => {
@@ -776,6 +1535,26 @@ export function ChatWindow() {
 
     const handleRegenerate = (msg: Message) => handleSend(msg.content, true);
 
+    // Handle rating agent output (thumbs up/down) — selection persists per action
+    const handleRateOutput = async (actionId: number | undefined, rating: number) => {
+        if (!actionId) return;
+        try {
+            const res = await fetch(`${API_BASE}/api/v1/rate-output`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    action_id: actionId,
+                    rating: rating,
+                    feedback: rating >= 4 ? 'positive' : 'negative',
+                }),
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            setRatedIds(prev => ({ ...prev, [actionId]: rating >= 4 ? 'up' : 'down' }));
+        } catch (err) {
+            console.error('Failed to rate output:', err);
+        }
+    };
+
     // ─── Markdown renderer ───
 
     function renderMarkdown(text: string) {
@@ -783,13 +1562,13 @@ export function ChatWindow() {
             <ReactMarkdown
                 remarkPlugins={[remarkGfm]}
                 components={{
-                    h1: ({ children }: any) => <h1 className="text-xl font-bold mt-4 mb-2 text-white">{children}</h1>,
-                    h2: ({ children }: any) => <h2 className="text-lg font-bold mt-3 mb-1.5 text-white/90">{children}</h2>,
-                    h3: ({ children }: any) => <h3 className="text-base font-bold mt-2 mb-1 text-white/85">{children}</h3>,
-                    p: ({ children }: any) => <p className="mb-2 leading-relaxed">{children}</p>,
-                    strong: ({ children }: any) => <strong className="font-semibold text-white">{children}</strong>,
-                    em: ({ children }: any) => <em className="italic text-white/70">{children}</em>,
-                    code: ({ className, children, ...props }: any) => {
+                    h1: ({ children }) => <h1 className="text-xl font-bold mt-4 mb-2 text-white">{children}</h1>,
+                    h2: ({ children }) => <h2 className="text-lg font-bold mt-3 mb-1.5 text-white/90">{children}</h2>,
+                    h3: ({ children }) => <h3 className="text-base font-bold mt-2 mb-1 text-white/85">{children}</h3>,
+                    p: ({ children }) => <p className="mb-2 leading-relaxed">{children}</p>,
+                    strong: ({ children }) => <strong className="font-semibold text-white">{children}</strong>,
+                    em: ({ children }) => <em className="italic text-white/70">{children}</em>,
+                    code: ({ className, children, ...props }) => {
                         const isBlock = className?.includes('language-');
                         return isBlock ? (
                             <pre className="bg-black/40 text-emerald-300 rounded-lg p-3 my-2 overflow-x-auto text-xs border border-white/5">
@@ -799,18 +1578,18 @@ export function ChatWindow() {
                             <code className="bg-white/10 px-1.5 py-0.5 rounded text-xs font-mono text-cyan-300" {...props}>{children}</code>
                         );
                     },
-                    ul: ({ children }: any) => <ul className="list-disc pl-5 space-y-1 mb-2">{children}</ul>,
-                    ol: ({ children }: any) => <ol className="list-decimal pl-5 space-y-1 mb-2">{children}</ol>,
-                    li: ({ children }: any) => <li className="leading-relaxed">{children}</li>,
-                    table: ({ children }: any) => (
+                    ul: ({ children }) => <ul className="list-disc pl-5 space-y-1 mb-2">{children}</ul>,
+                    ol: ({ children }) => <ol className="list-decimal pl-5 space-y-1 mb-2">{children}</ol>,
+                    li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+                    table: ({ children }) => (
                         <div className="overflow-x-auto my-2">
                             <table className="min-w-full border border-white/10 text-xs">{children}</table>
                         </div>
                     ),
-                    th: ({ children }: any) => <th className="border border-white/10 px-2 py-1 bg-white/5 font-semibold text-left text-white/80">{children}</th>,
-                    td: ({ children }: any) => <td className="border border-white/10 px-2 py-1 text-white/70">{children}</td>,
-                    blockquote: ({ children }: any) => <blockquote className="border-l-4 border-cyan-500/30 pl-3 italic text-white/50 my-2">{children}</blockquote>,
-                    a: ({ href, children }: any) => <a href={href} className="text-cyan-400 underline hover:text-cyan-300" target="_blank" rel="noreferrer">{children}</a>,
+                    th: ({ children }) => <th className="border border-white/10 px-2 py-1 bg-white/5 font-semibold text-left text-white/80">{children}</th>,
+                    td: ({ children }) => <td className="border border-white/10 px-2 py-1 text-white/70">{children}</td>,
+                    blockquote: ({ children }) => <blockquote className="border-l-4 border-cyan-500/30 pl-3 italic text-white/50 my-2">{children}</blockquote>,
+                    a: ({ href, children }) => <a href={href} className="text-cyan-400 underline hover:text-cyan-300" target="_blank" rel="noreferrer">{children}</a>,
                 }}
             >
                 {text}
@@ -822,28 +1601,81 @@ export function ChatWindow() {
 
     function renderMessage(msg: Message) {
         const isUser = msg.role === 'user';
-        const agentKey = msg.agentName?.toLowerCase().replace(/\s/g, '_') || 'system';
+        const messageContent = typeof msg.content === 'string'
+            ? msg.content
+            : 'Saved message content is unavailable.';
+        const agentName = typeof msg.agentName === 'string' ? msg.agentName : '';
+        const timestamp = msg.timestamp instanceof Date ? msg.timestamp : new Date(msg.timestamp || Date.now());
+        const agentKey = agentName.toLowerCase().replace(/\s/g, '_') || 'system';
         const agentStyle = AGENT_STYLES[agentKey] || AGENT_STYLES.system;
         const AgentIcon = agentStyle.icon;
         const isEditing = editingMsgId === msg.id;
+        const sourcePrompt = messages.find(message => message.role === 'user')?.content || '';
+        const conversationCompany = sourcePrompt ? extractCompanyName(sourcePrompt) : 'Target Company';
+        const isSummaryMessage = msg.metadata?._isSynthesis || msg.agentName === 'DealForge Summary';
+        const agentResultMessages = messages.filter(message =>
+            message.role === 'agent' && Boolean(message.metadata?._agentSummary)
+        );
+        const sourceOnlyAgentMessages = agentResultMessages.filter(message =>
+            message.metadata?.confidence_basis === 'not_calibrated_source_report'
+            || message.metadata?.synthesis_status === 'deterministic_source_report'
+        );
+        const onlySourceReportAgents = sourceOnlyAgentMessages.length > 0
+            && sourceOnlyAgentMessages.length === agentResultMessages.length;
+        let displayedContent = conversationCompany !== 'Target Company'
+            ? messageContent.replace(/Target Company/g, conversationCompany)
+            : messageContent;
+        if (agentName === 'Data Assistant' && onlySourceReportAgents && /employee count|team size/i.test(messageContent)) {
+            displayedContent = 'Employee count is not required for this SEC revenue retrieval.';
+        }
+        if (isSummaryMessage && onlySourceReportAgents) {
+            displayedContent = displayedContent.replace(/Overall Confidence:\s*\d+(?:\.\d+)?%/g, 'Confidence not calibrated for source-only retrieval');
+        } else if (isSummaryMessage) {
+            displayedContent = displayedContent.replace(/Overall Confidence:\s*(\d+(?:\.\d+)?)%/g, 'Mean model-reported score (uncalibrated): $1%');
+        }
+        const storedSummary = typeof msg.metadata?._agentSummary === 'string' ? msg.metadata._agentSummary : '';
+        const storedAgentLabel = storedSummary.match(/^\*\*(.+?)\*\*/)?.[1];
+        const nestedResult = msg.metadata?.result && typeof msg.metadata.result === 'object'
+            ? msg.metadata.result as Record<string, unknown>
+            : {};
+        const nestedResultData = nestedResult.data && typeof nestedResult.data === 'object'
+            ? nestedResult.data as Record<string, unknown>
+            : nestedResult;
+        const isUncalibratedSourceReport = msg.metadata?.confidence_basis === 'not_calibrated_source_report'
+            || msg.metadata?.synthesis_status === 'deterministic_source_report'
+            || nestedResultData.confidence_basis === 'not_calibrated_source_report'
+            || nestedResultData.synthesis_status === 'deterministic_source_report';
+        const displayedAgentSummary = isUncalibratedSourceReport
+            ? formatAgentSummaryLine(msg.agentName || storedAgentLabel || 'Agent', {
+                data: nestedResultData.confidence_basis ? nestedResultData : msg.metadata,
+                execution_time_ms: msg.metadata?.execution_time_ms,
+            })
+            : storedSummary;
 
         return (
             <div key={msg.id} className={`flex gap-3 group ${isUser ? 'flex-row-reverse' : ''} animate-in fade-in slide-in-from-bottom-2 duration-300`}>
-                {/* Avatar */}
-                <div className={`flex-shrink-0 w-9 h-9 rounded-xl flex items-center justify-center shadow-lg 
+                {/* Avatar (shadcn Avatar + initials fallback) */}
+                <Avatar className={`flex-shrink-0 w-9 h-9 rounded-xl shadow-lg
                     ${isUser
                         ? 'bg-gradient-to-br from-indigo-500 to-purple-600 shadow-indigo-500/20'
                         : `bg-gradient-to-br ${agentStyle.gradient} ${agentStyle.glow}`
-                    }`}
-                >
-                    {isUser ? <User className="h-4 w-4 text-white" /> : <AgentIcon className="h-4 w-4 text-white" />}
-                </div>
+                    }`}>
+                    <AvatarFallback className="bg-transparent text-white rounded-xl" delayMs={600}>
+                        {isUser
+                            ? <User className="h-4 w-4 text-white" />
+                            : <span className="flex items-center gap-1" title={agentName}>
+                                <AgentIcon className="h-4 w-4 text-white" />
+                                <span className="text-[8px] font-bold leading-none">{getInitials(agentName || 'DF')}</span>
+                            </span>}
+                    </AvatarFallback>
+                </Avatar>
 
                 <div className={`max-w-[85%] flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
-                    {/* Agent Header */}
+                    {/* Agent Header with Rating Buttons */}
                     {!isUser && msg.agentName && (
-                        <div className="flex items-center gap-2 mb-1.5">
-                            <span className="text-xs font-semibold text-white/60">{msg.agentName}</span>
+                        <div className="flex items-center justify-between w-full mb-1.5">
+                            <div className="flex items-center gap-2">
+                                <span className="text-xs font-semibold text-white/60">{msg.agentName}</span>
                             {msg.status === 'thinking' && (
                                 <span className="flex items-center gap-1 text-xs text-violet-400">
                                     <Loader2 className="h-3 w-3 animate-spin" />
@@ -856,12 +1688,36 @@ export function ChatWindow() {
                             {msg.status === 'error' && (
                                 <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-red-500/15 text-red-400 font-medium">Error</span>
                             )}
-                            {msg.provider && (
+                            {typeof msg.provider === 'string' && msg.provider && (
                                 <span className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-white/5 text-white/40 font-medium">
                                     {msg.provider === 'ollama' || msg.provider === 'lmstudio' ? <Cpu className="h-2.5 w-2.5" /> : <Cloud className="h-2.5 w-2.5" />}
                                     {msg.provider}
                                 </span>
                             )}
+                            </div>
+                            {/* Rating buttons for agent outputs - only show for completed agents */}
+                            {msg.status === 'done' && msg.metadata?.action_id && (() => {
+                                const actionId = msg.metadata!.action_id!;
+                                const vote = ratedIds[actionId];
+                                return (
+                                    <div className="flex items-center gap-0.5">
+                                        <button
+                                            onClick={() => handleRateOutput(actionId, 5)}
+                                            className={`p-1 rounded hover:bg-green-500/20 transition-colors ${vote === 'up' ? 'text-green-400 bg-green-500/10' : 'text-white/30 hover:text-green-400'}`}
+                                            title="Good output"
+                                        >
+                                            <ThumbsUp className="h-3 w-3" />
+                                        </button>
+                                        <button
+                                            onClick={() => handleRateOutput(actionId, 1)}
+                                            className={`p-1 rounded hover:bg-red-500/20 transition-colors ${vote === 'down' ? 'text-red-400 bg-red-500/10' : 'text-white/30 hover:text-red-400'}`}
+                                            title="Poor output"
+                                        >
+                                            <ThumbsDown className="h-3 w-3" />
+                                        </button>
+                                    </div>
+                                );
+                            })()}
                         </div>
                     )}
 
@@ -877,7 +1733,7 @@ export function ChatWindow() {
                                 <Button size="sm" onClick={() => handleEditSubmit(msg)} className="bg-cyan-500/20 text-cyan-400 hover:bg-cyan-500/30">Save</Button>
                             </div>
                         </div>
-                    ) : msg.metadata?._agentSummary ? (
+                    ) : displayedAgentSummary ? (
                         /* ─── Collapsible Agent Panel ─── */
                         <div className={`rounded-2xl text-sm leading-relaxed transition-all duration-300
                             bg-white/[0.04] backdrop-blur-sm rounded-bl-md border border-white/[0.06] text-white/80 hover:border-white/10 overflow-hidden`}>
@@ -885,7 +1741,7 @@ export function ChatWindow() {
                                 onClick={() => setCollapsedAgents(prev => ({ ...prev, [msg.id]: !prev[msg.id] }))}
                                 className="w-full flex items-center justify-between px-4 py-3 hover:bg-white/[0.03] transition-colors cursor-pointer"
                             >
-                                <span>{renderMarkdown(String(msg.metadata._agentSummary))}</span>
+                                <span>{renderMarkdown(displayedAgentSummary)}</span>
                                 {collapsedAgents[msg.id]
                                     ? <ChevronDown className="h-4 w-4 text-white/40 flex-shrink-0" />
                                     : <ChevronUp className="h-4 w-4 text-white/40 flex-shrink-0" />
@@ -893,7 +1749,7 @@ export function ChatWindow() {
                             </button>
                             {!collapsedAgents[msg.id] && (
                                 <div className="px-4 pb-3 border-t border-white/[0.06] pt-3 animate-in fade-in slide-in-from-top-1 duration-200">
-                                    {renderMarkdown(String(msg.metadata._agentDetail || ''))}
+                                    {renderMarkdown(typeof msg.metadata?._agentDetail === 'string' ? msg.metadata._agentDetail : '')}
                                 </div>
                             )}
                         </div>
@@ -903,17 +1759,119 @@ export function ChatWindow() {
                                 ? 'bg-gradient-to-r from-indigo-600/80 to-purple-600/80 text-white rounded-br-md border border-indigo-500/20 shadow-lg shadow-indigo-500/10'
                                 : 'bg-white/[0.04] backdrop-blur-sm rounded-bl-md border border-white/[0.06] text-white/80 hover:border-white/10'
                             } ${msg.status === 'thinking' ? 'animate-pulse' : ''}`}>
-                            {renderMarkdown(msg.content)}
+                            {renderMarkdown(displayedContent)}
+                            
+                            {/* Scrum Master QA Controls (Tier 1 Enhancement) */}
+                            {msg.metadata?.pending_clarification === true && (
+                                <div className="mt-4 flex flex-wrap gap-2">
+                                    <Button
+                                        size="sm"
+                                        onClick={() => {
+                                            const chatInput = document.getElementById('chat-input') as HTMLTextAreaElement;
+                                            if (chatInput?.value.trim()) handleSend();
+                                            else handleSend('confirm');
+                                        }}
+                                        className="bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 border border-emerald-500/30 gap-1.5"
+                                    >
+                                        <CheckCircle2 className="h-3.5 w-3.5" />
+                                        Answer & Continue
+                                    </Button>
+                                    <Button
+                                        size="sm"
+                                        variant="outline"
+                                        onClick={() => handleSend('skip')}
+                                        className="border-amber-500/30 text-amber-500 hover:bg-amber-500/10 gap-1.5"
+                                    >
+                                        <RotateCcw className="h-3.5 w-3.5" />
+                                        Skip Remaining
+                                    </Button>
+                                    {msg.metadata?.qa_controls?.can_ask_more === true && (
+                                        <Button
+                                            size="sm"
+                                            variant="ghost"
+                                            onClick={() => handleSend('more')}
+                                            className="text-cyan-400 hover:bg-cyan-500/10 gap-1.5"
+                                        >
+                                            <Sparkles className="h-3.5 w-3.5" />
+                                            Ask More
+                                        </Button>
+                                    )}
+                                </div>
+                            )}
+
+                            {/* Assumptions Confirmation (Tier 2 Enhancement) */}
+                            {msg.metadata?.is_assumptions_summary === true && (
+                                <div className="mt-4 flex flex-wrap gap-2">
+                                    <Button
+                                        size="sm"
+                                        onClick={() => handleSend('confirm')}
+                                        className="bg-indigo-500/20 text-indigo-400 hover:bg-indigo-500/30 border border-indigo-500/30 gap-1.5"
+                                    >
+                                        <Zap className="h-3.5 w-3.5" />
+                                        Confirm & Proceed
+                                    </Button>
+                                    <Button
+                                        size="sm"
+                                        variant="outline"
+                                        onClick={() => {
+                                            const chatInput = document.getElementById('chat-input') as HTMLTextAreaElement;
+                                            chatInput?.focus();
+                                        }}
+                                        className="border-white/10 text-white/60 hover:text-white"
+                                    >
+                                        Modify Assumptions
+                                    </Button>
+                                </div>
+                            )}
                         </div>
                     )}
+
+
+                    {/* Sources / citations (RAG v2) + confidence */}
+                    {!isUser && !isEditing && (() => {
+                        const cites = normalizeCitations(msg.metadata?.citations);
+                        const conf = isUncalibratedSourceReport
+                            ? undefined
+                            : msg.metadata?.confidence;
+                        if (cites.length === 0 && typeof conf !== 'number') return null;
+                        return (
+                            <div className="mt-2 w-full space-y-1.5">
+                                {typeof conf === 'number' && (
+                                    <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400 font-medium">
+                                        <CheckCircle2 className="h-2.5 w-2.5" />
+                                        Confidence {Math.round(conf * 100)}%
+                                    </span>
+                                )}
+                                {cites.length > 0 && (
+                                    <details className="rounded-xl border border-white/[0.06] bg-white/[0.02] overflow-hidden">
+                                        <summary className="flex items-center gap-1.5 px-3 py-2 text-[11px] font-medium text-white/50 hover:text-white/80 cursor-pointer list-none">
+                                            <Quote className="h-3 w-3 text-cyan-400" />
+                                            Sources ({cites.length})
+                                        </summary>
+                                        <ul className="px-3 pb-2.5 space-y-1.5">
+                                            {cites.map((c, i) => (
+                                                <li key={i} className="flex items-start gap-1.5 text-[11px] leading-relaxed text-white/60">
+                                                    <span className="flex-shrink-0 w-4 h-4 rounded bg-cyan-500/15 text-cyan-400 text-[9px] font-bold flex items-center justify-center mt-0.5">{i + 1}</span>
+                                                    <span>
+                                                        <span className="font-semibold text-white/75">{c.label}</span>
+                                                        {c.source && <span className="text-white/40"> — {c.source}</span>}
+                                                    </span>
+                                                </li>
+                                            ))}
+                                        </ul>
+                                    </details>
+                                )}
+                            </div>
+                        );
+                    })()}
 
                     {/* Action Buttons */}
                     {!isEditing && (
                         <div className={`flex items-center gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity ${isUser ? 'flex-row-reverse' : ''}`}>
                             <span className="text-[10px] text-white/30 px-1">
-                                {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                {timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                             </span>
-                            <button className="p-1 rounded-md text-white/30 hover:text-white/60 hover:bg-white/5 transition-colors" onClick={() => handleCopy(msg.content, msg.id)} title="Copy">
+                            <button className="p-1 rounded-md text-white/30 hover:text-white/60 hover:bg-white/5 transition-colors" onClick={() => handleCopy(messageContent, msg.id)} title="Copy">
                                 {copiedId === msg.id ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
                             </button>
                             {Boolean(msg.metadata?.excel_model_base64) && (
@@ -928,7 +1886,7 @@ export function ChatWindow() {
                             )}
                             {isUser && !isProcessing && (
                                 <>
-                                    <button className="p-1 rounded-md text-white/30 hover:text-white/60 hover:bg-white/5 transition-colors" onClick={() => { setEditingMsgId(msg.id); setEditValue(msg.content); }} title="Edit">
+                                    <button className="p-1 rounded-md text-white/30 hover:text-white/60 hover:bg-white/5 transition-colors" onClick={() => { setEditingMsgId(msg.id); setEditValue(messageContent); }} title="Edit">
                                         <Edit2 className="h-3 w-3" />
                                     </button>
                                     <button className="p-1 rounded-md text-white/30 hover:text-white/60 hover:bg-white/5 transition-colors" onClick={() => handleRegenerate(msg)} title="Regenerate">
@@ -936,6 +1894,19 @@ export function ChatWindow() {
                                     </button>
                                 </>
                             )}
+                            {!isUser && msg.status === 'error' && !isProcessing && (() => {
+                                const lastUser = [...messages].reverse().find(m => m.role === 'user');
+                                if (!lastUser) return null;
+                                return (
+                                    <button
+                                        className="flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] text-amber-400 hover:text-amber-300 hover:bg-amber-500/10 transition-colors"
+                                        onClick={() => handleSend(lastUser.content, true)}
+                                        title="Retry last request"
+                                    >
+                                        <RotateCcw className="h-3 w-3" /> Retry
+                                    </button>
+                                );
+                            })()}
                         </div>
                     )}
                 </div>
@@ -945,28 +1916,36 @@ export function ChatWindow() {
 
     // ─── Phase indicator bar ───
 
-    const phaseLabel = PHASE_LABELS[phase];
+    const phaseLabel = PHASE_LABELS[phase] || PHASE_LABELS.idle;
 
     // ═══════════════════════════════════════
     //  RENDER
     // ═══════════════════════════════════════
 
     return (
-        <div className="flex flex-col h-[calc(100vh-5rem)]">
+        <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-slate-950">
             {/* Header */}
-            <div className="flex items-center justify-between mb-4">
-                <div>
-                    <h2 className="text-3xl font-bold tracking-tight bg-gradient-to-r from-cyan-400 via-blue-500 to-violet-500 bg-clip-text text-transparent">
-                        Research begins here.
+            <div className="flex min-h-16 shrink-0 items-center justify-between gap-3 border-b border-white/10 px-4 sm:px-6">
+                <div className="min-w-0">
+                    <h2 className="truncate text-base font-semibold text-white sm:text-lg">
+                        {activeConv?.title || 'Deal analysis'}
                     </h2>
-                    <p className="text-white/40 text-sm mt-0.5">
-                        Multi-agent M&A intelligence • Local-first, cloud-fallback
-                    </p>
+                    <div className="mt-1 flex items-center gap-2 text-xs text-white/50">
+                        <span className={`h-2 w-2 rounded-full ${isProcessing ? 'animate-pulse bg-amber-400' : 'bg-emerald-400'}`} />
+                        <span>{isProcessing ? `${phaseLabel.text}${phase === 'executing' ? ` · ${executingProgress.done}/${executingProgress.total} agents` : ''}` : dealCompleted ? 'Analysis complete' : 'Ready for analysis'}</span>
+                        {activeDealId && <span className="hidden border-l border-white/20 pl-2 sm:inline">Deal {activeDealId.substring(0, 8)}</span>}
+                        {currentTurnAgentError && <span className="border-l border-white/20 pl-2 text-rose-300">Agent error in this turn</span>}
+                    </div>
                 </div>
                 {messages.length > 1 && (
-                    <Button variant="outline" size="sm" onClick={handleExport} className="border-white/10 text-white/60 hover:text-white hover:bg-white/5">
-                        <Download className="mr-2 h-3.5 w-3.5" /> Export
-                    </Button>
+                    <div className="flex shrink-0 items-center gap-1.5">
+                        <Button variant="outline" size="sm" onClick={() => handleExport('docx')} title="Download Word report (.docx)" className="h-8 border-white/15 bg-transparent px-2.5 text-white/75 hover:bg-white/10 hover:text-white sm:px-3">
+                            <FileText className="h-3.5 w-3.5 sm:mr-2" /><span className="hidden sm:inline">Report</span>
+                        </Button>
+                        <Button variant="outline" size="sm" onClick={() => handleExport('json')} title="Export structured analysis data" className="h-8 border-white/15 bg-transparent px-2.5 text-white/75 hover:bg-white/10 hover:text-white sm:px-3">
+                            <Download className="h-3.5 w-3.5 sm:mr-2" /><span className="hidden sm:inline">Data</span>
+                        </Button>
+                    </div>
                 )}
             </div>
 
@@ -974,16 +1953,33 @@ export function ChatWindow() {
             <div className="flex-1 min-h-0 flex flex-col overflow-hidden rounded-2xl border border-white/[0.06] bg-[#0d0d1a]/80 backdrop-blur-xl shadow-2xl shadow-black/30">
 
                 {/* Messages */}
-                <ScrollArea className="flex-1 min-h-0" type="always">
-                    <div className="space-y-5 p-5">
+                <ScrollArea className="min-h-0 flex-1" type="always">
+                    <div className="mx-auto w-full max-w-5xl space-y-5 px-3 py-5 sm:px-6 sm:py-6">
                         {messages.map(renderMessage)}
                         <div ref={messagesEndRef} className="h-1 w-full" />
                     </div>
                 </ScrollArea>
 
+                {approvalRequest && (
+                    <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-amber-300/20 bg-amber-300/[0.06] px-4 py-3 sm:px-6" role="status">
+                        <div className="flex min-w-0 items-center gap-2 text-sm text-amber-100">
+                            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-300" />
+                            <span>Review the {approvalRequest.taskCount}-task plan above. Nothing runs until you approve.</span>
+                        </div>
+                        <div className="ml-auto flex shrink-0 items-center gap-2">
+                            <Button variant="outline" size="sm" onClick={() => approvalRequest.resolve(false)} className="border-white/15 bg-transparent text-white/75 hover:bg-white/10">
+                                Cancel
+                            </Button>
+                            <Button size="sm" onClick={() => approvalRequest.resolve(true)}>
+                                <CheckCircle2 className="mr-2 h-4 w-4" /> Approve &amp; run
+                            </Button>
+                        </div>
+                    </div>
+                )}
+
                 {/* Follow-up Suggestions */}
                 {followUps.length > 0 && !isProcessing && (
-                    <div className="px-5 py-3 border-t border-white/5">
+                    <div className="shrink-0 border-t border-white/10 px-4 py-3 sm:px-6">
                         <div className="flex items-center gap-2 mb-2">
                             <HelpCircle className="h-3.5 w-3.5 text-cyan-400" />
                             <span className="text-xs font-semibold text-cyan-400">Follow-up questions</span>
@@ -1015,7 +2011,7 @@ export function ChatWindow() {
                 )}
 
                 {/* ═══ Input Area ═══ */}
-                <div className="border-t border-white/[0.06] p-4">
+                <div className="shrink-0 border-t border-white/10 bg-slate-950 px-3 py-3 sm:px-6 sm:py-4">
                     {/* Textarea */}
                     <div className="relative rounded-xl border border-white/10 bg-white/[0.03] focus-within:border-cyan-500/30 focus-within:bg-white/[0.05] transition-all duration-300">
                         <textarea

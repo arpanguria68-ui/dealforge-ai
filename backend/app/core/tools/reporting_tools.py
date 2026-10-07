@@ -1,8 +1,9 @@
 """
-OFAS Reporting Tools — IC Memo, Deck Assembly, Compliance QA
+OFAS Reporting Tools — IC Memo, Meeting Memo, Deck Assembly, Compliance QA
 
 MCP Tools:
-- generate_ic_memo: Assemble Investment Committee memo (DOCX/PDF) with citation system
+- generate_ic_memo: Assemble Investment Committee memo (PDF) with citation system
+- generate_meeting_memo: Generate meeting minutes/memos for deal discussions
 - generate_deal_deck: Assemble pitch deck (PPTX) from agent analysis results
 """
 
@@ -77,9 +78,10 @@ class GenerateICMemoTool(BaseTool):
                     ),
                     "items": {"type": "object"},
                 },
-                "agent_results": {
-                    "type": "array",
-                    "description": "Raw agent outputs to include in appendix",
+                "format": {
+                    "type": "string",
+                    "description": "Output format: pdf, docx, or markdown",
+                    "enum": ["pdf", "docx", "markdown"],
                 },
             },
             "required": ["ticker", "deal_name", "sections"],
@@ -93,6 +95,7 @@ class GenerateICMemoTool(BaseTool):
         exhibits: Optional[List[Dict]] = None,
         citations: Optional[List[Dict]] = None,
         agent_results: Optional[List[Dict]] = None,
+        format: str = "pdf",
         **kwargs,
     ) -> ToolResult:
         sections = sections or {}
@@ -106,6 +109,11 @@ class GenerateICMemoTool(BaseTool):
             )
 
         try:
+            if format.lower() == "docx":
+                return self._generate_docx_memo(
+                    ticker, deal_name, sections, exhibits, citations
+                )
+
             from fpdf import FPDF
 
             class ICMemo(FPDF):
@@ -378,6 +386,117 @@ class GenerateICMemoTool(BaseTool):
             },
         )
 
+    def _generate_docx_memo(
+        self, ticker, deal_name, sections, exhibits, citations
+    ) -> ToolResult:
+        """Generate IC Memo in DOCX format using python-docx."""
+        try:
+            from docx import Document
+            from docx.shared import Pt, RGBColor
+            from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+            doc = Document()
+            style = doc.styles["Normal"]
+            style.font.name = "Calibri"
+            style.font.size = Pt(11)
+
+            # Header
+            header = doc.add_paragraph()
+            header.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            run = header.add_run(f"CONFIDENTIAL - {deal_name} ({ticker})")
+            run.font.size = Pt(9)
+            run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+
+            # Title page
+            for _ in range(5):
+                doc.add_paragraph()
+
+            p_title = doc.add_paragraph()
+            p_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run_title = p_title.add_run(deal_name)
+            run_title.font.size = Pt(28)
+            run_title.font.bold = True
+            run_title.font.color.rgb = RGBColor(0x00, 0x33, 0x66)
+
+            p_sub = doc.add_paragraph()
+            p_sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run_sub = p_sub.add_run("Investment Committee Memorandum")
+            run_sub.font.size = Pt(18)
+            run_sub.font.color.rgb = RGBColor(0x50, 0x50, 0x50)
+
+            doc.add_paragraph()
+            p_meta = doc.add_paragraph()
+            p_meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p_meta.add_run(f"Ticker: {ticker}\nDate: {datetime.utcnow().strftime('%B %d, %Y')}\nPrepared by: OFAS Multi-Agent System")
+
+            doc.add_page_break()
+
+            # Sections
+            section_order = [
+                ("executive_summary", "1. EXECUTIVE SUMMARY"),
+                ("investment_thesis", "2. INVESTMENT THESIS"),
+                ("company_overview", "3. COMPANY OVERVIEW"),
+                ("market_analysis", "4. MARKET ANALYSIS"),
+                ("financial_analysis", "5. FINANCIAL ANALYSIS"),
+                ("valuation", "6. VALUATION"),
+                ("risks", "7. RISK ASSESSMENT"),
+                ("recommendation", "8. RECOMMENDATION"),
+            ]
+
+            for key, title in section_order:
+                content = sections.get(key)
+                if content:
+                    doc.add_heading(title, level=1)
+                    doc.add_paragraph(content)
+
+            # Exhibits
+            if exhibits:
+                doc.add_page_break()
+                doc.add_heading("EXHIBITS", level=1)
+                for i, exhibit in enumerate(exhibits):
+                    doc.add_heading(f"Exhibit {i+1}: {exhibit.get('title', '')}", level=2)
+                    data = exhibit.get("data", {})
+                    if isinstance(data, dict):
+                        table = doc.add_table(rows=len(data), cols=2)
+                        for j, (k, v) in enumerate(data.items()):
+                            table.rows[j].cells[0].text = str(k)
+                            table.rows[j].cells[1].text = str(v)
+
+            # Citations
+            if citations:
+                doc.add_page_break()
+                doc.add_heading("SOURCE CITATIONS", level=1)
+                for cit in citations:
+                    p = doc.add_paragraph(style="List Bullet")
+                    run = p.add_run(f"[{cit.get('id', '?')}] {cit.get('source', 'Unknown')}")
+                    run.font.bold = True
+                    if cit.get("chunk_id"):
+                        doc.add_paragraph(f"RAG chunk: {cit.get('chunk_id')}", style="List Bullet")
+                    if cit.get("content"):
+                        doc.add_paragraph(f'"{cit.get("content", "")[:300]}"', style="List Bullet")
+
+            # Save
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            filename = f"{ticker}_IC_Memo_{timestamp}.docx"
+            output_path = OUTPUT_DIR / filename
+            doc.save(str(output_path))
+
+            return ToolResult(
+                success=True,
+                data={
+                    "memo_path": str(output_path),
+                    "file_size_kb": round(output_path.stat().st_size / 1024, 1),
+                    "format": "docx",
+                    "pages": "N/A",
+                },
+            )
+        except Exception as e:
+            logger.error("IC memo DOCX generation failed", error=str(e))
+            return self._generate_markdown_memo(
+                ticker, deal_name, sections, exhibits, citations
+            )
+
 
 # ═══════════════════════════════════════════════
 #  2. Deal Deck Assembly (PPTX)
@@ -470,4 +589,159 @@ class GenerateDealDeckTool(BaseTool):
             )
         except Exception as e:
             logger.error("Deck generation failed", error=str(e))
+            return ToolResult(success=False, data=None, error=str(e))
+
+
+# ═══════════════════════════════════════════════
+#  3. Meeting Memo Generator
+# ═══════════════════════════════════════════════
+
+
+class GenerateMeetingMemoTool(BaseTool):
+    """
+    Generate a Meeting Memo for deal discussions, IC meetings, and due diligence sessions.
+    Supports PDF, PPTX, and HTML output formats.
+    
+    Output: Professional meeting memo with attendees, agenda, discussion points,
+    decisions, and action items.
+    """
+
+    def __init__(self):
+        super().__init__(
+            name="generate_meeting_memo",
+            description=(
+                "Generate a Meeting Memo (PDF/PPTX/HTML) for deal discussions. "
+                "Includes attendees, agenda, agent analysis summary, decisions, "
+                "and action items with owners and due dates."
+            ),
+        )
+
+    def get_parameters_schema(self) -> Dict:
+        return {
+            "type": "object",
+            "properties": {
+                "deal_name": {"type": "string", "description": "Deal name"},
+                "meeting_type": {"type": "string", "description": "Type of meeting (IC Review, Due Diligence, etc.)"},
+                "meeting_date": {"type": "string", "description": "Meeting date (YYYY-MM-DD)"},
+                "location": {"type": "string", "description": "Meeting location (Virtual, Office, etc.)"},
+                "duration": {"type": "string", "description": "Meeting duration (e.g., '60 min')"},
+                "attendees": {
+                    "type": "array",
+                    "description": "List of attendees [{name, role, organization}]",
+                    "items": {"type": "object"},
+                },
+                "agenda": {
+                    "type": "array",
+                    "description": "Agenda items",
+                    "items": {"type": "string"},
+                },
+                "agent_results": {
+                    "type": "array",
+                    "description": "Agent analysis outputs to include",
+                },
+                "discussion_summary": {
+                    "type": "object",
+                    "description": "Discussion points: {key_points: [], questions: [], concerns: []}",
+                },
+                "decisions": {
+                    "type": "array",
+                    "description": "Decisions made: [{description, made_by, outcome}]",
+                    "items": {"type": "object"},
+                },
+                "action_items": {
+                    "type": "array",
+                    "description": "Action items: [{description, owner, due_date, status}]",
+                    "items": {"type": "object"},
+                },
+                "format": {
+                    "type": "string",
+                    "description": "Output format: pdf, docx, pptx, or html",
+                    "enum": ["pdf", "docx", "pptx", "html"],
+                },
+            },
+            "required": ["deal_name", "meeting_type"],
+        }
+
+    async def execute(
+        self,
+        deal_name: str = "",
+        meeting_type: str = "Deal Review",
+        meeting_date: str = "",
+        location: str = "Virtual",
+        duration: str = "60 min",
+        attendees: Optional[List[Dict]] = None,
+        agenda: Optional[List[str]] = None,
+        agent_results: Optional[List[Dict]] = None,
+        discussion_summary: Optional[Dict] = None,
+        decisions: Optional[List[Dict]] = None,
+        action_items: Optional[List[Dict]] = None,
+        format: str = "pdf",
+        **kwargs,
+    ) -> ToolResult:
+        attendees = attendees or []
+        agenda = agenda or []
+        agent_results = agent_results or []
+        decisions = decisions or []
+        action_items = action_items or []
+        
+        if not meeting_date:
+            meeting_date = datetime.now().strftime("%Y-%m-%d")
+
+        try:
+            from app.core.reports.meeting_memo import generate_meeting_memo_report
+
+            # Build deal and meeting_info dicts
+            deal = {"name": deal_name}
+            meeting_info = {
+                "meeting_type": meeting_type,
+                "date": meeting_date,
+                "location": location,
+                "duration": duration,
+                "attendees": attendees,
+                "agenda": agenda,
+            }
+
+            # Generate the memo
+            memo_bytes = generate_meeting_memo_report(
+                deal=deal,
+                meeting_info=meeting_info,
+                agent_results=agent_results,
+                format=format,
+                discussion_summary=discussion_summary,
+                decisions=decisions,
+                action_items=action_items,
+            )
+
+            # Save to file
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            ext = format.lower()
+            filename = f"{deal_name.replace(' ', '_')}_MeetingMemo_{timestamp}.{ext}"
+            output_path = OUTPUT_DIR / filename
+
+            with open(str(output_path), "wb") as f:
+                f.write(memo_bytes)
+
+            return ToolResult(
+                success=True,
+                data={
+                    "memo_path": str(output_path),
+                    "file_size_kb": round(output_path.stat().st_size / 1024, 1),
+                    "format": format,
+                    "meeting_type": meeting_type,
+                    "attendee_count": len(attendees),
+                    "agenda_items": len(agenda),
+                    "decision_count": len(decisions),
+                    "action_item_count": len(action_items),
+                },
+            )
+
+        except ImportError as e:
+            return ToolResult(
+                success=False,
+                data=None,
+                error=f"Missing dependency: {str(e)}. Install required packages.",
+            )
+        except Exception as e:
+            logger.error("Meeting memo generation failed", error=str(e))
             return ToolResult(success=False, data=None, error=str(e))

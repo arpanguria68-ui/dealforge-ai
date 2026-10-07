@@ -1,13 +1,7 @@
-"""
-MCP (Model Context Protocol) Integration Layer for DealForge AI
+"""Legacy credential-backed API integrations used by DealForge data tools.
 
-This module provides a standardized interface to connect to external data
-providers using the Model Context Protocol. Inspired by Anthropic's financial
-services plugins which use MCP to connect to Bloomberg, PitchBook, S&P Global.
-
-Current implementation: HTTP-based MCP client stub.
-When a provider's MCP server URL is configured, this client will make
-structured requests to retrieve financial data.
+These providers are ordinary vendor HTTP APIs, not MCP protocol servers. Real
+Streamable HTTP MCP discovery and tool calls live in ``external_client``.
 """
 
 from __future__ import annotations
@@ -54,17 +48,17 @@ MCP_PROVIDERS = {
     },
     "massive": {
         "name": "Massive.com",
-        "description": "Enterprise data platform — company intelligence, market research, alternative data",
+        "description": "U.S. market data, ticker reference data, corporate actions, and market status",
         "url_env": "MASSIVE_MCP_URL",
         "api_key_env": "MASSIVE_API_KEY",
-        "base_url": "https://api.massive.com/v1",
-        "ping_path": "/status",
+        "base_url": "https://api.massive.com",
+        "ping_path": "/v1/marketstatus/now",
         "auth_method": "bearer",
         "capabilities": [
-            "company_data",
-            "market_research",
-            "alternative_data",
-            "people_data",
+            "market_status",
+            "stock_prices",
+            "ticker_reference_data",
+            "corporate_actions",
         ],
     },
     "daloopa": {
@@ -153,8 +147,8 @@ MCP_PROVIDERS = {
         "description": "Comprehensive financial statements, 150+ ratios, DCF, WACC, and market data",
         "url_env": "FMP_MCP_URL",
         "api_key_env": "FMP_API_KEY",
-        "base_url": "https://financialmodelingprep.com/api/v3",
-        "ping_path": "/profile/AAPL",
+        "base_url": "https://financialmodelingprep.com/stable",
+        "ping_path": "/profile?symbol=AAPL",
         "auth_method": "query_param",
         "auth_param": "apikey",
         "capabilities": [
@@ -218,12 +212,10 @@ async def initialize_provider(provider_name: str, api_key: str) -> dict:
     ping_path = provider.get("ping_path", "")
     auth_method = provider.get("auth_method", "bearer")
 
-    # Always save the key to runtime store
-    _runtime_keys[provider_name] = api_key
-    logger.info("mcp_key_saved", provider=provider_name)
-
-    # If no ping URL configured, just save and return ok
+    # Providers without a health endpoint can only confirm that the key was saved.
     if not base_url or not ping_path:
+        _runtime_keys[provider_name] = api_key
+        logger.info("provider_key_saved_without_live_test", provider=provider_name)
         return {
             "ok": True,
             "latency_ms": 0,
@@ -233,7 +225,7 @@ async def initialize_provider(provider_name: str, api_key: str) -> dict:
         }
 
     if not HTTPX_AVAILABLE:
-        return {"ok": True, "latency_ms": 0, "note": "httpx not available; key saved."}
+        return {"ok": False, "latency_ms": 0, "error": "httpx is required to validate provider credentials."}
 
     t0 = time.monotonic()
     try:
@@ -256,6 +248,7 @@ async def initialize_provider(provider_name: str, api_key: str) -> dict:
                 )
         latency_ms = round((time.monotonic() - t0) * 1000, 1)
         if resp.status_code in (200, 201, 204):
+            _runtime_keys[provider_name] = api_key
             logger.info("mcp_ping_ok", provider=provider_name, latency_ms=latency_ms)
             return {
                 "ok": True,
@@ -264,15 +257,18 @@ async def initialize_provider(provider_name: str, api_key: str) -> dict:
                 "capabilities": provider["capabilities"],
             }
         else:
+            _runtime_keys.pop(provider_name, None)
             return {
                 "ok": False,
                 "latency_ms": latency_ms,
-                "error": f"HTTP {resp.status_code}: {resp.text[:200]}",
+                "error": f"HTTP {resp.status_code}: {resp.text[:200].replace(api_key, '[redacted]')}",
             }
     except Exception as e:
+        _runtime_keys.pop(provider_name, None)
         latency_ms = round((time.monotonic() - t0) * 1000, 1)
-        logger.warning("mcp_ping_failed", provider=provider_name, error=str(e))
-        return {"ok": False, "latency_ms": latency_ms, "error": str(e)}
+        safe_error = str(e).replace(api_key, "[redacted]")
+        logger.warning("provider_ping_failed", provider=provider_name, error=safe_error[:200])
+        return {"ok": False, "latency_ms": latency_ms, "error": safe_error[:200]}
 
 
 def get_provider_status() -> list[dict]:
@@ -299,8 +295,7 @@ def get_provider_status() -> list[dict]:
 
 class MCPClient:
     """
-    MCP (Model Context Protocol) client for DealForge AI.
-    Provides a unified interface to query any registered financial data provider.
+    Legacy API-key provider adapter; this does not implement MCP JSON-RPC.
     """
 
     def __init__(self, provider_name: str):
@@ -350,22 +345,48 @@ class MCPClient:
 
         # Dispatch to local ToolRouter instead of JSON-RPC
         _PROVIDER_TO_TOOL = {
-            "search_company": "company_search",
+            "search_company": "company_data",
             "get_financials": "fetch_financial_statements",
             "search": "web_search",
-            "stock_price": "fetch_market_data",
+            "stock_price": "finnhub_data",
         }
 
         mapped_tool = _PROVIDER_TO_TOOL.get(tool_name, tool_name)
+        normalized_params = dict(params or {})
+
+        if mapped_tool == "company_data" and "company_name" not in normalized_params:
+            if normalized_params.get("name"):
+                normalized_params["company_name"] = normalized_params.pop("name")
+
+        if (
+            mapped_tool == "fetch_financial_statements"
+            and "ticker" not in normalized_params
+        ):
+            if normalized_params.get("company_id"):
+                normalized_params["ticker"] = normalized_params.pop("company_id")
+
+        if mapped_tool == "web_search" and "query" not in normalized_params:
+            if normalized_params.get("q"):
+                normalized_params["query"] = normalized_params.pop("q")
+
+        if mapped_tool == "finnhub_data":
+            if "symbol" not in normalized_params:
+                symbol = normalized_params.get("ticker") or normalized_params.get(
+                    "company_id"
+                )
+                if symbol:
+                    normalized_params["symbol"] = symbol
+            normalized_params.setdefault("endpoint", "quote")
 
         try:
             from app.core.tools.tool_router import ToolRouter
+            from app.core.memory.pageindex_client import get_pageindex_client
 
             router = ToolRouter()
+            router.register_default_tools(get_pageindex_client())
 
-            # execute() takes the tool name and kwarg params
-            # We don't have the context here for provenance but the router grabs it if set.
-            result = await router.execute(mapped_tool, **params)
+            # execute() takes a tool name and params dict.
+            result = await router.execute(mapped_tool, normalized_params)
 
             if result.success:
                 logger.info(
@@ -398,8 +419,7 @@ class MCPClient:
 
 class MCPRouter:
     """
-    Routes data requests to the best available MCP provider.
-    Falls back gracefully when providers aren't configured.
+    Routes legacy vendor API requests. Real MCP servers use external_client.
     """
 
     def __init__(self):

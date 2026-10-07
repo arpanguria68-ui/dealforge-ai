@@ -240,6 +240,9 @@ class PageIndexClient:
         In local mode: searches tree structures on disk.
         In cloud mode: calls VectifyAI API.
         """
+        from app.core.laya.graph_nodes import sanitize_brief
+
+        query = sanitize_brief(query)
         logger.info("Querying PageIndex", query=query, top_k=top_k, mode=self.mode)
 
         if self.mode == "local" and self._local_service:
@@ -275,7 +278,7 @@ class PageIndexClient:
             chunks.append(
                 PageIndexChunk(
                     chunk_id=chunk_data["chunk_id"],
-                    content=chunk_data["content"],
+                    content=sanitize_brief(chunk_data["content"], max_chars=5000),
                     page_number=chunk_data.get("page_number", 0),
                     metadata=chunk_data.get("metadata", {}),
                     relevance_score=chunk_data.get("relevance_score", 0.0),

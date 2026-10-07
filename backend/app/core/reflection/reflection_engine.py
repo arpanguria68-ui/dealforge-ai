@@ -2,6 +2,7 @@
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 from enum import Enum
+import json
 import structlog
 
 logger = structlog.get_logger()
@@ -36,7 +37,7 @@ class ReflectionEngine:
             "actionability": 0.20
         }
     
-    def evaluate(
+    async def evaluate(
         self,
         task: str,
         agent_output: Dict[str, Any],
@@ -45,58 +46,108 @@ class ReflectionEngine:
     ) -> ReflectionResult:
         """
         Evaluate agent output quality
-        
-        Args:
-            task: Original task description
-            agent_output: The agent's output
-            expected_format: Expected output structure
-            context: Additional context for evaluation
-            
-        Returns:
-            ReflectionResult with score and feedback
         """
-        scores = {}
-        
-        # Completeness check
-        scores["completeness"] = self._check_completeness(agent_output, expected_format)
-        
-        # Accuracy check (basic heuristics)
-        scores["accuracy"] = self._check_accuracy(agent_output)
-        
-        # Reasoning quality
-        scores["reasoning_quality"] = self._check_reasoning(agent_output)
-        
-        # Actionability
-        scores["actionability"] = self._check_actionability(agent_output)
-        
-        # Calculate weighted score
+        try:
+            # Try LLM reflection (Area 2 high-fidelity)
+            return await self.evaluate_llm(task, agent_output, expected_format)
+        except Exception as e:
+            # Fallback to heuristics if LLM fails
+            logger.warning("llm_evaluation_failed", error=str(e))
+            return self._evaluate_heuristics(task, agent_output, expected_format)
+
+    async def evaluate_llm(
+        self,
+        task: str,
+        agent_output: Dict[str, Any],
+        expected_format: Optional[Dict] = None,
+    ) -> ReflectionResult:
+        """
+        Use LLM to evaluate the quality of another agent's output.
+        This provides high-fidelity scoring beyond keyword heuristics.
+        """
+        from app.core.llm.llm_gateway import get_llm_gateway
+        from app.config import get_settings
+
+        prompt = f"""You are a Senior Quality Assurance Analyst for an M&A platform.
+Evaluate the following task output based on four criteria: 
+1. Completeness (0.0-1.0)
+2. Accuracy (0.0-1.0) 
+3. Reasoning Quality (0.0-1.0)
+4. Actionability (0.0-1.0)
+
+Task Description: {task}
+
+Agent Output:
+{json.dumps(agent_output, indent=2)}
+
+{f"Expected Format: {json.dumps(expected_format)}" if expected_format else ""}
+
+Provide your evaluation in the following JSON format:
+{{
+  "scores": {{
+    "completeness": 0.0,
+    "accuracy": 0.0,
+    "reasoning_quality": 0.0,
+    "actionability": 0.0
+  }},
+  "feedback": "Detailed feedback string",
+  "improvements": ["Improvement 1", "Improvement 2"]
+}}
+"""
+        try:
+            gateway = get_llm_gateway()
+            settings = get_settings()
+            
+            # Use a capable model for reflection
+            response = await gateway.call(
+                provider=getattr(settings, "DEFAULT_LLM_PROVIDER", "gemini"),
+                prompt=prompt,
+                system_prompt="You are a meticulous judge of AI output quality. Return ONLY JSON.",
+                temperature=0.0
+            )
+            
+            data = json.loads(response["content"].strip().strip("```json").strip("```").strip())
+            
+            scores = data.get("scores", {})
+            total_score = sum(
+                scores.get(criterion, 0.5) * weight 
+                for criterion, weight in self.evaluation_criteria.items()
+            )
+            
+            return ReflectionResult(
+                score=total_score,
+                grade=self._score_to_grade(total_score),
+                feedback=data.get("feedback", "Evaluation complete via LLM."),
+                improvements=data.get("improvements", []),
+                confidence=0.9
+            )
+        except Exception as e:
+            logger.warning("LLM reflection failed, falling back to heuristics", error=str(e))
+            return self._evaluate_heuristics(task, agent_output, expected_format)
+
+    def _evaluate_heuristics(
+        self,
+        task: str,
+        agent_output: Dict[str, Any],
+        expected_format: Optional[Dict] = None,
+    ) -> ReflectionResult:
+        """Original heuristic-based evaluation"""
+        scores = {
+            "completeness": self._check_completeness(agent_output, expected_format),
+            "accuracy": self._check_accuracy(agent_output),
+            "reasoning_quality": self._check_reasoning(agent_output),
+            "actionability": self._check_actionability(agent_output),
+        }
         total_score = sum(
-            scores[criterion] * weight 
+            scores[criterion] * weight
             for criterion, weight in self.evaluation_criteria.items()
         )
-        
-        # Determine grade
-        grade = self._score_to_grade(total_score)
-        
-        # Generate feedback
-        feedback = self._generate_feedback(scores, agent_output)
-        
-        # Suggest improvements
-        improvements = self._suggest_improvements(scores)
-        
-        logger.info(
-            "Reflection evaluation complete",
-            score=total_score,
-            grade=grade.value,
-            task_preview=task[:50]
-        )
-        
         return ReflectionResult(
             score=total_score,
-            grade=grade,
-            feedback=feedback,
-            improvements=improvements,
-            confidence=self._calculate_confidence(scores)
+            grade=self._score_to_grade(total_score),
+            feedback=self._generate_feedback(scores, agent_output),
+            improvements=self._suggest_improvements(scores),
+            confidence=self._calculate_confidence(scores),
         )
     
     def _check_completeness(

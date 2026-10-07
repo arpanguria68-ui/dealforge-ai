@@ -1,7 +1,7 @@
 """
 Document Artifact Store — Redis-backed cache for generated deal reports.
 
-Stores PPTX, Excel, and PDF artifacts with metadata so reports are generated
+Stores DOCX, PPTX, Excel, and PDF artifacts with metadata so reports are generated
 once and served instantly on subsequent downloads.
 """
 
@@ -90,6 +90,56 @@ class DocumentStore:
             size=meta["size_human"],
         )
 
+    async def replace_documents(
+        self,
+        deal_id: str,
+        artifacts: Dict[str, bytes],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Atomically publish a complete validated report bundle for a deal."""
+        if not artifacts:
+            raise ValueError("At least one validated report artifact is required.")
+        if any(not isinstance(content, bytes) or not content for content in artifacts.values()):
+            raise ValueError("Report artifacts must contain non-empty bytes.")
+
+        existing_formats = await self.meta_client.smembers(f"docindex:{deal_id}")
+        pipeline = self.client.pipeline(transaction=True)
+        old_keys = []
+        for fmt in existing_formats:
+            old_keys.extend((f"doc:{deal_id}:{fmt}", f"docmeta:{deal_id}:{fmt}"))
+        if old_keys:
+            pipeline.delete(*old_keys)
+        pipeline.delete(f"docindex:{deal_id}")
+
+        manifest = []
+        for fmt, content in artifacts.items():
+            meta = {
+                "deal_id": deal_id,
+                "format": fmt,
+                "size_bytes": len(content),
+                "size_human": self._human_size(len(content)),
+                "generated_at": datetime.utcnow().isoformat(),
+                "status": "ready",
+                **(metadata or {}),
+            }
+            pipeline.set(f"doc:{deal_id}:{fmt}", content, ex=DOCUMENT_TTL_SECONDS)
+            pipeline.set(
+                f"docmeta:{deal_id}:{fmt}",
+                json.dumps(meta).encode("utf-8"),
+                ex=DOCUMENT_TTL_SECONDS,
+            )
+            pipeline.sadd(f"docindex:{deal_id}", fmt)
+            pipeline.expire(f"docindex:{deal_id}", DOCUMENT_TTL_SECONDS)
+            manifest.append(meta)
+        await pipeline.execute()
+        logger.info(
+            "report_bundle_published",
+            deal_id=deal_id,
+            formats=list(artifacts),
+            report_version=(metadata or {}).get("report_version"),
+        )
+        return manifest
+
     async def get_document(self, deal_id: str, fmt: str) -> Optional[bytes]:
         """Retrieve cached document bytes. Returns None on cache miss."""
         doc_key = f"doc:{deal_id}:{fmt}"
@@ -104,6 +154,17 @@ class DocumentStore:
         if data:
             return json.loads(data)
         return None
+
+    async def update_document_metadata(self, deal_id: str, fmt: str, updates: Dict[str, Any]):
+        """Update cached artifact metadata without changing the artifact bytes."""
+        meta = await self.get_document_meta(deal_id, fmt)
+        if not meta:
+            return None
+        meta.update(updates)
+        await self.meta_client.set(
+            f"docmeta:{deal_id}:{fmt}", json.dumps(meta), ex=DOCUMENT_TTL_SECONDS
+        )
+        return meta
 
     # ═══════════════════════════════════════════════════════════
     #  Manifest & Listing
@@ -176,6 +237,7 @@ class DocumentStore:
             "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
             "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             "pdf": "application/pdf",
+            "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         }.get(fmt, "application/octet-stream")
 
     @staticmethod

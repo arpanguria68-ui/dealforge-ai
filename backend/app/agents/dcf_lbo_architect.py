@@ -35,9 +35,19 @@ class DCFLBOArchitectAgent(BaseAgent):
             # Retrieve any relevant knowledge from RAG
             memory_context = []
             if self.pageindex_client:
+                # Retrieve general context
                 memory_context = await self.retrieve_context(
                     f"LBO DCF debt waterfall financial model {task}", top_k=5
                 )
+                # Retrieve specific risk documents if a fact_base is present
+                risk_docs = []
+                if context.get("fact_base"):
+                    company_name = context["fact_base"].get("company_name", "")
+                    if company_name:
+                        risk_docs = await self.retrieve_context(
+                            f"{company_name} risk assessment", top_k=3
+                        )
+                    memory_context.extend(risk_docs) # Add risk docs to memory context
 
             # Build analysis prompt
             system_prompt = self._build_system_prompt()
@@ -49,7 +59,10 @@ class DCFLBOArchitectAgent(BaseAgent):
 
             # Run deterministic calculations if financial data available
             calc_results = {}
-            fin_data = context.get("financial_data", {})
+            # Priority: Use structured FactBase if available
+            fact_base = context.get("fact_base", {})
+            fin_data = fact_base.get("metrics") or context.get("financial_data", {})
+            
             if fin_data:
                 calc_results = self._run_calculations(fin_data)
 
@@ -94,7 +107,9 @@ RULES:
     def _build_prompt(self, task: str, context: Dict, memory: list) -> str:
         prompt = f"TASK: {task}\n\n"
         if context:
-            prompt += f"DEAL CONTEXT:\n{json.dumps(context, default=str)[:3000]}\n\n"
+            prompt += f"DEAL CONTEXT:\n{json.dumps(context, default=str)[:2000]}\n\n"
+            if context.get("fact_base"):
+                prompt += f"FACT BASE (GROUND TRUTH):\n{json.dumps(context['fact_base'], default=str)}\n\n"
         if memory:
             prompt += f"RELEVANT KNOWLEDGE:\n{chr(10).join(str(m)[:200] for m in memory[:3])}\n\n"
         prompt += "Provide your analysis in structured JSON format with sections for each model built."

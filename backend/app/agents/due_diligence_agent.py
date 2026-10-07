@@ -71,7 +71,11 @@ class CommercialDueDiligenceAgent(BaseAgent):
                         memory_context.append({"content": str(chunk)})
 
             # ── Cross-deal intelligence from MemoryEntry ──
-            cross_deal_context = await self._get_cross_deal_context(context)
+            cross_deal_context = (
+                await self._get_cross_deal_context(context)
+                if context.get("allow_cross_deal_patterns") is True
+                else []
+            )
 
             system_prompt = """You are a Senior Strategy Consultant at McKinsey/Bain performing commercial due diligence.
 
@@ -126,7 +130,10 @@ OUTPUT: Respond with structured JSON containing your assessment and source_citat
                     prompt += f"[DOC-{i+1} | chunk:{chunk_id}] {content}\n\n"
 
             if cross_deal_context:
-                prompt += "CROSS-DEAL INTELLIGENCE (patterns from prior analyses):\n"
+                prompt += (
+                    "CROSS-DEAL MEMORY (optional historical heuristics only; not evidence for this target). "
+                    "Never reuse its company-specific facts, figures, risks, or recommendations as current facts.\n"
+                )
                 for insight in cross_deal_context[:3]:
                     prompt += f"- [{insight.get('agent_type', 'unknown')}] {insight.get('content', '')[:200]}\n"
                 prompt += "\n"
@@ -262,7 +269,9 @@ OUTPUT structured JSON."""
         )
 
     async def _get_cross_deal_context(self, context: Dict) -> List[Dict]:
-        """Fetch relevant insights from previous deals via MemoryEntry"""
+        """Fetch prior deal memory only when a caller explicitly opts in."""
+        if context.get("allow_cross_deal_patterns") is not True:
+            return []
         try:
             from app.core.memory.memory_service import get_memory_service
 

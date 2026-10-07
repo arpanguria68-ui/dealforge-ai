@@ -526,7 +526,7 @@ class TaskManager:
             todo.items.append(
                 TodoItem(
                     list_id=todo.id,
-                    title=item_data.get("title", f"Task {i+1}"),
+                    title=item_data.get("title", f"Task {i + 1}"),
                     description=item_data.get("description", ""),
                     assigned_agent=item_data.get(
                         "assigned_agent", self._auto_assign(item_data.get("title", ""))
@@ -551,6 +551,11 @@ class TaskManager:
         await self.initialize()
         return [tl for tl in self._lists.values() if tl.deal_id == deal_id]
 
+    async def list_all_lists(self) -> List[TodoList]:
+        """Return all todo lists across deals."""
+        await self.initialize()
+        return list(self._lists.values())
+
     async def update_task(
         self, list_id: str, task_id: str, updates: Dict[str, Any]
     ) -> Optional[TodoItem]:
@@ -570,6 +575,17 @@ class TaskManager:
                         setattr(item, key, value)
                 item.updated_at = datetime.utcnow().isoformat()
                 await self._persist_item(item)
+                if todo.items and all(task.status == "done" for task in todo.items):
+                    if todo.status in {"in_progress", "needs_review"}:
+                        todo.status = "completed"
+                        import aiosqlite
+
+                        async with aiosqlite.connect(self.db_path) as db:
+                            await db.execute(
+                                "UPDATE todo_lists SET status = ? WHERE id = ?",
+                                ("completed", list_id),
+                            )
+                            await db.commit()
                 return item
         return None
 
@@ -626,6 +642,38 @@ class TaskManager:
                     ("approved", list_id),
                 )
                 await db.commit()
+        return todo
+
+    async def set_list_status(
+        self, list_id: str, status: str
+    ) -> Optional[TodoList]:
+        """Advance a plan through approval and execution without false completion."""
+        await self.initialize()
+        import aiosqlite
+
+        todo = self._lists.get(list_id)
+        if not todo:
+            return None
+
+        if status == todo.status:
+            return todo
+
+        allowed = {
+            "approved": {"in_progress", "needs_review"},
+            "in_progress": {"needs_review", "completed"},
+            "needs_review": {"in_progress", "completed"},
+        }
+        if status not in allowed.get(todo.status, set()):
+            raise ValueError(f"Cannot change task list status from {todo.status} to {status}")
+        if status == "completed" and any(item.status != "done" for item in todo.items):
+            raise ValueError("Cannot complete a task list while tasks remain unfinished")
+
+        todo.status = status
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE todo_lists SET status = ? WHERE id = ?", (status, list_id)
+            )
+            await db.commit()
         return todo
 
     async def reorder_tasks(self, list_id: str, task_ids: List[str]) -> bool:

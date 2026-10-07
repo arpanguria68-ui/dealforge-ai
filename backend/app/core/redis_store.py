@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import structlog
 from typing import Dict, Any, List, Optional
@@ -6,7 +7,17 @@ import redis.asyncio as redis
 
 logger = structlog.get_logger()
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+from app.config import get_settings
+
+settings = get_settings()
+REDIS_URL = settings.REDIS_URL
+
+# ── Configurable TTLs (seconds) ──
+DEAL_TTL = settings.MEMORY_STALENESS_DAYS * 86400
+CONV_TTL = 60 * 86400  # 60 days
+ACTIVITY_TTL = 14 * 86400  # 14 days
+SEARCH_CACHE_TTL = settings.SEARCH_CACHE_TTL
+MAX_ACTIVITY_PER_DEAL = 500
 
 
 class RedisStore:
@@ -33,13 +44,19 @@ class RedisStore:
         return None
 
     async def save_deal(self, deal_id: str, deal_data: Dict[str, Any]):
-        await self.client.set(f"deal:{deal_id}", json.dumps(deal_data))
+        await self.client.setex(f"deal:{deal_id}", DEAL_TTL, json.dumps(deal_data))
 
     async def list_deals(self) -> List[Dict[str, Any]]:
-        keys = await self.client.keys("deal:*")
+        keys = []
+        async for key in self.client.scan_iter(match="deal:*", count=100):
+            keys.append(key)
+
         deals = []
-        for key in keys:
-            data = await self.client.get(key)
+        if not keys:
+            return deals
+
+        rows = await self.client.mget(keys)
+        for data in rows:
             if data:
                 deals.append(json.loads(data))
         return deals
@@ -61,7 +78,10 @@ class RedisStore:
     async def add_activity(self, evt: dict):
         deal_id = evt.get("deal_id")
         if deal_id:
-            await self.client.rpush(f"activity:{deal_id}", json.dumps(evt))
+            key = f"activity:{deal_id}"
+            await self.client.rpush(key, json.dumps(evt))
+            await self.client.ltrim(key, -MAX_ACTIVITY_PER_DEAL, -1)
+            await self.client.expire(key, ACTIVITY_TTL)
 
         # Keep global activity log (recent 1000 events)
         await self.client.rpush("global_activity", json.dumps(evt))
@@ -80,8 +100,8 @@ class RedisStore:
     # ═══════════════════════════════════════════════════════════
 
     async def save_conversation(self, conv_id: str, conv_data: Dict[str, Any]):
-        """Save or update a full conversation."""
-        await self.client.set(f"conv:{conv_id}", json.dumps(conv_data))
+        """Save or update a full conversation with TTL."""
+        await self.client.setex(f"conv:{conv_id}", CONV_TTL, json.dumps(conv_data))
         # Track in sorted set for ordered listing (score = updatedAt timestamp)
         updated_at = conv_data.get("updatedAt", 0)
         await self.client.zadd("conv_index", {conv_id: updated_at})
@@ -117,6 +137,54 @@ class RedisStore:
             keys = [f"conv:{cid}" for cid in conv_ids]
             await self.client.delete(*keys)
         await self.client.delete("conv_index")
+
+    # ═══════════════════════════════════════════════════════════
+    #  Search Result Cache (prevents re-fetching identical queries)
+    # ═══════════════════════════════════════════════════════════
+
+    def _search_cache_key(self, deal_id: str, tool: str, query: str) -> str:
+        query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
+        return f"search:{deal_id}:{tool}:{query_hash}"
+
+    async def cache_search_result(
+        self,
+        deal_id: str,
+        tool: str,
+        query: str,
+        result: Any,
+        ttl: int = SEARCH_CACHE_TTL,
+    ):
+        """Cache a tool search result for a specific deal."""
+        key = self._search_cache_key(deal_id, tool, query)
+        await self.client.setex(key, ttl, json.dumps(result, default=str))
+        logger.debug("search_cached", deal_id=deal_id, tool=tool, query=query[:50])
+
+    async def get_cached_search(
+        self, deal_id: str, tool: str, query: str
+    ) -> Optional[Any]:
+        """Retrieve a cached search result. Returns None on miss."""
+        key = self._search_cache_key(deal_id, tool, query)
+        data = await self.client.get(key)
+        if data:
+            logger.debug("search_cache_hit", deal_id=deal_id, tool=tool)
+            return json.loads(data)
+        return None
+
+    async def invalidate_search_cache(self, deal_id: str):
+        """Remove all cached searches for a deal."""
+        pattern = f"search:{deal_id}:*"
+        keys = []
+        async for key in self.client.scan_iter(match=pattern, count=100):
+            keys.append(key)
+        if keys:
+            await self.client.delete(*keys)
+            logger.info(
+                "search_cache_invalidated", deal_id=deal_id, keys_removed=len(keys)
+            )
+
+    # ═══════════════════════════════════════════════════════════
+    #  Lifecycle
+    # ═══════════════════════════════════════════════════════════
 
     async def close(self):
         await self.client.aclose()

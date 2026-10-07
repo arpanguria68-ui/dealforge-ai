@@ -9,6 +9,9 @@ Both sources are free and require NO API keys.
 """
 
 import json
+import os
+import re
+import time
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 import structlog
@@ -20,15 +23,15 @@ logger = structlog.get_logger()
 # SEC EDGAR API base URL (free, no API key needed)
 SEC_EDGAR_BASE = "https://data.sec.gov"
 SEC_WWW_BASE = "https://www.sec.gov"
-SEC_COMPANY_TICKERS = f"{SEC_WWW_BASE}/files/company_tickers.json"
+SEC_COMPANY_TICKERS = f"{SEC_WWW_BASE}/files/company_tickers_exchange.json"
 SEC_COMPANY_FACTS = f"{SEC_EDGAR_BASE}/api/xbrl/companyfacts"
 
 # Required headers for SEC EDGAR (must identify the software and provide a contact email)
 SEC_HEADERS = {
-    "User-Agent": "DealForge-OFAS/1.0 (contact@dealforge.ai)",
+    "User-Agent": os.environ.get("SEC_USER_AGENT", "DealForge-OFAS/1.0 (contact@dealforge.ai)"),
     "Accept-Encoding": "gzip, deflate",
-    "Host": "www.sec.gov",
 }
+_COMPANY_TICKERS_CACHE: Dict[str, Any] = {"loaded_at": 0.0, "rows": []}
 
 # XBRL taxonomy mappings (Prioritized order: most common/modern first)
 XBRL_INCOME_STATEMENT = {
@@ -161,13 +164,26 @@ class FetchFinancialStatementsTool(BaseTool):
         import asyncio
 
         statements = statements or ["income", "balance", "cashflow"]
-        ticker = ticker.upper().strip()
+        identifier = str(kwargs.get("company_name") or kwargs.get("identifier") or ticker).strip()
+        ticker = identifier.upper()
 
         if not ticker:
             return ToolResult(
                 success=False,
                 data=None,
                 error="Ticker symbol is required",
+            )
+
+        if re.sub(r"[^A-Z0-9]", "", ticker) in {
+            "TARGET", "TARGETCOMPANY", "THETARGET", "UNKNOWN", "COMPANY", "PUBLICCOMPANY"
+        }:
+            return ToolResult(
+                success=False,
+                data=None,
+                error=(
+                    "A specific ticker or issuer name is required. A generic placeholder "
+                    "cannot be resolved to a public company."
+                ),
             )
 
         # Try SEC EDGAR first (blocking I/O → thread)
@@ -179,13 +195,22 @@ class FetchFinancialStatementsTool(BaseTool):
                 success=True,
                 data={
                     "source": "sec_edgar",
-                    "ticker": ticker,
                     "currency": "USD",
                     **result,
                 },
             )
 
-        # Fallback to Yahoo Finance (blocking I/O → thread)
+        if not re.fullmatch(r"[A-Z0-9][A-Z0-9.\-]{0,14}", ticker):
+            return ToolResult(
+                success=False,
+                data=None,
+                error=(
+                    f"SEC EDGAR could not resolve public company '{identifier}'. "
+                    "Private-company financials require supplied documents or a licensed data source."
+                ),
+            )
+
+        # Fallback to Yahoo Finance (blocking I/O → thread); keep its source classification explicit.
         logger.info("SEC EDGAR unavailable, trying Yahoo Finance", ticker=ticker)
         result = await asyncio.to_thread(
             self._fetch_from_yfinance, ticker, statements, periods, frequency
@@ -197,6 +222,8 @@ class FetchFinancialStatementsTool(BaseTool):
                     "source": "yahoo_finance",
                     "ticker": ticker,
                     "currency": "USD",
+                    "source_notice": "Yahoo Finance vendor data; not a primary filing source.",
+                    "retrieved_at": datetime.utcnow().isoformat() + "Z",
                     **result,
                 },
             )
@@ -204,10 +231,7 @@ class FetchFinancialStatementsTool(BaseTool):
         return ToolResult(
             success=False,
             data=None,
-            error=(
-                f"Could not fetch financial data for {ticker}. "
-                f"Install 'requests' for SEC EDGAR or 'yfinance' for Yahoo Finance."
-            ),
+            error=f"Could not retrieve financial statements for {identifier} from SEC EDGAR or the configured secondary source.",
         )
 
     def _fetch_from_edgar(
@@ -223,30 +247,44 @@ class FetchFinancialStatementsTool(BaseTool):
             return None
 
         try:
-            # Step 1: Get CIK from ticker
-            tickers_url = SEC_COMPANY_TICKERS
-            # Note: For tickers_url, we need different headers (Host: www.sec.gov)
-            headers = SEC_HEADERS.copy()
-            headers["Host"] = "www.sec.gov"
-            resp = requests.get(tickers_url, headers=headers, timeout=10)
-            resp.raise_for_status()
-            tickers_data = resp.json()
+            # Step 1: Resolve exact ticker or normalized company name to a SEC CIK.
+            tickers_data = _COMPANY_TICKERS_CACHE.get("rows")
+            if not tickers_data or time.monotonic() - _COMPANY_TICKERS_CACHE["loaded_at"] > 86400:
+                resp = requests.get(SEC_COMPANY_TICKERS, headers=SEC_HEADERS, timeout=10)
+                resp.raise_for_status()
+                payload = resp.json()
+                fields = payload.get("fields", [])
+                if isinstance(payload.get("data"), list) and fields:
+                    tickers_data = [dict(zip(fields, row)) for row in payload["data"]]
+                else:
+                    tickers_data = list(payload.values()) if isinstance(payload, dict) else []
+                _COMPANY_TICKERS_CACHE.update(rows=tickers_data, loaded_at=time.monotonic())
 
-            cik = None
-            for _, entry in tickers_data.items():
-                if entry.get("ticker", "").upper() == ticker:
-                    cik = str(entry["cik_str"]).zfill(10)
-                    break
+            def normalized_name(value: str) -> str:
+                name = re.sub(r"[^A-Z0-9]", "", value.upper())
+                for suffix in ("CORPORATION", "INCORPORATED", "LIMITED", "COMPANY", "CORP", "INC", "LTD", "LLC", "PLC", "CO"):
+                    if name.endswith(suffix) and len(name) > len(suffix) + 2:
+                        return name[:-len(suffix)]
+                return name
 
-            if not cik:
-                logger.warning("Ticker not found in SEC EDGAR", ticker=ticker)
+            matches = []
+            for entry in tickers_data:
+                if not isinstance(entry, dict):
+                    continue
+                symbol = str(entry.get("ticker", "")).upper()
+                title = str(entry.get("name") or entry.get("title") or "")
+                cik_value = entry.get("cik") or entry.get("cik_str")
+                if symbol == ticker or normalized_name(title) == normalized_name(ticker):
+                    matches.append((str(cik_value).zfill(10), symbol, title, entry.get("exchange")))
+
+            if len(matches) != 1:
+                logger.warning("Company identifier not uniquely resolved in SEC EDGAR", identifier=ticker, matches=len(matches))
                 return None
+            cik, resolved_ticker, resolved_name, exchange = matches[0]
 
             # Step 2: Fetch company facts (XBRL data)
             facts_url = f"{SEC_COMPANY_FACTS}/CIK{cik}.json"
-            headers = SEC_HEADERS.copy()
-            headers["Host"] = "data.sec.gov"
-            resp = requests.get(facts_url, headers=headers, timeout=30)
+            resp = requests.get(facts_url, headers=SEC_HEADERS, timeout=30)
             resp.raise_for_status()
             facts = resp.json()
 
@@ -257,30 +295,37 @@ class FetchFinancialStatementsTool(BaseTool):
             result = {
                 "has_data": True,
                 "cik": cik,
-                "entity_name": facts.get("entityName", ticker),
+                "entity_name": facts.get("entityName", resolved_name),
+                "ticker": resolved_ticker,
+                "exchange": exchange,
+                "source": "sec_edgar_companyfacts",
+                "source_url": facts_url,
+                "retrieved_at": datetime.utcnow().isoformat() + "Z",
             }
 
             # Step 3: Extract requested statements
             if "income" in statements:
                 result["income_statement"] = self._extract_xbrl_items(
-                    us_gaap, XBRL_INCOME_STATEMENT, periods, frequency
+                    us_gaap, XBRL_INCOME_STATEMENT, periods, frequency, cik=cik
                 )
 
             if "balance" in statements:
                 result["balance_sheet"] = self._extract_xbrl_items(
-                    us_gaap, XBRL_BALANCE_SHEET, periods, frequency
+                    us_gaap, XBRL_BALANCE_SHEET, periods, frequency, cik=cik
                 )
 
             if "cashflow" in statements:
                 result["cash_flow"] = self._extract_xbrl_items(
-                    us_gaap, XBRL_CASH_FLOW, periods, frequency
+                    us_gaap, XBRL_CASH_FLOW, periods, frequency, cik=cik
                 )
 
             # Extract fiscal years covered
             fiscal_years = set()
             for stmt in ["income_statement", "balance_sheet", "cash_flow"]:
                 if stmt in result:
-                    for item_data in result[stmt].values():
+                    for name, item_data in result[stmt].items():
+                        if name == "_sources":
+                            continue
                         if isinstance(item_data, dict):
                             fiscal_years.update(item_data.keys())
             result["fiscal_years"] = sorted(fiscal_years)[-periods:]
@@ -297,12 +342,13 @@ class FetchFinancialStatementsTool(BaseTool):
         field_map: Dict[str, str],
         periods: int,
         frequency: str,
+        cik: str = "",
     ) -> Dict[str, Any]:
         """Extract standardized financial items from XBRL data"""
         result = {}
-        # Metadata to track which field provided which year's data
         sources = {}
-        unit_filter = "10-K" if frequency == "annual" else "10-Q"
+        annual_forms = {"10-K", "20-F", "40-F"}
+        quarter_forms = {"10-Q"}
 
         for xbrl_field, std_name in field_map.items():
             if xbrl_field not in us_gaap:
@@ -311,12 +357,7 @@ class FetchFinancialStatementsTool(BaseTool):
             field_data = us_gaap[xbrl_field]
             units = field_data.get("units", {})
 
-            # Try USD first, then 'shares', then 'USD/shares'
-            values = (
-                units.get("USD", [])
-                or units.get("shares", [])
-                or units.get("USD/shares", [])
-            )
+            values = next((units[key] for key in ("USD", "USD/shares", "shares", "pure") if key in units), [])
 
             if not values:
                 continue
@@ -328,23 +369,70 @@ class FetchFinancialStatementsTool(BaseTool):
             # Filter by form type and extract yearly values
             for entry in values:
                 form = entry.get("form", "")
-                if unit_filter not in form:
+                allowed_forms = annual_forms if frequency == "annual" else quarter_forms
+                if form not in allowed_forms:
                     continue
 
                 end_date = entry.get("end", "")
                 if not end_date:
                     continue
 
+                start_date = entry.get("start")
+                is_instant = std_name in XBRL_BALANCE_SHEET.values()
+                if start_date:
+                    try:
+                        duration_days = (
+                            datetime.strptime(end_date, "%Y-%m-%d")
+                            - datetime.strptime(start_date, "%Y-%m-%d")
+                        ).days
+                    except ValueError:
+                        continue
+                    if frequency == "annual" and not 330 <= duration_days <= 400:
+                        continue
+                    if frequency != "annual" and not 70 <= duration_days <= 110:
+                        continue
+                elif not is_instant:
+                    continue
+
                 year = end_date[:4]
+                if frequency != "annual":
+                    end = datetime.strptime(end_date, "%Y-%m-%d")
+                    year = f"{end.year}-Q{(end.month - 1) // 3 + 1}"
                 val = entry.get("val")
 
                 # Data prioritized by end_date (newest first)
                 # If we already have data for this year, only overwrite if this field is 'better'
                 # or if the date is actually more recent for the same fiscal year
                 current_entry = result[std_name].get(year)
-                if current_entry is None or end_date > sources[std_name].get(year, ""):
+                filed = entry.get("filed", "")
+                current_filed = sources[std_name].get(year, {}).get("filed", "")
+                reported_fy = entry.get("fy")
+                current_reported_fy = sources[std_name].get(year, {}).get("reported_fy")
+                try:
+                    is_fiscal_year_filing = int(reported_fy) == int(year) and entry.get("fp") == "FY"
+                except (TypeError, ValueError):
+                    is_fiscal_year_filing = False
+                try:
+                    current_is_fiscal_year_filing = (
+                        int(current_reported_fy) == int(year)
+                        and sources[std_name].get(year, {}).get("fiscal_period") == "FY"
+                    )
+                except (TypeError, ValueError):
+                    current_is_fiscal_year_filing = False
+                if (
+                    current_entry is None
+                    or (is_fiscal_year_filing and not current_is_fiscal_year_filing)
+                    or (is_fiscal_year_filing == current_is_fiscal_year_filing and filed > current_filed)
+                ):
                     result[std_name][year] = val
-                    sources[std_name][year] = end_date
+                    accession = str(entry.get("accn", ""))
+                    accession_path = accession.replace("-", "")
+                    sources[std_name][year] = {
+                        "form": form, "filed": filed, "start": start_date,
+                        "end": end_date, "accession": accession,
+                        "reported_fy": reported_fy, "fiscal_period": entry.get("fp"),
+                        "url": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_path}/" if cik and accession_path else None,
+                    }
 
         # Post-process: limit to requested periods and sort years
         processed_result = {}
@@ -353,6 +441,14 @@ class FetchFinancialStatementsTool(BaseTool):
             time_series = {y: years_data[y] for y in sorted(sorted_years)}
             if time_series:
                 processed_result[std_name] = time_series
+
+        processed_result["_sources"] = {
+            metric: {
+                period: metadata for period, metadata in period_map.items()
+                if period in processed_result.get(metric, {})
+            }
+            for metric, period_map in sources.items()
+        }
 
         return processed_result
 

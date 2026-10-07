@@ -21,6 +21,8 @@ from app.core.validation.output_validator import (
     validate_agent_output,
     format_validation_block,
 )
+from app.core.messaging.message_bus import get_message_bus, AgentMessage
+from app.core.knowledge_graph.neo4j_client import DealKnowledgeGraph
 
 logger = structlog.get_logger()
 
@@ -49,6 +51,7 @@ class AgentOutput:
     tool_calls: Optional[List[Dict]] = None
     reflection_score: Optional[float] = None
     issue_tree: Optional[Dict] = None
+    action_id: Optional[int] = None
 
 
 class BaseAgent(ABC):
@@ -66,6 +69,7 @@ class BaseAgent(ABC):
         reflection_engine=None,
         reward_engine=None,
     ):
+        self._llm_client_injected = llm_client is not None
         # Use ModelRouter for mixed cloud+local LLM strategy
         if llm_client:
             self.llm = llm_client
@@ -84,7 +88,39 @@ class BaseAgent(ABC):
             self.tools = ToolRouter()
             self.tools.register_default_tools(self.memory)
 
+        self.bus = get_message_bus()
         self.logger = structlog.get_logger(agent=self.name)
+
+    async def generate_with_routed_fallback(self, prompt: str, system_prompt: Optional[str] = None, max_attempts: int = 3):
+        """Use Laya's task-selected model and the gateway's guarded provider fallback chain."""
+        local_only = bool(getattr(self, "_current_context", {}).get("local_only"))
+        if self._llm_client_injected and not local_only:
+            return await self.llm.generate(prompt, system_prompt)
+        router = get_model_router()
+        if local_only:
+            provider = getattr(self, "_current_context", {}).get("routed_provider")
+            if provider not in {"lmstudio", "ollama"}:
+                raise RuntimeError("Local-only analysis requires an explicitly selected local provider.")
+            model = None
+        else:
+            provider, model, _used_fallback = await router.get_model_route_for_text(
+                self.name, f"{self.name}: {prompt[:1600]}"
+            )
+        result = await get_llm_gateway().call(
+            provider=provider,
+            model=model,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            max_tokens=2048,
+            temperature=0.2,
+            use_cache=True,
+            json_mode=True,
+            allow_fallback=not local_only,
+        )
+        if result.get("error") or not str(result.get("content") or "").strip():
+            raise RuntimeError(f"No configured LLM route returned a usable synthesis ({result.get('error', 'empty response')}).")
+        self._last_llm_provider = result.get("provider_used", provider)
+        return result
 
     @abstractmethod
     async def run(self, task: str, context: Optional[Dict] = None) -> AgentOutput:
@@ -100,24 +136,66 @@ class BaseAgent(ABC):
         """
         pass
 
+    async def emit_message(self, msg_type: str, payload: Dict[str, Any], deal_id: Optional[str] = None):
+        """Helper to emit messages to the inter-agent bus"""
+        msg = AgentMessage(
+            sender=self.name,
+            msg_type=msg_type,
+            payload=payload,
+            deal_id=deal_id or (self._current_context.get("deal_id") if hasattr(self, "_current_context") else None)
+        )
+        await self.bus.publish(msg)
+
     async def run_with_structure(
         self, task: str, context: Optional[Dict] = None
     ) -> AgentOutput:
         """
         DealForge 2.0 structured execution flow:
         0. [NEW] Inject Domain Skill for this task type
+        0.1 [NEW] Inject historical best practices (closed RL loop)
         1. Generate MECE Issue Tree (hypothesis-first)
         2. Validate MECE completeness
         3. Retrieve context per branch
         4. Execute analysis with tools
         5. [NEW] Validate financial output for mathematical consistency
         6. Store learnings to memory
+        7. [NEW] Reflect, reward, and update best practices
         """
         start_time = datetime.now()
         self.logger.info("Starting structured analysis", task=task, agent=self.name)
 
         # Step 0: DealForge 2.0 — Inject Domain Skill
         skill_context = build_skill_context(task, self.name)
+
+        # [NEW] Step 0.1: Closed-loop RL — inject historical best practices
+        best_practices_context = ""
+        action_id = None
+        try:
+            from app.core.quality.agent_quality_store import AgentQualityStore
+            quality_store = AgentQualityStore()
+            await quality_store.initialize()
+            practices = await quality_store.get_historical_best_practices(
+                self.name, task[:50]
+            )
+            if practices:
+                best_practices_context = (
+                    "\n\n## Historical Best Practices (from prior high-scoring runs)\n"
+                    + "\n".join(f"- {p}" for p in practices)
+                )
+                self.logger.info(
+                    "RL best practices injected",
+                    agent=self.name,
+                    practice_count=len(practices),
+                )
+            # Log this action for the RL reward loop
+            action_id = await quality_store.log_action(
+                agent_name=self.name,
+                task_type=task[:50],
+                deal_context=context or {},
+                action_payload={"task": task[:200], "has_best_practices": bool(practices)},
+            )
+        except Exception as e:
+            self.logger.warning("RL best practices injection failed", error=str(e))
 
         # [NEW] Step 0.5: Sector Customization Framework
         from app.core.sector_loader import load_sector_config, build_sector_prompt
@@ -128,21 +206,46 @@ class BaseAgent(ABC):
             cfg = load_sector_config(sector_name)
             sector_prompt = build_sector_prompt(self.name, cfg)
 
-        if skill_context or sector_prompt:
+        # [NEW] Step 0.7: Inter-Agent Messaging Context [Area 1]
+        messaging_context = ""
+        if (context or {}).get("deal_id"):
+            try:
+                past_msgs = await self.bus.get_messages(context["deal_id"])
+                if past_msgs:
+                    messaging_context = (
+                        "\n\n## Inter-Agent Insights (Shared by other agents)\n"
+                        + "\n".join([f"- [{m.sender}]: {m.payload.get('summary', str(m.payload))}" for m in past_msgs if m.msg_type == "insight_discovered"])
+                    )
+            except Exception as e:
+                self.logger.warning("messaging_context_failed", error=str(e))
+
+        if skill_context or sector_prompt or best_practices_context or messaging_context:
             self.logger.info(
                 "Context injection",
                 agent=self.name,
                 has_skill=bool(skill_context),
                 has_sector=bool(sector_prompt),
+                has_best_practices=bool(best_practices_context),
+                has_messages=bool(messaging_context),
             )
             # Pass injected traits to the LLM context via enriched_context
             context = {
                 **(context or {}),
-                "skill_context": skill_context,
+                "skill_context": (skill_context or "") + (best_practices_context or "") + (messaging_context or ""),
                 "sector_prompt": sector_prompt,
             }
 
         self._current_context = context  # Store centrally for generate_with_tools
+
+        # Emit SSE agent_starting event so frontend gets real-time updates
+        deal_id = (context or {}).get("deal_id")
+        task_id = (context or {}).get("task_id", f"{self.name}_{id(self)}")
+        if deal_id:
+            try:
+                from app.api.stream import emit_agent_starting
+                await emit_agent_starting(deal_id, self.name, task_id, task)
+            except Exception:
+                pass
 
         # Step 1: Generate MECE Issue Tree
         issue_tree = await self.generate_issue_tree(task, context)
@@ -190,9 +293,118 @@ class BaseAgent(ABC):
                 ],
             )
 
-        execution_time = (datetime.now() - start_time).total_seconds() * 1000
-        output.execution_time_ms = execution_time
+        # Step 8: Closed-loop RL — reflect, reward, update best practices
+        try:
+            if action_id is not None:
+                reflection_score = await self.reflect(task, output)
+                reward = self.reward.compute_reward(
+                    reflection_score=reflection_score,
+                    task_completed=output.success,
+                )
+                output.reflection_score = reflection_score
+
+                from app.core.quality.agent_quality_store import AgentQualityStore
+                quality_store = AgentQualityStore()
+                await quality_store.initialize()
+                await quality_store.reward_action(
+                    action_id, reward, f"reflection={reflection_score:.2f}"
+                )
+                if reward >= 0.7:
+                    await quality_store.update_best_practices(
+                        self.name, task[:50]
+                    )
+                self.logger.info(
+                    "RL loop closed",
+                    reflection=round(reflection_score, 3),
+                )
+
+                # Step 9: Emit Insight discovered message
+                if output.success and output.confidence >= 0.8:
+                    await self.emit_message(
+                        msg_type="insight_discovered",
+                        payload={
+                            "task": task[:100],
+                            "confidence": output.confidence,
+                            "summary": output.reasoning[:200]
+                        }
+                    )
+        except Exception as e:
+            self.logger.warning("RL reward loop failed", error=str(e))
+
+        execution_time_ms = (datetime.now() - start_time).total_seconds() * 1000
+        output.execution_time_ms = execution_time_ms
+        output.action_id = action_id
+
+        # Emit SSE agent_completed / agent_error event for real-time frontend updates
+        if deal_id:
+            try:
+                from app.api.stream import emit_agent_completed, emit_agent_error
+                if output.success:
+                    await emit_agent_completed(
+                        deal_id=deal_id,
+                        agent_type=self.name,
+                        task_id=task_id,
+                        result=output.data,
+                        reasoning=output.reasoning[:500] if output.reasoning else "",
+                        confidence=output.confidence,
+                        execution_time_ms=execution_time_ms,
+                    )
+                else:
+                    await emit_agent_error(
+                        deal_id=deal_id,
+                        agent_type=self.name,
+                        task_id=task_id,
+                        error=output.reasoning or "Agent returned failure",
+                    )
+            except Exception:
+                pass
+
+        # [NEW] Phase 4: Write findings to knowledge graph (F-023)
+        if output.success and deal_id:
+            try:
+                kb_graph = (context or {}).get("kb_graph")
+                if kb_graph:
+                    await self._write_findings_to_graph(output.data, deal_id, kb_graph)
+            except Exception as e:
+                self.logger.warning("graph_write_back_failed", error=str(e))
+
         return output
+
+    async def _write_findings_to_graph(self, findings: Dict[str, Any], deal_id: str, kb_graph: Any):
+        """Extract entities/metrics from findings and persist to Neo4j (F-023)."""
+        self.logger.info("writing_to_graph", deal_id=deal_id)
+        
+        # 1. Handle specialized metrics (Financial Analyst)
+        metrics = findings.get("metrics", {}) or {}
+        if not metrics and "valuation" in findings:
+             metrics = findings["valuation"]
+             
+        for k, v in metrics.items():
+            if isinstance(v, (int, float)):
+                await kb_graph.add_entity(deal_id, f"{self.name}_{k}", "Metric", {"value": v, "agent": self.name})
+
+        # 2. Handle Risks (Risk Assessor / Legal Advisor)
+        risks = findings.get("risks", []) or []
+        for risk in risks:
+            if isinstance(risk, dict):
+                await kb_graph.add_risk(
+                    deal_id=deal_id,
+                    risk_name=risk.get("name", "Unknown Risk"),
+                    severity=risk.get("severity", 5),
+                    category=risk.get("category", "General"),
+                    description=risk.get("description", "")
+                )
+        
+        # 3. Handle Companies/Entities (Market Researcher)
+        entities = findings.get("entities", []) or []
+        for ent in entities:
+             if isinstance(ent, dict):
+                 await kb_graph.add_entity(
+                     deal_id=deal_id,
+                     entity_name=ent.get("name"),
+                     entity_label=ent.get("label", "Company"),
+                     properties=ent
+                 )
 
     async def _validate_and_annotate_output(
         self, task: str, output: "AgentOutput"
@@ -232,20 +444,46 @@ class BaseAgent(ABC):
     async def retrieve_context(
         self, query: str, top_k: int = 5, deal_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Retrieve relevant context from memory, filtered by deal_id when provided"""
+        """Retrieve context within the active deal whenever one is available."""
         try:
+            if deal_id is None:
+                active_context = getattr(self, "_current_context", None)
+                if isinstance(active_context, dict):
+                    deal_id = active_context.get("deal_id")
             kwargs = {"top_k": top_k}
             if deal_id:
                 kwargs["filters"] = {"deal_id": deal_id}
+            
+            # Use TokenBudget if available in context (F-011)
+            budget = self._current_context.get("token_budget") if hasattr(self, "_current_context") else None
+            
             chunks = await self.memory.query(query, **kwargs)
-            return [
-                {
+            results = []
+            for chunk in chunks:
+                res = {
                     "content": chunk.content,
                     "page": chunk.page_number,
                     "relevance": chunk.relevance_score,
+                    "source": chunk.metadata.get("filename") if hasattr(chunk, "metadata") else "unknown"
                 }
-                for chunk in chunks
-            ]
+                results.append(res)
+                
+                # Record in source registry if deal_id is present (F-014)
+                if deal_id and hasattr(self, "_current_context"):
+                    if "source_registry" not in self._current_context:
+                        self._current_context["source_registry"] = {}
+                    if self.name not in self._current_context["source_registry"]:
+                        self._current_context["source_registry"][self.name] = []
+                    
+                    source_info = {
+                        "title": res["source"],
+                        "type": "document_chunk",
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                    if source_info not in self._current_context["source_registry"][self.name]:
+                        self._current_context["source_registry"][self.name].append(source_info)
+
+            return results
         except Exception as e:
             self.logger.error("Context retrieval failed", error=str(e))
             return []
@@ -256,6 +494,7 @@ class BaseAgent(ABC):
         system_prompt: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tool_rounds: int = 3,
+        json_mode: bool = False,
     ) -> Dict[str, Any]:
         """Generate response with tool calls, routed through LLM Gateway.
 
@@ -268,18 +507,38 @@ class BaseAgent(ABC):
         if temperature is None:
             temperature = 0.0
 
-        # Get available tools (filtered per-agent via AGENT_TOOL_MAP)
-        tools = self.tools.list_tools(agent_name=self.name)
+        # Laya shortlists task-relevant tools inside the agent's allow-list.
+        task_tool_list = getattr(self.tools, "list_tools_for_task", None)
+        if task_tool_list:
+            tools = await task_tool_list(prompt, agent_name=self.name)
+        else:
+            tools = self.tools.list_tools(agent_name=self.name)
+        allowed_tool_names = [
+            t.get("function", {}).get("name") for t in tools
+            if t.get("function", {}).get("name")
+        ]
 
-        # Inject Sector Prompt dynamically
+        # Inject Sector Prompt & Skill Context (Best Practices) dynamically
         ctx = getattr(self, "_current_context", {})
         sector_prompt = ctx.get("sector_prompt")
+        skill_context = ctx.get("skill_context")
+        
         if sector_prompt:
             system_prompt = (system_prompt or "") + "\n\n" + sector_prompt
+        if skill_context:
+            system_prompt = (system_prompt or "") + "\n\n" + skill_context
 
-        # Get provider from router (respects UI settings)
+        # Keep the task-level Laya decision for every call in this tool loop.
         model_router = get_model_router()
-        provider = model_router.get_provider_for_agent(self.name)
+        selected_model = None
+        if ctx.get("routed_provider"):
+            provider = ctx["routed_provider"]
+        else:
+            provider, selected_model, _ = await model_router.get_model_route_for_text(
+                self.name, f"{self.name}: {prompt[:1600]}"
+            )
+        if selected_model:
+            self.logger.info("laya_model_selected", agent=self.name, provider=provider, model=selected_model)
         is_local_model = provider in ["ollama", "lmstudio", "mistral"]
 
         gateway = get_llm_gateway()
@@ -318,74 +577,31 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
                 system_prompt=system_prompt,
                 tools=effective_tools,
                 temperature=temperature,
+                json_mode=json_mode,
+                model=selected_model,
+                allow_fallback=not bool(ctx.get("local_only")),
             )
-
-            # Parse ReAct JSON for local models
-            if is_local_model and tools:
-                content = response.get("content", "")
-                print(f"DEBUG - Raw Local Content:\n{content}\n" + "="*40)
-                # Attempt to find JSON blocks both with and without code blocks
-                json_blocks = re.findall(
-                    r"```json\s*(\{.*?\})\s*```", content, re.DOTALL
+            if response.get("error"):
+                raise RuntimeError(
+                    f"LLM provider call failed ({response['error']}): "
+                    f"{response.get('content') or 'No usable response'}"
                 )
-                if not json_blocks:
-                    # Fallback: look for any { } block that looks like it might be a tool call
-                    json_blocks = re.findall(
-                        r"(\{.*?\})", content, re.DOTALL
-                    )
-                function_calls = []
-                for block in json_blocks:
-                    try:
-                        parsed = json.loads(block)
-                        # Be flexible with tool call keys
-                        tool_name = parsed.get("command") or parsed.get("tool") or parsed.get("name") or parsed.get("call")
-                        if tool_name and isinstance(tool_name, str):
-                            args = parsed.get("args") or parsed.get("parameters") or parsed.get("params") or {}
-                            
-                            # If args is a string, it might be double-encoded JSON
-                            if isinstance(args, str):
-                                try:
-                                    args = json.loads(args)
-                                except:
-                                    pass
-                                    
-                            function_calls.append(
-                                {
-                                    "name": tool_name,
-                                    "args": args if isinstance(args, dict) else {},
-                                }
-                            )
-                    except json.JSONDecodeError:
-                        # Attempt JSON repair for common local LLM issues
-                        try:
-                            repaired = block.rstrip(",").rstrip()
-                            if not repaired.endswith("}"):
-                                repaired += "}"
-                            parsed = json.loads(repaired)
-                            tool_name = parsed.get("command") or parsed.get("tool") or parsed.get("name") or parsed.get("call")
-                            if tool_name and isinstance(tool_name, str):
-                                args = parsed.get("args") or parsed.get("parameters") or parsed.get("params") or {}
-                                
-                                # If args is a string, it might be double-encoded JSON
-                                if isinstance(args, str):
-                                    try:
-                                        args = json.loads(args)
-                                    except:
-                                        pass
-                                        
-                                function_calls.append(
-                                    {
-                                        "name": tool_name,
-                                        "args": args if isinstance(args, dict) else {},
-                                    }
-                                )
-                            self.logger.info("JSON repair succeeded for ReAct block")
-                        except json.JSONDecodeError:
-                            self.logger.warning(
-                                "Failed to parse/repair ReAct JSON block", block=block
-                            )
-                if function_calls:
-                    response["function_calls"] = function_calls
+
+            # Local models often represent ReAct calls as JSON text instead of
+            # returning native function_calls.
+            if is_local_model and not response.get("function_calls"):
+                content = response.get("content", "")
+                if '"command"' in content or "'command'" in content:
+                    from app.core.json_helpers import extract_and_parse_json
+
+                    parsed = extract_and_parse_json(content)
+                    if isinstance(parsed, dict) and isinstance(parsed.get("command"), str):
+                        args = parsed.get("args", {})
+                        response["function_calls"] = [{
+                            "name": parsed["command"],
+                            "args": args if isinstance(args, dict) else {},
+                        }]
+                        response["content"] = ""
 
             # Check if tool calls were requested
             if not response.get("function_calls"):
@@ -399,7 +615,8 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
 
             # Execute tools
             tool_results = await self.tools.execute_function_calls(
-                response["function_calls"]
+                response["function_calls"],
+                allowed_tools=allowed_tool_names,
             )
 
             round_results = []
@@ -435,7 +652,15 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
                 prompt=final_prompt,
                 system_prompt=system_prompt,
                 temperature=temperature,
+                json_mode=json_mode,
+                model=selected_model,
+                allow_fallback=not bool(ctx.get("local_only")),
             )
+            if final_response.get("error"):
+                raise RuntimeError(
+                    f"LLM provider synthesis failed ({final_response['error']}): "
+                    f"{final_response.get('content') or 'No usable response'}"
+                )
             response["content"] = final_response.get("content", "")
             response["tool_results"] = accumulated_tool_results
             response["function_calls"] = all_function_calls
@@ -480,12 +705,14 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
 
 Your task is to provide thorough, well-reasoned analysis with specific data points and actionable recommendations.
 
-Guidelines:
-- Always show your reasoning process
-- Cite specific data and sources
-- Provide actionable recommendations
-- Be objective and highlight both positives and concerns
-- Format output as structured JSON when requested
+Evidence and decision discipline:
+- Distinguish user-provided inputs, tool-sourced facts, deterministic calculations, and estimates.
+- Treat missing, null, or failed tool data as unknown; never convert it to zero or fill it with a plausible value.
+- Cite the tool/source and relevant period for externally sourced quantitative claims. Do not claim a lookup occurred unless a tool result is present.
+- Preserve conflicting source values and describe the discrepancy; do not silently overwrite user inputs.
+- State concise conclusions and material assumptions, not private chain-of-thought.
+- Provide actionable recommendations proportional to the evidence, and state when evidence is insufficient.
+- Format output as structured JSON when requested; represent unavailable numeric fields as null.
 """
         if not context:
             return base + self._CITATION_DISCIPLINE
@@ -529,7 +756,7 @@ Guidelines:
         self, task: str, output: AgentOutput, expected_schema: Optional[Dict] = None
     ) -> float:
         """Run reflection on agent output"""
-        reflection_result = self.reflection.evaluate(
+        reflection_result = await self.reflection.evaluate(
             task=task, agent_output=output.data, expected_format=expected_schema
         )
 
@@ -603,14 +830,15 @@ Respond with JSON:
 }}"""
 
         try:
-            llm = get_model_router().get_client_for_agent(self.name)
-            provider = get_model_router().get_provider_for_agent(self.name)
+            router = get_model_router()
+            provider = (context or {}).get("routed_provider") or router.get_provider_for_agent(self.name)
 
             response = await get_llm_gateway().call(
                 provider=provider,
                 prompt=tree_prompt,
                 system_prompt="You are a McKinsey-trained structured problem solver. Return only valid JSON.",
                 temperature=0.0,
+                allow_fallback=not bool((context or {}).get("local_only")),
             )
             tree_data = json.loads(
                 response["content"].strip().strip("```json").strip("```").strip()
@@ -652,11 +880,119 @@ Respond with JSON:
                 ],
             )
 
+    async def run_iterative(
+        self,
+        task: str,
+        context: Dict[str, Any],
+        max_iterations: int = 3,
+        gap_detection_prompt: Optional[str] = None,
+    ) -> AgentOutput:
+        """
+        Iterative research (IterDRAG): task → findings → gap detection → re-retrieval → synthesis.
+        Prevents context bloat via running summaries.
+        """
+        findings = []
+        current_context = dict(context)
+        final_reasoning = ""
+        
+        for iteration in range(max_iterations):
+            self.logger.info("iterdrag_iteration_start", iteration=iteration+1, max=max_iterations)
+            
+            # Step 1: Run standard analysis
+            result = await self.run(task, current_context)
+            if not result.success:
+                return result
+                
+            findings.append(result.data)
+            final_reasoning = result.reasoning
+            
+            # Step 2: Stop early if final iteration or if no gaps detected
+            if iteration == max_iterations - 1:
+                break
+                
+            # Step 3: Detect research gaps
+            gaps = await self._detect_research_gaps(task, result.data, gap_detection_prompt)
+            if not gaps:
+                self.logger.info("no_research_gaps_detected", iteration=iteration+1)
+                break
+                
+            self.logger.info("research_gaps_identified", count=len(gaps))
+            
+            # Step 4: Maintain running summary (F-013) to prevent context explosion
+            summary = await self._maintain_running_summary(iteration + 1, result.data)
+            
+            # Step 5: Update context for next iteration
+            current_context["running_summary"] = summary
+            current_context["retrieval_hint"] = "Focus on these unanswered gaps: " + "; ".join(gaps)
+            
+            # Trigger fresh retrieval based on hints? 
+            # In simple impl, we just pass the hint to the next run.
+            
+        # Consolidate final output
+        return AgentOutput(
+            success=True,
+            data={
+                "iterations": len(findings),
+                "all_findings": findings,
+                "final_synthesis": findings[-1] if findings else {},
+            },
+            reasoning=final_reasoning,
+            confidence=sum(f.get("confidence", 0.7) for f in findings) / len(findings) if findings else 0.0
+        )
+
+    async def _detect_research_gaps(self, task: str, findings: Dict, prompt: Optional[str] = None) -> List[str]:
+        """Use LLM to identify unanswered questions or missing data in current findings (F-012)."""
+        gap_prompt = prompt or f"""
+        Original Task: {task}
+        Current Findings: {json.dumps(findings, indent=2)}
+        
+        Identify the top 3 critical data points or questions that remain unanswered and are essential for a professional M&A analysis.
+        Return ONLY a JSON array of strings. If no gaps exist, return [].
+        """
+        
+        try:
+            gateway = get_llm_gateway()
+            # Fast model for gap detection
+            response = await gateway.call(
+                provider="gemini",
+                model="gemini-3.8-flash",
+                prompt=gap_prompt,
+                temperature=0.0,
+                max_tokens=256
+            )
+            content = response.get("content", "[]")
+            clean_json = content.strip().strip("```json").strip("```").strip()
+            gaps = json.loads(clean_json)
+            return gaps[:3] if isinstance(gaps, list) else []
+        except Exception as e:
+            self.logger.warning("gap_detection_failed", error=str(e))
+            return []
+
+    async def _maintain_running_summary(self, iteration: int, findings: Dict) -> str:
+        """Compress prior findings into a concise overview to keep context window clean (F-013)."""
+        summary_prompt = f"""
+        Iteration {iteration} Findings: {json.dumps(findings, indent=2)}
+        
+        Summarize the key facts, risks, and conclusions above in 3-5 high-density sentences.
+        Maintain all specific numbers and dollar values.
+        """
+        
+        try:
+            gateway = get_llm_gateway()
+            response = await gateway.call(
+                provider="gemini",
+                model="gemini-3.8-flash",
+                prompt=summary_prompt,
+                temperature=0.0,
+                max_tokens=300
+            )
+            return response.get("content", "").strip()
+        except Exception as e:
+            self.logger.warning("summary_maintenance_failed", error=str(e))
+            return "Summary unavailable."
+
     def validate_mece(self, tree: IssueTreeNode) -> tuple[bool, List[str]]:
-        """
-        Validate that the issue tree is MECE.
-        Returns (is_valid, list_of_gaps).
-        """
+        """Validate if the issue tree is MECE (F-015: Loop-back triggers)"""
         required_dimensions = {
             "financial": False,
             "strategic": False,
@@ -716,7 +1052,7 @@ Respond with JSON:
         Store learnings/insights to the MemoryEntry table for cross-deal intelligence.
         """
         try:
-            await self.memory.ingest_document(
+            await self.memory.ingest_text(
                 content=content,
                 metadata={
                     "agent_type": self.name,

@@ -198,6 +198,8 @@ CAPABILITIES:
 - CCC: Cash conversion cycle (operating cycle - payables period)
 - EVA: Economic Value Added = NOPAT - (WACC × Capital)
 - SGR: Sustainable growth rate = ROE × Retention ratio
+- Scenario Analysis: Use `run_sensitivity_analysis` for 2D valuation tables.
+- Synergies & Execution Risk: Use `run_monte_carlo_irr` for M&A synergy simulations.
 
 RULES:
 - **CRITICAL: NEVER hallucinate financial data. Use tools to fetch real data.**

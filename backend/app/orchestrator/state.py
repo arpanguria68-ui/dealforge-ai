@@ -175,6 +175,8 @@ class DealStage(str, Enum):
     DECISION = "decision"
     COMPLETED = "completed"
     ERROR = "error"
+    IC_MEMO = "ic_memo"
+    DEEP_DIVE = "deep_dive"
 
 
 class AgentState(str, Enum):
@@ -213,6 +215,7 @@ class DealState(TypedDict, total=False):
     red_team_output: Optional[Dict[str, Any]]
     scoring_output: Optional[Dict[str, Any]]
     analyst_output: Optional[Dict[str, Any]]
+    fact_base: Optional[Dict[str, Any]]
 
     # MECE Issue Tree
     issue_tree: Optional[Dict[str, Any]]
@@ -248,6 +251,24 @@ class DealState(TypedDict, total=False):
     awaiting_decision: bool
     decision_request: Optional[Dict[str, Any]]
 
+    # Loop-back convergence guard (F-008)
+    loop_count: int           # tracks number of loop-backs to prevent infinite loops
+    revision_targets: List[str]  # which agents need revision in the next loop-back
+
+    # Source Tracking (F-014)
+    source_registry: Dict[str, List[Dict[str, Any]]] # {agent_name: [{"title": "...", "url": "...", "type": "..."}]}
+
+    # Dynamic Tasking (F-019)
+    dynamic_tasks: Dict[str, str]  # {agent_name: "specific task instructions"}
+
+    # Phase 5: Advanced Orchestration (F-026, F-027, F-028)
+    selected_agents: List[str]
+    specialist_outputs: Dict[str, Any]
+    quality_results: Dict[str, Any]
+    stakeholder_reactions: Optional[Dict[str, Any]]
+    deal_size: int
+    deal_type: str
+
 
 class WorkflowConfig(TypedDict, total=False):
     """Configuration for workflow execution"""
@@ -272,6 +293,16 @@ class WorkflowConfig(TypedDict, total=False):
     # Scoring
     scoring_weights: Dict[str, float]
     min_deal_score: float
+
+def workflow_config_from_runnable(config: Dict[str, Any]) -> WorkflowConfig:
+    """Helper to extract WorkflowConfig from LangGraph RunnableConfig (F-020)"""
+    configurable = config.get("configurable", {})
+    return {
+        "max_iterations": configurable.get("max_iterations", 10),
+        "parallel_execution": configurable.get("parallel_execution", True),
+        "enabled_agents": configurable.get("enabled_agents", ["financial_analyst", "legal_advisor", "risk_assessor", "market_researcher"]),
+        "require_human_approval": configurable.get("require_human_approval", False),
+    }
 
 
 def create_initial_state(
@@ -315,6 +346,15 @@ def create_initial_state(
         "retry_count": 0,
         "awaiting_decision": False,
         "decision_request": None,
+        "loop_count": 0,
+        "revision_targets": [],
+        "source_registry": {},
+        "selected_agents": [],
+        "dynamic_tasks": {},
+        "quality_results": {},
+        "stakeholder_reactions": {},
+        "deal_size": ctx.get("deal_size", 0),
+        "deal_type": ctx.get("deal_type", "M&A"),
     }
 
 
@@ -372,7 +412,7 @@ def all_agents_completed(state: DealState, required_agents: List[str]) -> bool:
 def has_errors(state: DealState) -> bool:
     """Check if any agent has errored"""
     agent_states = state.get("agent_states", {})
-    return any(state == AgentState.ERROR for state in agent_states.values())
+    return any(s == AgentState.ERROR for s in agent_states.values())
 
 
 def get_error_agents(state: DealState) -> List[str]:

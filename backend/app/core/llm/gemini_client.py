@@ -1,5 +1,6 @@
 # Deferred import to prevent startup hang
 # import google.generativeai as genai
+import os
 from typing import List, Dict, Any, Optional, AsyncGenerator
 import json
 import structlog
@@ -47,11 +48,10 @@ class GeminiClient:
     def _get_model(self, tools: Optional[List[Dict]] = None):
         """Get configured model instance"""
         generation_config = {
-            "temperature": 0.7,
-            "top_p": 0.95,
-            "top_k": 40,
             "max_output_tokens": 8192,
         }
+        if not self.model_name.startswith("gemini-3."):
+            generation_config.update(temperature=0.7, top_p=0.95, top_k=40)
 
         if self.provider == "vertex":
             from vertexai.generative_models import GenerativeModel, Tool as VertexTool, FunctionDeclaration
@@ -60,7 +60,6 @@ class GeminiClient:
                 # Transform OpenAI-style tools to Vertex AI format
                 formatted_tools = []
                 for tool in tools:
-                    # ... reuse similar logic or adjust for Vertex if needed ...
                     # Vertex expects Tool(function_declarations=[...])
                     if isinstance(tool, dict):
                         func = dict(tool.get("function", tool))
@@ -86,7 +85,6 @@ class GeminiClient:
 
         if tools:
             # Transform OpenAI-style tools to Gemini format
-            # Gemini expects a list of FunctionDeclarations with specific schema rules
             formatted_tools = []
             for tool in tools:
                 if isinstance(tool, dict):
@@ -131,7 +129,6 @@ class GeminiClient:
             new_schema["type"] = new_schema["type"].upper()
 
         # 2. Remove unsupported fields (Gemini Schema is strict)
-        # These fields cause "ValueError: Unknown field for Schema"
         unsupported_fields = [
             "default",
             "title",
@@ -162,21 +159,26 @@ class GeminiClient:
         system_prompt: Optional[str] = None,
         tools: Optional[List[Dict]] = None,
         temperature: float = 0.7,
+        max_tokens: int = 8192,
+        json_mode: bool = False,
+        **kwargs,
     ) -> Dict[str, Any]:
         """
         Generate text using Gemini
-
-        Args:
-            prompt: User prompt
-            system_prompt: Optional system instructions
-            tools: Optional tool definitions for function calling
-            temperature: Sampling temperature
-
-        Returns:
-            Response dict with content and optional tool calls
         """
         try:
             model = self._get_model(tools)
+
+            # Override generation config with caller-specified values
+            import google.generativeai as genai
+            generation_config = {"max_output_tokens": max_tokens}
+            if not self.model_name.startswith("gemini-3."):
+                generation_config.update(
+                    temperature=temperature, top_p=0.95, top_k=40
+                )
+            if json_mode:
+                generation_config["response_mime_type"] = "application/json"
+            gen_config = genai.GenerationConfig(**generation_config)
 
             # Build conversation
             if system_prompt:
@@ -186,7 +188,9 @@ class GeminiClient:
 
             logger.debug("Gemini generation request", prompt_length=len(full_prompt))
 
-            response = await model.generate_content_async(full_prompt)
+            response = await model.generate_content_async(
+                full_prompt, generation_config=gen_config
+            )
 
             # Extract text content safely
             content = ""
@@ -220,22 +224,13 @@ class GeminiClient:
             }
 
         except Exception as e:
-            logger.error("Gemini generation failed", error=str(e))
+            logger.error("Gemini generation failed", error_type=type(e).__name__)
             raise
 
     async def generate_stream(
         self, prompt: str, system_prompt: Optional[str] = None
     ) -> AsyncGenerator[str, None]:
-        """
-        Stream generation from Gemini
-
-        Args:
-            prompt: User prompt
-            system_prompt: Optional system instructions
-
-        Yields:
-            Text chunks as they are generated
-        """
+        """Stream generation from Gemini"""
         try:
             model = self._get_model()
 
@@ -251,7 +246,7 @@ class GeminiClient:
                     yield chunk.text
 
         except Exception as e:
-            logger.error("Gemini stream generation failed", error=str(e))
+            logger.error("Gemini stream generation failed", error_type=type(e).__name__)
             raise
 
     async def generate_structured(
@@ -260,17 +255,7 @@ class GeminiClient:
         output_schema: Dict[str, Any],
         system_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Generate structured JSON output
-
-        Args:
-            prompt: User prompt
-            output_schema: JSON schema for expected output
-            system_prompt: Optional system instructions
-
-        Returns:
-            Parsed JSON response
-        """
+        """Generate structured JSON output"""
         schema_prompt = f"""
 {prompt}
 
@@ -296,7 +281,9 @@ Respond ONLY with the JSON, no other text.
             return json.loads(json_str)
         except json.JSONDecodeError as e:
             logger.error(
-                "Failed to parse structured output", content=content, error=str(e)
+                "Failed to parse structured output",
+                error_type=type(e).__name__,
+                content_length=len(content or ""),
             )
             raise
 
@@ -308,7 +295,11 @@ class OpenAIClient:
         from openai import AsyncOpenAI
 
         settings = get_settings()
-        self.client = AsyncOpenAI(api_key=api_key or settings.OPENAI_API_KEY)
+        self.client = AsyncOpenAI(
+            api_key=api_key or settings.OPENAI_API_KEY,
+            timeout=60.0,
+            max_retries=0,
+        )
         self.model = model or settings.OPENAI_MODEL
         self.provider = "openai"
         self.max_context = 128000
@@ -318,6 +309,10 @@ class OpenAIClient:
         prompt: str,
         system_prompt: Optional[str] = None,
         tools: Optional[List[Dict]] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4000,
+        json_mode: bool = False,
+        **kwargs,
     ) -> Dict[str, Any]:
         """Generate using OpenAI"""
         messages = []
@@ -330,9 +325,15 @@ class OpenAIClient:
         params = {
             "model": self.model,
             "messages": messages,
-            "temperature": 0.7,
-            "max_tokens": 4000,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            **kwargs,
         }
+
+        if json_mode:
+            params["response_format"] = {"type": "json_object"}
+            if "json" not in prompt.lower() and "json" not in (system_prompt or "").lower():
+                messages[-1]["content"] += "\nReturn response in valid JSON format."
 
         if tools:
             params["tools"] = tools
@@ -398,6 +399,10 @@ class MistralClient:
         prompt: str,
         system_prompt: Optional[str] = None,
         tools: Optional[List[Dict]] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4000,
+        json_mode: bool = False,
+        **kwargs,
     ) -> Dict[str, Any]:
         """Generate using Mistral SDK"""
         messages = []
@@ -410,9 +415,15 @@ class MistralClient:
         params = {
             "model": self.model,
             "messages": messages,
-            "temperature": 0.7,
-            "max_tokens": 4000,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            **kwargs,
         }
+
+        if json_mode:
+            params["response_format"] = {"type": "json_object"}
+            if "json" not in prompt.lower() and "json" not in (system_prompt or "").lower():
+                messages[-1]["content"] += "\nReturn response in valid JSON format."
 
         if tools:
             params["tools"] = tools

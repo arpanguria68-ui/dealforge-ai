@@ -1,33 +1,42 @@
+"""Finance tool validation with a fake toolkit: deterministic and network-free."""
+from types import SimpleNamespace
+
 import pytest
-from unittest.mock import Mock
-from .conftest import calculate_accuracy, BENCHMARKS
-from backend.app.core.tools.finance_toolkit_tool import FinanceAnalysisTool as FinanceToolkitTool
-# Import other tools
+
+from app.core.tools import finance_toolkit_tool as finance_module
+from app.core.tools.finance_toolkit_tool import FinanceAnalysisTool
+
+
+class _FakeToolkit:
+    def __init__(self, **_kwargs):
+        self.ratios = SimpleNamespace(
+            collect_valuation_ratios=lambda: SimpleNamespace(to_dict=lambda: {"PE": {"EVAL": 12.0}})
+        )
+
 
 @pytest.mark.asyncio
-async def test_finance_toolkit_accuracy(mock_api_tool):
-    tool = FinanceToolkitTool()
-    tool.api_client = mock_api_tool
-    input_data = {"symbol": "AAPL", "metric": "revenue"}
-    ground_truth = {"revenue": 1000000000}
-    
-    output = await tool.execute(input_data)
-    accuracy = calculate_accuracy(str(output), str(ground_truth))
-    assert accuracy >= BENCHMARKS['accuracy']
+async def test_finance_tool_normalizes_ticker_and_returns_structured_data(monkeypatch):
+    monkeypatch.setattr(finance_module, "_try_import_toolkit", lambda: _FakeToolkit)
+    result = await FinanceAnalysisTool().execute(tickers="EVAL", analysis_type="ratios", sub_type="valuation")
+    assert result.success
+    assert result.data == {"PE": {"EVAL": 12.0}}
+
 
 @pytest.mark.asyncio
-async def test_finance_toolkit_error_handling(mock_api_tool):
-    mock_api_tool.execute.side_effect = Exception("API Error")
-    tool = FinanceToolkitTool(api_client=mock_api_tool)
-    input_data = {"symbol": "INVALID"}
-    
-    try:
-        output = await tool.execute(input_data)
-        assert "error handled" in output
-    except Exception as e:
-        assert str(e) == "API Error"  # or check if handled properly
+async def test_finance_tool_rejects_empty_ticker_list(monkeypatch):
+    monkeypatch.setattr(finance_module, "_try_import_toolkit", lambda: _FakeToolkit)
+    result = await FinanceAnalysisTool().execute(tickers="  ")
+    assert not result.success
+    assert result.error == "No valid tickers provided."
 
-# Tests for tool usage efficiency, perhaps count calls
 
-# Similar tests for other tools like alpha_vantage_tool, etc.
+@pytest.mark.asyncio
+async def test_finance_tool_converts_provider_exceptions_to_tool_result(monkeypatch):
+    class BrokenToolkit:
+        def __init__(self, **_kwargs):
+            self.ratios = SimpleNamespace(collect_valuation_ratios=lambda: (_ for _ in ()).throw(RuntimeError("offline")))
 
+    monkeypatch.setattr(finance_module, "_try_import_toolkit", lambda: BrokenToolkit)
+    result = await FinanceAnalysisTool().execute(tickers=["EVAL"])
+    assert not result.success
+    assert "FinanceToolkit error: offline" in result.error

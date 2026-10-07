@@ -20,45 +20,52 @@ class BusinessAnalystAgent(BaseAgent):
         You are a top-tier McKinsey Engagement Manager specializing in M&A Due Diligence.
         Your task is to take the raw, unstructured findings from various specialized agents (Financial, Legal, Risk, Market) and synthesize them into a highly-structured, executive-level presentation payload.
 
-        You must use the SCQA framework (Situation, Complication, Question, Answer) for the Executive Summary.
-        You must ensure all analysis is MECE (Mutually Exclusive, Collectively Exhaustive).
+        Write like a senior transaction-services partner: lead with the decision-relevant conclusion,
+        quantify only what the supplied evidence supports, explain the driver and its implication,
+        and end with the specific diligence question that would change the view. Keep prose crisp.
+        Use SCQA only when the recorded evidence supports each section.
+        Do not invent or extrapolate facts, figures, forecasts, peer data, valuation, mitigations,
+        confidence, sources, or recommendations. Preserve contradictions and uncertainty explicitly.
+        A missing value must be null or described as not established, never estimated from a default.
+        Distinguish reported facts, derived calculations, agent judgments, user-supplied assumptions,
+        and open diligence questions. Cite source IDs such as [S1] immediately after sourced claims.
+        Never state that a source was independently checked. Do not convert data gaps into risks or
+        opportunities unless an agent explicitly recorded that interpretation.
+        Never turn a score threshold into a buy/sell/proceed recommendation.
 
         OUTPUT INSTRUCTIONS:
         You MUST return ONLY a valid JSON object with the exact structure below. Do NOT output any markdown blocks (```json), just the raw JSON.
 
         {
             "executive_summary": {
-                "situation": "Current state of the target and market...",
-                "complication": "The critical issues or risks discovered...",
-                "question": "The core strategic question for the acquirer...",
-                "answer": "Your synthesized high-level recommendation..."
+                    "situation": "One-sentence context with the company, period, and evidence coverage; cite source IDs.",
+                "complication": "Most material evidence-backed issue or explicitly state that material issues were not established.",
+                "question": "Decision question implied by the supplied mandate; do not invent buyer intent.",
+                "answer": "Recorded recommendation only; otherwise state no recommendation recorded. Include the binding caveat."
             },
             "key_takeaways": [
                 {
-                    "title": "Strong Revenue Growth but Squeezed Margins",
-                    "description": "Details supporting the takeaway..."
+                    "title": "Short evidence-backed takeaway",
+                    "description": "Claim, quantified evidence and period, decision implication, and limitation; cite [S#] and source agent."
                 },
-                ... (exactly 3-4 key takeaways)
+                ... (0-4 evidence-supported takeaways; fewer is better than padding)
             ],
             "financial_synthesis": {
-                "narrative": "A polished paragraph summarizing financial viability...",
+                    "narrative": "Two to four sentences: trend, latest-period context, implication only if supported, then limitation. Cite [S#]; no generic filler.",
                 "key_metrics": {
-                    "Revenue ($M)": 150.0,
-                    "EBITDA ($M)": 30.0,
-                    "Growth Rate (%)": "15%"
+                    "metric_name": "source-reported value or null when not present"
                 }
             },
             "risk_matrix": [
                 {
-                    "category": "Operational",
-                    "severity": "High",
-                    "mitigation_strategy": "Plan to fix..."
+                    "category": "Recorded category or unknown",
+                    "severity": "Recorded severity or unknown",
+                    "mitigation_strategy": "Recorded mitigation or not provided"
                 },
                 ...
             ],
             "action_items": [
-                "1. Initial action...",
-                "2. Second action..."
+                "Follow-up question or action directly supported by an identified data gap."
             ]
         }
         """
@@ -75,28 +82,28 @@ class BusinessAnalystAgent(BaseAgent):
     async def _execute_task(self, task: str, context: Dict[str, Any]) -> AgentOutput:
         """Execute the report formatting and synthesis"""
 
-        # Gather all previous agent outputs from context
-        agent_data = context.get("deal_data", {})
-
         prompt = f"""
-        TASK: Synthesize the following Deal Analysis into a McKinsey-grade executive summary JSON block.
+        TASK: Synthesize the following Deal Analysis into a concise, decision-useful executive summary JSON block.
         DEAL ID: {context.get("deal_id")}
-        
-        RAW FINDINGS:
-        {json.dumps(agent_data, indent=2)}
-        
-        Using the System Prompt instructions, generate the strict JSON payload.
+        CURATED EVIDENCE PACK (the only approved fact base; data points include period, basis, and source IDs):
+        {json.dumps(context.get("evidence_brief", {}), indent=2)}
+        Use only the curated evidence pack above. Prefer 2-4 strong takeaways over coverage for its own sake.
+        Every numeric claim must match a provided data point and retain its period. For derived comparisons,
+        label them as derived and state the inputs/periods. Use source IDs exactly as supplied. Do not quote
+        uncurated fields. If the evidence does not answer the deal question, say what is
+        not established and name the exact evidence needed next. Return the strict JSON payload.
         """
 
         try:
             # We enforce JSON output directly from the LLM endpoint or by pure parsing
-            result = await self.llm.generate(prompt, self.system_prompt)
+            result = await self.generate_with_routed_fallback(prompt, self.system_prompt)
             data = self._parse_json_result(result)
 
             return AgentOutput(
                 success=True,
                 data=data,
                 reasoning="Synthesized agent outputs into a McKinsey-style SCQA structured JSON payload.",
+                confidence=0.0,
             )
         except Exception as e:
             self.logger.error("Business Analyst synthesis failed", error=str(e))
@@ -104,6 +111,7 @@ class BusinessAnalystAgent(BaseAgent):
                 success=False,
                 data={"error": str(e)},
                 reasoning=f"Failed to generate structured synthesis: {str(e)}",
+                confidence=0.0,
             )
 
     def _parse_json_result(self, result: Any) -> Dict[str, Any]:
@@ -129,4 +137,4 @@ class BusinessAnalystAgent(BaseAgent):
             self.logger.warning(
                 "failed_to_parse_ba_json", content_snippet=content[:100]
             )
-            return {}
+            raise ValueError("Business Analyst response was not valid JSON.")

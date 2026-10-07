@@ -111,10 +111,15 @@ class RiskAssessorAgent(BaseAgent):
             else "No risk documents retrieved"
         )
 
+        fact_base_str = ""
+        if context and context.get("fact_base"):
+            fact_base_str = f"\nFACT BASE (GROUND TRUTH):\n{json.dumps(context['fact_base'], indent=2)}\n"
+
         return f"""Task: {task}
 
 Context:
 {context_str}
+{fact_base_str}
 
 Relevant Documents:
 {docs_str}
@@ -145,6 +150,7 @@ Respond with structured JSON:
         "probability": number,
         "impact": number,
         "severity": string,
+        "evidence": string,
         "mitigation": [string],
         "owner": string
     }}],
@@ -156,8 +162,11 @@ Respond with structured JSON:
     }},
     "top_risks": [string],
     "mitigation_priorities": [string],
-    "reasoning": string
-}}"""
+    "reasoning": string,
+    "caveats": [string]
+}}
+
+CRITICAL: Every risk identified MUST contain an 'evidence' field citing specific data from the FactBase or retrieved Documents. Claims without evidence will be discarded in final reports."""
 
     def _build_system_prompt(self) -> str:
         """Build system prompt for risk assessment"""
@@ -262,8 +271,27 @@ class MarketRiskAgent(BaseAgent):
         """Execute market risk assessment"""
         start_time = datetime.now()
 
-        industry = context.get("industry", "technology") if context else "technology"
+        industry = (context or {}).get("industry")
         market_data = context.get("market_data", {}) if context else {}
+
+        # Do not silently substitute an unrelated industry when the case has
+        # not established one. This agent has no reliable basis for a TAM claim.
+        if not industry:
+            return AgentOutput(
+                success=True,
+                data={
+                    "market_risks": [],
+                    "market_context": {
+                        "industry": None,
+                        "tam": None,
+                        "competitor_count": None,
+                        "status": "insufficient_evidence",
+                    },
+                },
+                reasoning="Industry and market data were not established; market risks are left unassessed rather than inferred.",
+                confidence=0.0,
+                execution_time_ms=(datetime.now() - start_time).total_seconds() * 1000,
+            )
 
         # Get market data via tool
         market_tool_result = await self.tools.execute(

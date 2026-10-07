@@ -5,7 +5,13 @@ from dataclasses import dataclass
 from abc import ABC, abstractmethod
 import json
 import time
+import asyncio
+import ipaddress
+import socket
+from urllib.parse import urljoin, urlparse
 import structlog
+from app.core.tools.web_search import WebSearchTool
+from app.core.search.hybrid_search import HybridSearch
 
 logger = structlog.get_logger()
 
@@ -15,40 +21,7 @@ logger = structlog.get_logger()
 # ═══════════════════════════════════════════════
 
 
-@dataclass
-class ToolResult:
-    """Result of a tool execution"""
-
-    success: bool
-    data: Any
-    error: Optional[str] = None
-    execution_time_ms: Optional[float] = None
-
-
-class BaseTool(ABC):
-    """Base class for all tools"""
-
-    def __init__(self, name: str, description: str):
-        self.name = name
-        self.description = description
-
-    @abstractmethod
-    async def execute(self, **kwargs) -> ToolResult:
-        pass
-
-    def get_schema(self) -> Dict[str, Any]:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.get_parameters_schema(),
-            },
-        }
-
-    @abstractmethod
-    def get_parameters_schema(self) -> Dict[str, Any]:
-        pass
+from app.core.tools.base_tool import BaseTool, ToolResult
 
 
 # ═══════════════════════════════════════════════
@@ -101,16 +74,26 @@ class FinancialCalculatorTool(BaseTool):
                     pv += terminal_value / ((1 + discount_rate) ** len(cash_flows))
                 result = {"dcf_value": round(pv, 2)}
             elif calculation_type == "multiple":
-                revenue = inputs.get("revenue", 0)
-                multiple = inputs.get("multiple", 5)
+                if inputs.get("revenue") is None or inputs.get("multiple") is None:
+                    return ToolResult(
+                        success=False, data=None,
+                        error="Missing required inputs: revenue and multiple.",
+                    )
+                revenue = float(inputs["revenue"])
+                multiple = float(inputs["multiple"])
                 result = {"valuation": round(revenue * multiple, 2)}
             elif calculation_type == "ratio":
-                numerator = inputs.get("numerator", 0)
-                denominator = inputs.get("denominator", 1)
+                if inputs.get("numerator") is None or inputs.get("denominator") is None:
+                    return ToolResult(
+                        success=False, data=None,
+                        error="Missing required inputs: numerator and denominator.",
+                    )
+                numerator = float(inputs["numerator"])
+                denominator = float(inputs["denominator"])
                 ratio_name = inputs.get("ratio_name", "ratio")
-                result = {
-                    ratio_name: round(numerator / denominator, 4) if denominator else 0
-                }
+                if denominator == 0:
+                    return ToolResult(success=False, data=None, error="Denominator cannot be zero.")
+                result = {ratio_name: round(numerator / denominator, 4)}
             return ToolResult(success=True, data=result)
         except Exception as e:
             return ToolResult(success=False, data=None, error=str(e))
@@ -153,7 +136,10 @@ class DocumentSearchTool(BaseTool):
         self, query: str, index_id: Optional[str] = None, top_k: int = 5
     ) -> ToolResult:
         try:
-            chunks = await self.pageindex.query(query, index_id, top_k)
+            # Use HybridSearch (F-018) for improved accuracy
+            hybrid = HybridSearch(self.pageindex)
+            chunks = await hybrid.search(query, deal_id=index_id, top_k=top_k)
+            
             results = [
                 {
                     "content": chunk.content,
@@ -172,68 +158,7 @@ class DocumentSearchTool(BaseTool):
 # ═══════════════════════════════════════════════
 
 
-class DuckDuckGoSearchTool(BaseTool):
-    """Search the web using DuckDuckGo — no API key required"""
-
-    def __init__(self):
-        super().__init__(
-            name="web_search",
-            description="Search the web for real-time company news, market data, competitor analysis, and industry trends using DuckDuckGo",
-        )
-
-    def get_parameters_schema(self) -> Dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query (e.g., 'Zapier automation SaaS market share 2024')",
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "Maximum number of results",
-                    "default": 5,
-                },
-            },
-            "required": ["query"],
-        }
-
-    async def execute(self, query: str, max_results: int = 5) -> ToolResult:
-        t0 = time.time()
-        try:
-            from duckduckgo_search import DDGS
-
-            with DDGS() as ddgs:
-                raw = list(ddgs.text(query, max_results=max_results))
-
-            results = [
-                {
-                    "title": r.get("title", ""),
-                    "url": r.get("href", ""),
-                    "snippet": r.get("body", ""),
-                }
-                for r in raw
-            ]
-            elapsed = round((time.time() - t0) * 1000, 1)
-            return ToolResult(
-                success=True,
-                data={
-                    "query": query,
-                    "results_count": len(results),
-                    "results": results,
-                },
-                execution_time_ms=elapsed,
-            )
-        except ImportError:
-            return ToolResult(
-                success=False,
-                data=None,
-                error="duckduckgo-search package not installed. Run: pip install duckduckgo-search",
-            )
-        except Exception as e:
-            return ToolResult(
-                success=False, data=None, error=f"Web search failed: {str(e)}"
-            )
+# WebSearchTool is now imported from web_search.py
 
 
 # ═══════════════════════════════════════════════
@@ -267,14 +192,51 @@ class WebScraperTool(BaseTool):
             "required": ["url"],
         }
 
+    @staticmethod
+    async def _validate_public_url(url: str) -> None:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("Only public HTTP/HTTPS URLs are allowed")
+        if parsed.username or parsed.password or parsed.port not in (None, 80, 443):
+            raise ValueError("URL credentials and nonstandard ports are not allowed")
+        host = parsed.hostname.rstrip(".").lower()
+        if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+            raise ValueError("Private network hosts are not allowed")
+        try:
+            addresses = [ipaddress.ip_address(host)]
+        except ValueError:
+            try:
+                records = await asyncio.to_thread(
+                    socket.getaddrinfo, host, parsed.port or (443 if parsed.scheme == "https" else 80),
+                    type=socket.SOCK_STREAM,
+                )
+                addresses = [ipaddress.ip_address(record[4][0]) for record in records]
+            except OSError as exc:
+                raise ValueError("Unable to resolve public URL host") from exc
+        if not addresses or any(not address.is_global for address in addresses):
+            raise ValueError("Private or reserved network addresses are not allowed")
+
     async def execute(self, url: str, max_chars: int = 5000) -> ToolResult:
         t0 = time.time()
         try:
             import httpx
             from bs4 import BeautifulSoup
 
-            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-                resp = await client.get(url, headers={"User-Agent": "DealForge-AI/1.0"})
+            current_url = url
+            async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+                for _ in range(6):
+                    await self._validate_public_url(current_url)
+                    resp = await client.get(
+                        current_url, headers={"User-Agent": "DealForge-AI/1.0"}
+                    )
+                    if resp.status_code not in {301, 302, 303, 307, 308}:
+                        break
+                    location = resp.headers.get("Location")
+                    if not location:
+                        raise ValueError("Redirect response did not include a destination")
+                    current_url = urljoin(current_url, location)
+                else:
+                    raise ValueError("Too many redirects")
                 resp.raise_for_status()
 
             soup = BeautifulSoup(resp.text, "html.parser")
@@ -302,7 +264,7 @@ class WebScraperTool(BaseTool):
             return ToolResult(
                 success=True,
                 data={
-                    "url": url,
+                    "url": str(resp.url),
                     "title": title,
                     "meta_description": meta_desc,
                     "text": clean_text,
@@ -770,7 +732,7 @@ class LegalClauseTool(BaseTool):
 
 
 class ReportGenerationTool(BaseTool):
-    """Generate final deliverable reports (PPTX, PDF, Excel)"""
+    """Generate final deliverable reports (PPTX, PDF, Excel, DOCX)"""
 
     def __init__(self):
         super().__init__(
@@ -784,7 +746,7 @@ class ReportGenerationTool(BaseTool):
             "properties": {
                 "format": {
                     "type": "string",
-                    "enum": ["pptx", "pdf", "excel"],
+                    "enum": ["pptx", "pdf", "excel", "docx"],
                     "description": "The format of the report to generate",
                 },
                 "deal_context": {
@@ -816,6 +778,7 @@ class ReportGenerationTool(BaseTool):
                 generate_pptx,
                 generate_pdf,
                 generate_excel,
+                generate_docx,
             )
             import base64
 
@@ -828,6 +791,9 @@ class ReportGenerationTool(BaseTool):
             elif format == "excel":
                 file_bytes = generate_excel(deal_context, analyst_data, agent_results)
                 ext = "xlsx"
+            elif format == "docx":
+                file_bytes = generate_docx(deal_context, analyst_data, agent_results)
+                ext = "docx"
             else:
                 return ToolResult(
                     success=False, data=None, error=f"Unsupported format: {format}"
@@ -864,6 +830,7 @@ AGENT_TOOL_MAP: Dict[str, List[str]] = {
         "web_search",
         "company_data",
         "peer_discovery",
+        "web_scraper",
         "finance_analysis",
         "alpha_vantage",
         "finnhub_data",
@@ -895,6 +862,7 @@ AGENT_TOOL_MAP: Dict[str, List[str]] = {
         "financial_calculator",
         "sec_filings",
         "web_search",
+        "web_scraper",
         "company_data",
         "fetch_comparable_companies",
         "generate_football_field",
@@ -992,9 +960,12 @@ AGENT_TOOL_MAP: Dict[str, List[str]] = {
         "company_data",
         "document_search",
         "generate_report",
+        "generate_meeting_memo",
+        "generate_ic_memo",
     ],
     "compiler_agent": [
         "generate_report",
+        "generate_meeting_memo",
     ],
     "treasury_agent": ["financial_calculator", "web_search"],
     "fpa_forecasting_agent": ["financial_calculator", "market_data", "web_search"],
@@ -1014,6 +985,10 @@ AGENT_TOOL_MAP: Dict[str, List[str]] = {
         "antitrust_hhi_calculator",
         "privacy_auditor",
     ],
+    "market_risk_agent": ["web_search", "company_data", "market_data", "finnhub_data"],
+    "compliance_agent": ["web_search", "web_scraper", "document_search", "sec_filings"],
+    "scoring_agent": ["document_search", "financial_calculator", "company_data", "market_data"],
+    "red_team": ["document_search", "web_search", "company_data", "sec_filings"],
 }
 
 
@@ -1022,6 +997,8 @@ class ToolRouter:
 
     def __init__(self):
         self.tools: Dict[str, BaseTool] = {}
+        self._mcp_agents_by_tool: Dict[str, set[str]] = {}
+        self._mcp_family_by_tool: Dict[str, str] = {}
         self.logger = structlog.get_logger()
 
     def register_tool(self, tool: BaseTool):
@@ -1031,7 +1008,7 @@ class ToolRouter:
     def register_default_tools(self, pageindex_client=None):
         """Register all tools"""
         self.register_tool(FinancialCalculatorTool())
-        self.register_tool(DuckDuckGoSearchTool())
+        self.register_tool(WebSearchTool())
         self.register_tool(WebScraperTool())
         self.register_tool(SECFilingsTool())
         self.register_tool(CompanyDataTool())
@@ -1190,23 +1167,191 @@ class ToolRouter:
             from app.core.tools.reporting_tools import (
                 GenerateICMemoTool,
                 GenerateDealDeckTool,
+                GenerateMeetingMemoTool,
             )
 
             self.register_tool(GenerateICMemoTool())
             self.register_tool(GenerateDealDeckTool())
+            self.register_tool(GenerateMeetingMemoTool())
         except ImportError:
             self.logger.warning("OFAS ReportingTools import failed")
 
     def list_tools(self, agent_name: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get tool schemas, optionally filtered for a specific agent"""
-        if agent_name and agent_name in AGENT_TOOL_MAP:
-            allowed = AGENT_TOOL_MAP[agent_name]
+        if agent_name:
+            allowed = AGENT_TOOL_MAP.get(agent_name, [])
             return [
                 tool.get_schema()
                 for name, tool in self.tools.items()
-                if name in allowed
+                if name in allowed or agent_name in getattr(self, "_mcp_agents_by_tool", {}).get(name, set())
             ]
-        return [tool.get_schema() for tool in self.tools.values()]
+        mcp_tools = getattr(self, "_mcp_agents_by_tool", {})
+        return [
+            tool.get_schema() for name, tool in self.tools.items()
+            if name not in mcp_tools
+        ]
+
+    # Laya tool-family → concrete tool names (subset of registered tools).
+    LAYA_FAMILY_TOOLS: Dict[str, List[str]] = {
+        "financial": [
+            "financial_calculator", "finance_analysis", "peer_discovery",
+            "web_scraper", "fetch_financial_statements", "fetch_comparable_companies",
+            "generate_football_field", "run_sensitivity_analysis",
+            "run_monte_carlo_irr", "excel_model_populate",
+            "excel_export_tables", "financial_datasets", "alpha_vantage",
+            "finnhub_data",
+        ],
+        "search": [
+            "web_search", "web_scraper", "sec_filings", "company_data",
+            "market_data", "startup_intelligence", "filing_due_diligence",
+        ],
+        "document": ["document_search"],
+        "legal_risk": [
+            "legal_clause_analyzer", "cyber_vuln_scanner", "antitrust_hhi_calculator",
+            "privacy_auditor",
+        ],
+        "tech_esg": [
+            "ai_stack_scanner", "model_defensibility_scorer",
+            "ai_value_quantifier", "carbon_footprint_extractor",
+            "supply_chain_risk_flagger", "esg_scorer",
+        ],
+        "reporting": [
+            "generate_report", "generate_ic_memo", "generate_deal_deck",
+            "generate_meeting_memo",
+        ],
+        "integration": [
+            "roadmap_generator", "churn_monte_carlo", "synergy_tracker",
+        ],
+        "none": [],
+    }
+
+    async def suggest_tools(
+        self, task: str, agent_name: Optional[str] = None, max_tools: int = 8
+    ) -> List[str]:
+        """Laya shortlist, constrained by agent policy; fail-soft to keyword routing.
+
+        The fallback is intentionally narrow so a weak/failed classifier does
+        not put every allowed tool in the agent's prompt.
+        """
+        available_tools = self.list_tools(agent_name=agent_name)
+        fallback = self._keyword_tool_shortlist(task, agent_name, max_tools)
+        try:
+            from app.core.laya.client import get_laya_client
+
+            catalog = [
+                {
+                    "name": schema.get("function", {}).get("name", ""),
+                    "description": schema.get("function", {}).get("description", ""),
+                }
+                for schema in available_tools
+            ]
+            res = await get_laya_client().suggest_tool_family(task or "", catalog)
+            if res is None:
+                return fallback
+            if res.confidence < 0.55:
+                return fallback
+            if res.answer == "none" and res.confidence >= 0.55:
+                return []
+            if res.answer == "none":
+                return fallback
+            family_tools = self.LAYA_FAMILY_TOOLS.get(str(res.answer), [])
+            names = [t for t in family_tools if t in self.tools]
+            names.extend(
+                name for name, family in self._mcp_family_by_tool.items()
+                if family == str(res.answer) and name in self.tools
+            )
+            allowed = set(AGENT_TOOL_MAP.get(agent_name or "", []))
+            names = [
+                t for t in names
+                if t in allowed or agent_name in self._mcp_agents_by_tool.get(t, set())
+            ]
+            self.logger.info(
+                "laya_tool_shortlist",
+                family=res.answer,
+                tools=names[:max_tools],
+                available_count=len(available_tools),
+                confidence=res.confidence,
+            )
+            return names[:max_tools]
+        except Exception as e:
+            self.logger.warning("laya_suggest_tools_failed", error=str(e))
+        return fallback
+
+    def _keyword_tool_shortlist(
+        self, task: str, agent_name: Optional[str], max_tools: int
+    ) -> List[str]:
+        text = (task or "").lower()
+        family_keywords = {
+            "financial": (
+                "valuation", "dcf", "lbo", "financial", "revenue", "ebitda",
+                "irr", "comps", "multiple",
+            ),
+            "search": ("search", "research", "market", "news", "company profile", "competitor", "filing"),
+            "document": ("document", "uploaded", "vdr", "contract", "cim", "data room"),
+            "legal_risk": ("legal", "regulatory", "privacy", "antitrust", "cyber", "clause"),
+            "tech_esg": ("esg", "carbon", "sustainability", "ai stack", "technology diligence"),
+            "reporting": ("memo", "report", "deck", "presentation", "export"),
+            "integration": ("integration", "synergy", "churn", "roadmap", "100 day"),
+        }
+        family = next(
+            (name for name, terms in family_keywords.items() if any(term in text for term in terms)),
+            None,
+        )
+        allowed = set(AGENT_TOOL_MAP.get(agent_name or "", []))
+        if not family:
+            return []
+        names = [name for name in self.LAYA_FAMILY_TOOLS.get(family, []) if name in self.tools and name in allowed]
+        names.extend(
+            name for name, mapped_family in getattr(self, "_mcp_family_by_tool", {}).items()
+            if mapped_family == family and name in self.tools
+            and agent_name in getattr(self, "_mcp_agents_by_tool", {}).get(name, set())
+        )
+        return names[:max_tools]
+
+    async def list_tools_for_task(
+        self, task: str, agent_name: Optional[str] = None, max_tools: int = 8
+    ) -> List[Dict[str, Any]]:
+        """Return the Laya-shortlisted schemas within the agent's allow-list."""
+        await self._discover_mcp_tools(agent_name)
+        names = await self.suggest_tools(task, agent_name=agent_name, max_tools=max_tools)
+        schemas = self.list_tools(agent_name=agent_name)
+        return [
+            schema for schema in schemas
+            if schema.get("function", {}).get("name") in names
+        ]
+
+    async def _discover_mcp_tools(self, agent_name: Optional[str]) -> None:
+        """Discover fresh read-only MCP tools and scope them to configured agents."""
+        # Remove this agent's old discovery snapshot before probing again so a
+        # server that went offline does not remain in a later model prompt.
+        for name, agents in list(getattr(self, "_mcp_agents_by_tool", {}).items()):
+            agents.discard(agent_name)
+            if not agents:
+                self._mcp_agents_by_tool.pop(name, None)
+                self._mcp_family_by_tool.pop(name, None)
+                self.tools.pop(name, None)
+        try:
+            from app.core.mcp.external_client import RemoteMCPTool, discover_tools
+
+            discovered = await discover_tools()
+            for descriptor in discovered:
+                permitted = set(descriptor["server"].get("allowed_agents", []))
+                if agent_name not in permitted:
+                    continue
+                name = descriptor["name"]
+                self.register_tool(RemoteMCPTool(
+                    name=name,
+                    description=descriptor["description"],
+                    schema=descriptor["parameters"],
+                    server=descriptor["server"],
+                    remote_name=descriptor["remote_name"],
+                ))
+                self._mcp_agents_by_tool[name] = permitted
+                family = descriptor.get("family")
+                if family in self.LAYA_FAMILY_TOOLS and family != "none":
+                    self._mcp_family_by_tool[name] = family
+        except Exception as exc:
+            self.logger.warning("mcp_tool_discovery_unavailable", error=str(exc))
 
     async def execute(self, tool_name: str, params: Any) -> ToolResult:
         if tool_name not in self.tools:
@@ -1226,6 +1371,27 @@ class ToolRouter:
                 )
 
         tool = self.tools[tool_name]
+        pctx = getattr(self, "_provenance_context", {}) or {}
+        deal_id = pctx.get("deal_id")
+        
+        # ── Caching Logic (Area 4) ──
+        cacheable_tools = ["web_search", "document_search", "sec_filings"]
+        cache_key_info = None
+        
+        if deal_id and tool_name in cacheable_tools:
+            try:
+                from app.core.redis_store import RedisStore
+                store = RedisStore.get_instance()
+                # For caching, we use the query param as the primary key
+                query = params.get("query") or params.get("company_name") or json.dumps(params)
+                cached_result = await store.get_cached_search(deal_id, tool_name, query)
+                if cached_result:
+                    self.logger.info("tool_cache_hit", tool_name=tool_name, deal_id=deal_id)
+                    return ToolResult(success=True, data=cached_result)
+                cache_key_info = (deal_id, tool_name, query)
+            except Exception as e:
+                self.logger.warning("cache_check_failed", error=str(e))
+
         try:
             self.logger.info(
                 "Executing tool", tool_name=tool_name, params_keys=list(params.keys())
@@ -1238,14 +1404,21 @@ class ToolRouter:
                 time_ms=result.execution_time_ms,
             )
 
+            # Store in cache if successful (Area 4)
+            if result.success and cache_key_info:
+                try:
+                    from app.core.redis_store import RedisStore
+                    store = RedisStore.get_instance()
+                    await store.cache_search_result(*cache_key_info, result.data)
+                except Exception as e:
+                    self.logger.warning("cache_storage_failed", error=str(e))
+
             # ── Provenance capture (QA Flow 6) ──
-            pctx = getattr(self, "_provenance_context", None)
-            if pctx and pctx.get("deal_id"):
+            if deal_id:
                 try:
                     from app.core.provenance import get_provenance_collector
-
                     provenance_id = await get_provenance_collector().record_tool_call(
-                        deal_id=pctx["deal_id"],
+                        deal_id=deal_id,
                         agent_name=pctx.get("agent_name", "unknown"),
                         tool_name=tool_name,
                         params=params,
@@ -1280,10 +1453,18 @@ class ToolRouter:
         self._provenance_context = None
 
     async def execute_function_calls(
-        self, function_calls: List[Dict]
+        self, function_calls: List[Dict], allowed_tools: Optional[List[str]] = None
     ) -> List[ToolResult]:
         results = []
         for call in function_calls:
-            result = await self.execute(call["name"], call.get("args", {}))
+            name = call.get("name", "")
+            if allowed_tools is not None and name not in allowed_tools:
+                results.append(ToolResult(
+                    success=False,
+                    data=None,
+                    error=f"Tool '{name}' was not selected for this task.",
+                ))
+                continue
+            result = await self.execute(name, call.get("args", {}))
             results.append(result)
         return results

@@ -1,0 +1,180 @@
+﻿Starting test_message_bus_publish_retrieval...
+2026-03-15 17:25:41 [info     ] redis_store_initialized        url=redis://localhost:6379/0
+2026-03-15 17:25:41 [info     ] message_published              deal_id=test_deal_123 sender=agent_a type=insight_discovered
+Retrieved 1 messages
+test_message_bus_publish_retrieval passed!
+Starting test_agent_integration...
+2026-03-15 17:25:42 [info     ] settings_loaded                keys=28 path='F:\\code project\\Kimi_Agent_DealForge AI PRD\\backend\\settings.json'
+2026-03-15 17:25:42 [info     ] Custom agent model map loaded from SettingsService overrides={'financial_analyst': 'nvidia', 'valuation_agent': 'nvidia', 'legal_advisor': 'nvidia', 'risk_assessor': 'nvidia', 'debate_moderator': 'nvidia', 'market_researcher': 'nvidia', 'market_risk_agent': 'nvidia', 'compliance_agent': 'nvidia', 'scoring_agent': 'nvidia', 'pageindex': 'nvidia', 'advanced_financial_modeler': 'nvidia', 'complex_reasoning': 'nvidia', 'data_curator': 'nvidia', 'report_architect': 'nvidia', 'project_manager': 'nvidia', 'due_diligence_agent': 'nvidia', 'investment_memo_agent': 'nvidia', 'red_team': 'nvidia', 'business_analyst': 'nvidia', 'esg_agent': 'nvidia', 'integration_planner_agent': 'nvidia', 'dcf_lbo_architect': 'nvidia', 'compiler_agent': 'nvidia', 'treasury_agent': 'nvidia', 'fpa_forecasting_agent': 'nvidia'}
+2026-03-15 17:25:42 [info     ] ModelRouter initialized (local-first) routing_summary={'cloud_agents': ['financial_analyst', 'valuation_agent', 'legal_advisor', 'risk_assessor', 'debate_moderator', 'due_diligence_agent', 'investment_memo_agent', 'dcf_lbo_architect', 'complex_reasoning', 'advanced_financial_modeler', 'data_curator', 'report_architect', 'market_researcher', 'market_risk_agent', 'compliance_agent', 'scoring_agent', 'pageindex', 'project_manager', 'red_team', 'business_analyst', 'esg_agent', 'integration_planner_agent', 'compiler_agent', 'treasury_agent', 'fpa_forecasting_agent'], 'local_agents': ['compliance_qa_agent', 'ofas_supervisor'], 'fallback': 'nvidia'}
+2026-03-15 17:25:42 [debug    ] Agent routed                   agent=mock_agent provider=nvidia
+2026-03-15 17:25:48 [debug    ] Agent routed                   agent=pageindex provider=nvidia
+2026-03-15 17:25:48 [info     ] LocalPageIndexService initialized indexed_docs=0 storage_dir='F:\\code project\\Kimi_Agent_DealForge AI PRD\\backend\\app\\core\\memory\\..\\..\\..\\data\\pageindex'
+2026-03-15 17:25:48 [info     ] PageIndex running in LOCAL mode (self-hosted) model=z-ai/glm5 provider=nvidia
+2026-03-15 17:25:48 [info     ] Registered tool                tool_name=financial_calculator
+2026-03-15 17:25:48 [info     ] Registered tool                tool_name=web_search
+2026-03-15 17:25:48 [info     ] Registered tool                tool_name=web_scraper
+2026-03-15 17:25:48 [info     ] Registered tool                tool_name=sec_filings
+2026-03-15 17:25:48 [info     ] Registered tool                tool_name=company_data
+2026-03-15 17:25:48 [info     ] Registered tool                tool_name=market_data
+2026-03-15 17:25:48 [info     ] Registered tool                tool_name=legal_clause_analyzer
+2026-03-15 17:25:48 [info     ] Registered tool                tool_name=generate_report
+2026-03-15 17:25:48 [info     ] Registered tool                tool_name=startup_intelligence
+2026-03-15 17:25:48 [info     ] Registered tool                tool_name=document_search
+2026-03-15 17:25:48 [info     ] Registered tool                tool_name=peer_discovery
+2026-03-15 17:25:48 [info     ] Registered tool                tool_name=finance_analysis
+2026-03-15 17:25:48 [info     ] Registered tool                tool_name=alpha_vantage
+2026-03-15 17:25:48 [info     ] Registered tool                tool_name=finnhub_data
+2026-03-15 17:25:48 [info     ] Registered tool                tool_name=financial_datasets
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=excel_model_populate
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=excel_export_tables
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=fetch_financial_statements
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=fetch_comparable_companies
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=generate_football_field
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=run_sensitivity_analysis
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=run_monte_carlo_irr
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=ai_stack_scanner
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=model_defensibility_scorer
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=ai_value_quantifier
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=carbon_footprint_extractor
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=supply_chain_risk_flagger
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=esg_scorer
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=cyber_vuln_scanner
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=antitrust_hhi_calculator
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=privacy_auditor
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=roadmap_generator
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=churn_monte_carlo
+2026-03-15 17:25:49 [info     ] Registered tool                tool_name=synergy_tracker
+2026-03-15 17:26:04 [info     ] Registered tool                tool_name=filing_due_diligence
+2026-03-15 17:26:04 [info     ] Registered tool                tool_name=generate_ic_memo
+2026-03-15 17:26:04 [info     ] Registered tool                tool_name=generate_deal_deck
+2026-03-15 17:26:04 [info     ] Registered tool                tool_name=generate_meeting_memo
+2026-03-15 17:26:04 [debug    ] Agent routed                   agent=mock_agent provider=nvidia
+2026-03-15 17:26:05 [debug    ] Agent routed                   agent=pageindex provider=nvidia
+2026-03-15 17:26:05 [info     ] PageIndex running in LOCAL mode (self-hosted) model=z-ai/glm5 provider=nvidia
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=financial_calculator
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=web_search
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=web_scraper
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=sec_filings
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=company_data
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=market_data
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=legal_clause_analyzer
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=generate_report
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=startup_intelligence
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=document_search
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=peer_discovery
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=finance_analysis
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=alpha_vantage
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=finnhub_data
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=financial_datasets
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=excel_model_populate
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=excel_export_tables
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=fetch_financial_statements
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=fetch_comparable_companies
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=generate_football_field
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=run_sensitivity_analysis
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=run_monte_carlo_irr
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=ai_stack_scanner
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=model_defensibility_scorer
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=ai_value_quantifier
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=carbon_footprint_extractor
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=supply_chain_risk_flagger
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=esg_scorer
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=cyber_vuln_scanner
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=antitrust_hhi_calculator
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=privacy_auditor
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=roadmap_generator
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=churn_monte_carlo
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=synergy_tracker
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=filing_due_diligence
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=generate_ic_memo
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=generate_deal_deck
+2026-03-15 17:26:05 [info     ] Registered tool                tool_name=generate_meeting_memo
+Running Agent A...
+2026-03-15 17:26:05 [info     ] Starting structured analysis   agent=mock_agent task='Find insights'
+2026-03-15 17:26:05 [warning  ] redis_fetch_messages_failed    error='Event loop is closed'
+2026-03-15 17:26:05 [info     ] Issue tree generated           agent=mock_agent branches=0
+2026-03-15 17:26:05 [warning  ] Failed to store memory         agent=mock_agent error="PageIndexClient.ingest_document() got an unexpected keyword argument 'content'"
+2026-03-15 17:26:05 [info     ] Reward computed                reflection=0.9 reward=0.7999999999999999 user_feedback=0.5
+2026-03-15 17:26:05 [warning  ] RL reward loop failed          agent=mock_agent error="_make_filtering_bound_logger.<locals>.make_method.<locals>.meth() missing 1 required positional argument: 'event'"
+Checking Agent B context awareness...
+Agent B sees 0 messages
+python : Traceback 
+(most recent call 
+last):
+At line:1 char:30
++ ... "backend;."; 
+python tests/test_inter
+_agent_bus.py > 
+test_out.txt 2>&1
++                  ~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~
+    + CategoryInfo     
+         : NotSpecifi  
+  ed: (Traceback (mo   
+ st recent call las    
+t)::String) [], Re    
+moteException
+    + FullyQualifiedEr 
+   rorId : NativeComm  
+  andError
+ 
+  File "F:\code project
+\Kimi_Agent_DealForge 
+AI PRD\tests\test_inter
+_agent_bus.py", line 
+76, in <module>
+    asyncio.run(test_ag
+ent_integration())
+    ~~~~~~~~~~~^^^^^^^^
+^^^^^^^^^^^^^^^^^^
+  File "C:\Program File
+s\WindowsApps\PythonSof
+twareFoundation.Python.
+3.13_3.13.3312.0_x64__q
+bz5n2kfra8p0\Lib\asynci
+o\runners.py", line 
+195, in run
+    return 
+runner.run(main)
+           
+~~~~~~~~~~^^^^^^
+  File "C:\Program File
+s\WindowsApps\PythonSof
+twareFoundation.Python.
+3.13_3.13.3312.0_x64__q
+bz5n2kfra8p0\Lib\asynci
+o\runners.py", line 
+118, in run
+    return self._loop.r
+un_until_complete(task)
+           ~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Program File
+s\WindowsApps\PythonSof
+twareFoundation.Python.
+3.13_3.13.3312.0_x64__q
+bz5n2kfra8p0\Lib\asynci
+o\base_events.py", 
+line 725, in 
+run_until_complete
+    return 
+future.result()
+           
+~~~~~~~~~~~~~^^
+  File "F:\code project
+\Kimi_Agent_DealForge 
+AI PRD\tests\test_inter
+_agent_bus.py", line 
+71, in 
+test_agent_integration
+    assert 
+any(m.sender == 
+"mock_agent" for m in 
+msgs)
+           ~~~^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^
+AssertionError

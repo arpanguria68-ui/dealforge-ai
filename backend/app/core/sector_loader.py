@@ -65,6 +65,13 @@ def build_sector_prompt(agent_name: str, sector_config: Dict[str, Any]) -> str:
         for item in checklists:
             prompt_injection += f"- {item}\n"
 
+    benchmarks = sector_config.get("benchmarks", {})
+    if benchmarks:
+        prompt_injection += "\nSector Benchmarks (Median values for comparison):\n"
+        for key, value in benchmarks.items():
+            prompt_injection += f"- {key}: {value}\n"
+        prompt_injection += "Use these benchmarks to contextualize the target's performance. High variance from median should be flagged and explained.\n"
+
     # Include emphasis weights if this agent is explicitly weighted
     emphasis = sector_config.get("emphasis", [])
     agent_weight = 1.0

@@ -4,10 +4,11 @@
 # ========================
 # SET YOUR API KEYS HERE
 # ========================
-$GEMINI_API_KEY = $env:GEMINI_API_KEY
-$MISTRAL_API_KEY = $env:MISTRAL_API_KEY
+$GEMINI_API_KEY = ""
+$MISTRAL_API_KEY = ""
 # Optional:
 $OPENAI_API_KEY = ""
+$ADMIN_API_TOKEN = ""
 
 # ========================
 # STOP & REMOVE OLD CONTAINER
@@ -27,6 +28,7 @@ docker run -d `
   -e DEBUG=true `
   -e DEFAULT_LLM_PROVIDER=gemini `
   -e PAGEINDEX_MODE=local `
+  -e ADMIN_API_TOKEN=$ADMIN_API_TOKEN `
   -e GEMINI_API_KEY=$GEMINI_API_KEY `
   -e MISTRAL_API_KEY=$MISTRAL_API_KEY `
   -e OPENAI_API_KEY=$OPENAI_API_KEY `

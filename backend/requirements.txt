@@ -10,14 +10,19 @@ asyncpg
 aiosqlite
 alembic
 redis
+neo4j
+neo4j-driver
 
 # LangGraph & AI
 langgraph
 langchain
 langchain-openai
+mcp>=1.28,<2
 openai
 google-generativeai
 mistralai==1.1.0
+anthropic
+groq
 
 # Pydantic & Validation
 pydantic
@@ -41,7 +46,7 @@ tiktoken
 pyyaml
 
 # External Data Tools
-duckduckgo-search
+ddgs
 beautifulsoup4
 financedatabase
 
@@ -74,3 +79,11 @@ xlsxwriter
 scikit-learn
 nltk
 sec-api
+
+# ── Laya System-1 decision layer (local inference; pulls torch + transformers) ──
+laya @ git+https://github.com/NandhaKishorM/laya.git
+# Optional: dense RAG embeddings (falls back to hashed TF-IDF if absent)
+# sentence-transformers>=3.0.0
+# Without sentence-transformers the integration is fail-soft: dense ranking
+# falls back to hashed TF-IDF. Without laya installed, all Laya calls return
+# None and the existing LLM paths run.

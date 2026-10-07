@@ -13,8 +13,7 @@
 
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-
-const API_BASE = 'http://localhost:8005';
+import { API_BASE } from '@/lib/api-base';
 
 // ─── Types ───────────────────────────────────────────
 export interface ChatMessage {
@@ -49,6 +48,7 @@ interface DealForgeStore {
     createConversation: (dealId?: string) => string;
     deleteConversation: (id: string) => void;
     setActiveConversation: (id: string) => void;
+    setConversationDealId: (conversationId: string, dealId: string) => void;
     getActiveConversation: () => Conversation | null;
 
     addMessage: (conversationId: string, message: Omit<ChatMessage, 'id' | 'timestamp'>) => string;
@@ -152,6 +152,18 @@ export const useDealForgeStore = create<DealForgeStore>()(
 
             setActiveConversation: (id) => set({ activeConversationId: id }),
 
+            setConversationDealId: (conversationId, dealId) => {
+                let updatedConv: Conversation | null = null;
+                set(s => ({
+                    conversations: s.conversations.map(c => {
+                        if (c.id !== conversationId) return c;
+                        updatedConv = { ...c, dealId, updatedAt: Date.now() };
+                        return updatedConv;
+                    }),
+                }));
+                if (updatedConv) syncToBackend(updatedConv);
+            },
+
             getActiveConversation: () => {
                 const s = get();
                 return s.conversations.find(c => c.id === s.activeConversationId) || null;
@@ -247,8 +259,9 @@ export const useDealForgeStore = create<DealForgeStore>()(
                         messages: conv.messages
                             .slice(-100)
                             .map(m => {
-                                const { metadata, ...rest } = m;
-                                return rest;
+                                const persistedMessage = { ...m };
+                                delete persistedMessage.metadata;
+                                return persistedMessage;
                             })
                     })),
                 activeConversationId: state.activeConversationId,

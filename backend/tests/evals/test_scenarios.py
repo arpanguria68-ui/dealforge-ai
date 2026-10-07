@@ -1,33 +1,58 @@
+"""Dependency scheduling checks using the actual OFAS execution engine."""
+from types import SimpleNamespace
+
 import pytest
-from .conftest import BENCHMARKS
-from backend.app.orchestrator.ofas_engine import OFASExecutionEngine as OfasEngine  # Assuming integration point
 
-# Scenario 1: Financial Modeling for Tech Startup
+from app.orchestrator.ofas_engine import OFASExecutionEngine
+from app.orchestrator.state import create_ofas_mission, create_ofas_task
+
+
+class _Agent:
+    def __init__(self, value):
+        self.value = value
+        self.calls = 0
+
+    async def run(self, _task, _context):
+        self.calls += 1
+        return SimpleNamespace(data={"value": self.value})
+
+
 @pytest.mark.asyncio
-async def test_scenario1_financial_modeling():
-    engine = OfasEngine()
-    input_data = {"company": "TechStartup", "financials": {...}, "market_data": {...}}
-    output = await engine.run_scenario("financial_modeling", input_data)
-    # Assert metrics
-    assert calculate_accuracy(output['model'], ground_truth_model) >= BENCHMARKS['accuracy']
+async def test_independent_tasks_run_in_same_ready_batch():
+    mission = create_ofas_mission("eval-1", "EVAL", "test independent work")
+    mission["tasks"] = [
+        create_ofas_task("a", "A", ["analyst"]),
+        create_ofas_task("b", "B", ["analyst"]),
+    ]
+    agent = _Agent("ok")
+    result = await OFASExecutionEngine().execute_ready_tasks(mission, {"analyst": agent})
+    assert agent.calls == 2
+    assert [task["status"] for task in result["tasks"]] == ["done", "done"]
+    assert all(task["outputs"] == {"value": "ok"} for task in result["tasks"])
 
-# Scenario 2: Legal Due Diligence
+
 @pytest.mark.asyncio
-async def test_scenario2_legal_due_diligence():
-    engine = OfasEngine()
-    input_data = {"contracts": "doc", "filings": "data"}
-    output = await engine.run_scenario("legal_due_diligence", input_data)
-    assert calculate_completeness(output, required_risks) >= BENCHMARKS['completeness']
+async def test_dependent_task_waits_for_prerequisite():
+    mission = create_ofas_mission("eval-2", "EVAL", "test dependency")
+    mission["tasks"] = [
+        create_ofas_task("source", "Source", ["analyst"]),
+        create_ofas_task("model", "Model", ["analyst"], dependencies=["source"]),
+    ]
+    agent = _Agent("ok")
+    engine = OFASExecutionEngine()
+    await engine.execute_ready_tasks(mission, {"analyst": agent})
+    assert mission["tasks"][0]["status"] == "done"
+    assert mission["tasks"][1]["status"] == "pending"
+    await engine.execute_ready_tasks(mission, {"analyst": agent})
+    assert mission["tasks"][1]["status"] == "done"
+    assert agent.calls == 2
 
-# Add tests for other scenarios, including full deal workflow, report generation
 
-# Edge cases
 @pytest.mark.asyncio
-async def test_edge_case_invalid_input():
-    engine = OfasEngine()
-    input_data = {"invalid": "data"}
-    output = await engine.run_scenario("any", input_data)
-    assert "error handled" in output
-
-# More integration tests
-
+async def test_missing_agent_blocks_task_with_diagnostic():
+    mission = create_ofas_mission("eval-3", "EVAL", "test missing agent")
+    mission["tasks"] = [create_ofas_task("x", "X", ["absent"])]
+    await OFASExecutionEngine().execute_ready_tasks(mission, {})
+    task = mission["tasks"][0]
+    assert task["status"] == "blocked"
+    assert "not found in registry" in task["issues"][0]["msg"]

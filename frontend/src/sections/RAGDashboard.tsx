@@ -9,8 +9,7 @@ import {
     BookOpen, Upload, AlertTriangle, CheckCircle2, Brain, Layers,
     Activity, Server
 } from 'lucide-react';
-
-const API_BASE = 'http://localhost:8005';
+import { API_BASE } from '@/lib/api-base';
 
 interface RAGStats {
     total_documents: number;
@@ -21,6 +20,7 @@ interface RAGStats {
 
 interface RAGDocument {
     doc_id: string;
+    index_id?: string;
     filename: string;
     file_type: string;
     total_pages: number;
@@ -32,7 +32,7 @@ interface RAGDocument {
 interface RoutingHealth {
     provider: string;
     is_local: boolean;
-    is_healthy: boolean;
+    is_healthy: boolean | null;
     fallback?: string;
 }
 
@@ -42,6 +42,23 @@ interface ModelRouting {
     health: Record<string, RoutingHealth>;
     agents: string[];
     note: string;
+}
+
+interface RAGQueryResult {
+    filename?: string;
+    page?: number;
+    laya_relevance?: number;
+    relevance: number;
+    content: string;
+    citation?: string;
+    doc_id?: string;
+    chunk_id?: string | number;
+}
+
+interface RAGQueryResponse {
+    error?: string;
+    query?: string;
+    results?: RAGQueryResult[];
 }
 
 // ─── Animated Pulse Dot ───
@@ -101,7 +118,7 @@ function FileTreeNode({ doc, onDelete }: { doc: RAGDocument; onDelete: (id: stri
                         )}
                     </div>
                     <div className="flex justify-end pt-1">
-                        <Button size="sm" variant="ghost" onClick={() => onDelete(doc.doc_id)} className="text-red-400/60 hover:text-red-400 hover:bg-red-500/10 h-7 text-xs">
+                        <Button size="sm" variant="ghost" onClick={() => onDelete(doc.index_id || doc.doc_id)} className="text-red-400/60 hover:text-red-400 hover:bg-red-500/10 h-7 text-xs">
                             <Trash2 className="h-3 w-3 mr-1" /> Remove from index
                         </Button>
                     </div>
@@ -122,9 +139,16 @@ export function RAGDashboard() {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [testQuery, setTestQuery] = useState('');
-    const [testResult, setTestResult] = useState<any>(null);
+    const [testDealId, setTestDealId] = useState('');
+    const [testResult, setTestResult] = useState<RAGQueryResponse | null>(null);
     const [testing, setTesting] = useState(false);
     const [ragMode, setRagMode] = useState<string>('local');
+    const [docFilter, setDocFilter] = useState('');
+    const filteredDocs = docFilter
+        ? documents.filter(d =>
+            d.filename.toLowerCase().includes(docFilter.toLowerCase()) ||
+            d.doc_id.toLowerCase().includes(docFilter.toLowerCase()))
+        : documents;
     const [directoryPath, setDirectoryPath] = useState('');
     const [syncing, setSyncing] = useState(false);
     const [syncMessage, setSyncMessage] = useState<string | null>(null);
@@ -152,7 +176,10 @@ export function RAGDashboard() {
         setLoading(false);
     }, []);
 
-    useEffect(() => { fetchAll(); }, [fetchAll]);
+    useEffect(() => {
+        const timer = window.setTimeout(() => { void fetchAll(); }, 0);
+        return () => window.clearTimeout(timer);
+    }, [fetchAll]);
 
     async function handleTestQuery() {
         if (!testQuery.trim()) return;
@@ -162,7 +189,7 @@ export function RAGDashboard() {
             const res = await fetch(`${API_BASE}/api/v1/documents/query`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ query: testQuery }),
+                body: JSON.stringify({ query: testQuery, ...(testDealId ? { deal_id: testDealId } : {}) }),
             });
             if (res.ok) {
                 setTestResult(await res.json());
@@ -175,9 +202,17 @@ export function RAGDashboard() {
         setTesting(false);
     }
 
-    function handleDeleteDoc(docId: string) {
-        // For now, just refresh (delete endpoint can be added later)
-        setDocuments(prev => prev.filter(d => d.doc_id !== docId));
+    async function handleDeleteDoc(docId: string) {
+        try {
+            const res = await fetch(`${API_BASE}/api/v1/documents/${docId}`, { method: 'DELETE' });
+            if (!res.ok) {
+                setError(`Failed to remove document: HTTP ${res.status}`);
+                return;
+            }
+            setDocuments(prev => prev.filter(d => d.doc_id !== docId));
+        } catch (err) {
+            setError(err instanceof Error ? err.message : 'Failed to remove document');
+        }
     }
 
     async function handleDirectorySync() {
@@ -210,6 +245,7 @@ export function RAGDashboard() {
     const pageindexRoute = routing?.health?.pageindex;
     const assignedProvider = routing?.routing_table?.pageindex || 'gemini';
     const isHealthy = pageindexRoute?.is_healthy !== false;
+    const healthUnknown = pageindexRoute?.is_healthy == null;
     const pageindexProvider = isHealthy ? assignedProvider : (pageindexRoute?.fallback || 'gemini');
     const isFallback = !isHealthy && assignedProvider !== pageindexProvider;
 
@@ -316,7 +352,9 @@ export function RAGDashboard() {
                             </p>
                         </div>
                     ) : (
-                        <p className="text-[11px] text-muted-foreground mt-1">RAG embedding & reasoning</p>
+                        <p className="text-[11px] text-muted-foreground mt-1">
+                            {healthUnknown ? 'Health not probed' : 'RAG embedding & reasoning'}
+                        </p>
                     )}
                 </Card>
             </div>
@@ -404,6 +442,20 @@ export function RAGDashboard() {
                         </Button>
                     </div>
 
+                    {documents.length > 4 && (
+                        <div className="px-3 pt-2">
+                            <div className="relative">
+                                <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-muted-foreground" />
+                                <input
+                                    type="text"
+                                    value={docFilter}
+                                    onChange={e => setDocFilter(e.target.value)}
+                                    placeholder="Filter documents..."
+                                    className="w-full pl-8 pr-3 py-1.5 text-xs border rounded-md bg-white dark:bg-slate-800 text-foreground"
+                                />
+                            </div>
+                        </div>
+                    )}
                     <ScrollArea className="flex-1 min-h-[200px] max-h-[400px]">
                         <div className="p-2">
                             {loading ? (
@@ -416,8 +468,13 @@ export function RAGDashboard() {
                                     <p className="text-sm font-medium">No documents indexed yet</p>
                                     <p className="text-xs opacity-60 mt-1">Upload documents via the Chat interface to index them for RAG</p>
                                 </div>
+                            ) : filteredDocs.length === 0 ? (
+                                <div className="flex flex-col items-center justify-center py-12 text-muted-foreground text-center">
+                                    <Search className="h-10 w-10 mb-3 opacity-20" />
+                                    <p className="text-sm font-medium">No documents match "{docFilter}"</p>
+                                </div>
                             ) : (
-                                documents.map(doc => (
+                                filteredDocs.map(doc => (
                                     <FileTreeNode key={doc.doc_id} doc={doc} onDelete={handleDeleteDoc} />
                                 ))
                             )}
@@ -433,6 +490,20 @@ export function RAGDashboard() {
                     </div>
 
                     <div className="p-4 space-y-3 flex-1">
+                        <select
+                            aria-label="Limit search to deal"
+                            value={testDealId}
+                            onChange={e => setTestDealId(e.target.value)}
+                            className="w-full bg-muted/30 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:border-cyan-500/30"
+                        >
+                            <option value="">All indexed documents</option>
+                            {Array.from(new Map(documents
+                                .filter(doc => typeof doc.metadata?.deal_id === 'string' && doc.metadata.deal_id)
+                                .map(doc => [String(doc.metadata.deal_id), String(doc.metadata.company_name || doc.metadata.deal_id)])
+                            ).entries()).map(([id, label]) => (
+                                <option key={id} value={id}>{label}</option>
+                            ))}
+                        </select>
                         <div className="flex gap-2">
                             <input
                                 type="text"
@@ -459,27 +530,43 @@ export function RAGDashboard() {
                                         <AlertTriangle className="h-4 w-4 mb-1" />
                                         {testResult.error}
                                     </div>
-                                ) : testResult.results?.length > 0 ? (
+                                ) : testResult.results && testResult.results.length > 0 ? (
                                     <div className="space-y-4 pb-6">
                                         <p className="text-[11px] text-slate-500 dark:text-slate-400 font-bold uppercase tracking-wider">
                                             {testResult.results.length} result(s) for "{testResult.query}"
                                         </p>
-                                        {testResult.results.map((r: any, i: number) => (
+                                        {testResult.results.map((r, i) => (
                                             <div key={i} className="rounded-xl bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-800 p-4 text-xs group hover:border-cyan-500/30 transition-all shadow-sm">
                                                 <div className="flex items-center justify-between mb-2.5">
-                                                    <div className="flex items-center gap-2">
-                                                        <div className="w-5 h-5 rounded bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-center">
+                                                    <div className="flex items-center gap-2 min-w-0">
+                                                        <div className="w-5 h-5 rounded bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-center flex-shrink-0">
                                                             <FileText className="h-3 w-3 text-slate-400" />
                                                         </div>
-                                                        <span className="text-slate-800 dark:text-slate-100 font-bold">Page {r.page}</span>
+                                                        <span className="text-slate-800 dark:text-slate-100 font-bold truncate">
+                                                            {r.filename || `Page ${r.page}`}
+                                                        </span>
                                                     </div>
-                                                    <Badge className="text-[10px] bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/20 px-2">
-                                                        {(r.relevance * 100).toFixed(0)}% match
-                                                    </Badge>
+                                                    <div className="flex items-center gap-1.5 flex-shrink-0">
+                                                        {typeof r.laya_relevance === 'number' && (
+                                                            <Badge className="text-[10px] bg-violet-500/10 text-violet-700 dark:text-violet-400 border-violet-500/20 px-2" title="Laya System-1 relevance score">
+                                                                <Zap className="h-2.5 w-2.5 mr-0.5" />
+                                                                {(r.laya_relevance * 100).toFixed(0)}%
+                                                            </Badge>
+                                                        )}
+                                                        <Badge className="text-[10px] bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/20 px-2">
+                                                            {(r.relevance * 100).toFixed(0)}% match
+                                                        </Badge>
+                                                    </div>
                                                 </div>
                                                 <p className="leading-relaxed text-slate-800 dark:text-slate-200 line-clamp-[8] text-[13px] font-medium">
                                                     {r.content}
                                                 </p>
+                                                {(r.citation || r.doc_id) && (
+                                                    <p className="mt-2 pt-2 border-t border-slate-200 dark:border-slate-800 text-[11px] text-slate-500 dark:text-slate-400 truncate" title={r.citation || r.doc_id}>
+                                                        <BookOpen className="h-3 w-3 inline mr-1 -mt-0.5" />
+                                                        {r.citation || `chunk ${r.chunk_id}`}
+                                                    </p>
+                                                )}
                                             </div>
                                         ))}
                                     </div>

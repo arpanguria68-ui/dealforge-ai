@@ -41,6 +41,32 @@ class SettingsService:
             if os.path.exists(self.file_path):
                 with open(self.file_path, "r") as f:
                     self._settings = json.load(f)
+                legacy_models = {
+                    "gemini_model": {
+                        "gemini-1.5-flash": "gemini-3.8-flash",
+                        "gemini-1.5-pro": "gemini-3.8-flash",
+                        "gemini-2.0-flash": "gemini-3.8-flash",
+                        "gemini-2.0-flash-001": "gemini-3.8-flash",
+                        "gemini-3-flash-preview": "gemini-3.8-flash",
+                        "gemini-3.1-flash-lite-preview": "gemini-3.1-flash-lite",
+                    },
+                    "vertex_model": {
+                        "gemini-1.5-pro-002": "gemini-3.8-flash",
+                        "gemini-1.5-flash-002": "gemini-3.8-flash",
+                        "gemini-2.0-flash-001": "gemini-3.8-flash",
+                        "gemini-3-flash-preview": "gemini-3.8-flash",
+                        "gemini-3.1-flash-lite-preview": "gemini-3.1-flash-lite",
+                    },
+                    "nvidia_model": {"z-ai/glm5": "z-ai/glm-5.3"},
+                }
+                migrated = False
+                for setting_name, replacements in legacy_models.items():
+                    value = self._settings.get(setting_name)
+                    if value in replacements:
+                        self._settings[setting_name] = replacements[value]
+                        migrated = True
+                if migrated:
+                    self._save()
                 logger.info(
                     "settings_loaded", path=self.file_path, keys=len(self._settings)
                 )
@@ -68,19 +94,21 @@ class SettingsService:
             # API Keys
             "gemini_api_key": "",
             "openai_api_key": "",
+            "openrouter_api_key": "",
             "mistral_api_key": "",
             # Model selections
-            "gemini_model": "",
+            "gemini_model": "gemini-3.8-flash",
             # NVIDIA
             "nvidia_api_key": "",
             "nvidia_base_url": "https://integrate.api.nvidia.com/v1",
-            "nvidia_model": "z-ai/glm5",
+            "nvidia_model": "z-ai/glm-5.3",
             # Vertex AI
             "vertex_api_key": "",
             "vertex_project_id": "",
             "vertex_location": "us-central1",
-            "vertex_model": "gemini-1.5-flash-002",
+            "vertex_model": "gemini-3.8-flash",
             "openai_model": "",
+            "openrouter_model": "openai/gpt-4o-mini",
             "mistral_model": "",
             # Local LLMs
             "ollama_base_url": "http://localhost:11434",
@@ -89,30 +117,42 @@ class SettingsService:
             "lmstudio_model": "local-model",
             # Default provider
             "default_llm_provider": "gemini",
-            # Agent routing
+            # Agent routing — all default to gemini so nothing silently fails
+            # when Ollama/LM Studio are not running locally.
+            # Change individual agents to "vertex" for higher quotas / enterprise data governance.
             "agent_routing": {
+                # Tier 1: Gemini Flash — fast, cheap, structured tasks
+                "project_manager": "gemini",
+                "scoring_agent": "gemini",
+                "data_curator": "gemini",
+                "report_architect": "gemini",
+                "compliance_agent": "gemini",
+                "market_researcher": "gemini",
+                "market_risk_agent": "gemini",
+                "esg_agent": "gemini",
+                "pageindex": "gemini",
+                # Tier 2: Gemini Pro — deep reasoning, long context
                 "financial_analyst": "gemini",
                 "valuation_agent": "gemini",
                 "dcf_lbo_architect": "gemini",
                 "legal_advisor": "gemini",
                 "risk_assessor": "gemini",
                 "debate_moderator": "gemini",
-                "market_researcher": "ollama",
-                "market_risk_agent": "ollama",
-                "compliance_agent": "ollama",
-                "scoring_agent": "ollama",
-                "pageindex": "gemini",
                 "advanced_financial_modeler": "gemini",
                 "complex_reasoning": "gemini",
-                "data_curator": "gemini",
-                "report_architect": "gemini",
                 "due_diligence_agent": "gemini",
                 "investment_memo_agent": "gemini",
                 "red_team": "gemini",
                 "business_analyst": "gemini",
-                "esg_agent": "ollama",
                 "integration_planner_agent": "gemini",
-                "project_manager": "gemini"
+                "compiler_agent": "gemini",
+                "treasury_agent": "gemini",
+                "fpa_forecasting_agent": "gemini",
+                "tax_compliance_agent": "gemini",
+                "ofas_supervisor": "gemini",
+                "prospectus_agent": "gemini",
+                "compliance_qa_agent": "gemini",
+                "ai_tech_diligence_agent": "gemini",
             },
             # RAG
             "pageindex_mode": "local",
@@ -140,18 +180,48 @@ class SettingsService:
         }
 
     def get_all(self) -> Dict[str, Any]:
-        """Return all settings."""
-        return dict(self._settings)
+        """Return settings with credentials redacted for API responses."""
+        def configured(value: Any) -> bool:
+            if not isinstance(value, str):
+                return bool(value)
+            return value.strip().lower() not in {"", "***", "placeholder_key", "none", "null"}
+
+        def redact(value: Any) -> Any:
+            if isinstance(value, dict):
+                safe = {}
+                for key, item in value.items():
+                    lowered = key.lower()
+                    if any(part in lowered for part in ("api_key", "secret", "access_token")):
+                        safe[key] = ""
+                        safe[f"{key}_configured"] = configured(item)
+                    else:
+                        safe[key] = redact(item)
+                return safe
+            if isinstance(value, list):
+                return [redact(item) for item in value]
+            return value
+
+        return redact(self._settings)
 
     def get(self, key: str, default: Any = None) -> Any:
         return self._settings.get(key, default)
 
     def update(self, updates: Dict[str, Any]) -> Dict[str, Any]:
         """Update settings and persist."""
-        self._settings.update(updates)
+        for key, value in updates.items():
+            lowered = key.lower()
+            is_secret = any(part in lowered for part in ("api_key", "secret", "access_token"))
+            if is_secret and (
+                value is None
+                or (isinstance(value, str) and value.strip().lower() in {"", "***", "placeholder_key", "none", "null"})
+            ):
+                continue
+            if key.endswith("_configured"):
+                continue
+            self._settings[key] = value
         self._save()
         self._apply_to_system()
-        return self._settings
+        return self.get_all()
 
     def _apply_to_system(self):
         """
@@ -165,7 +235,7 @@ class SettingsService:
                 from app.core.llm.llm_gateway import get_llm_gateway, VendorLimits
 
                 gw = get_llm_gateway()
-                for vendor in ["gemini", "openai", "mistral", "nvidia"]:
+                for vendor in ["gemini", "openai", "openrouter", "mistral", "nvidia"]:
                     rpm = gateway_cfg.get(f"{vendor}_max_rpm")
                     tpm = gateway_cfg.get(f"{vendor}_max_tpm")
                     if rpm or tpm:
@@ -194,9 +264,11 @@ class SettingsService:
                 "vertex_location": "VERTEX_LOCATION",
                 "vertex_model": "VERTEX_MODEL",
                 "openai_api_key": "OPENAI_API_KEY",
+                "openrouter_api_key": "OPENROUTER_API_KEY",
                 "mistral_api_key": "MISTRAL_API_KEY",
                 "gemini_model": "GEMINI_MODEL",
                 "openai_model": "OPENAI_MODEL",
+                "openrouter_model": "OPENROUTER_MODEL",
                 "mistral_model": "MISTRAL_MODEL",
                 "ollama_base_url": "OLLAMA_BASE_URL",
                 "ollama_model": "OLLAMA_MODEL",

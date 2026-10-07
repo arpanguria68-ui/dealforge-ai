@@ -25,9 +25,9 @@ class ProvenanceCollector:
     _instance: Optional["ProvenanceCollector"] = None
 
     def __init__(self):
-        self._memory_buffer: Dict[str, List[Dict[str, Any]]] = (
-            {}
-        )  # fallback if Redis unavailable
+        self._memory_buffer: Dict[
+            str, List[Dict[str, Any]]
+        ] = {}  # fallback if Redis unavailable
 
     @classmethod
     def get_instance(cls) -> "ProvenanceCollector":
@@ -103,7 +103,11 @@ class ProvenanceCollector:
             from app.core.redis_store import RedisStore
 
             redis = RedisStore.get_instance()
-            keys = await redis.client.keys(f"provenance:{deal_id}:*")
+            keys = []
+            async for key in redis.client.scan_iter(
+                match=f"provenance:{deal_id}:*", count=100
+            ):
+                keys.append(key)
             for key in keys:
                 data = await redis.client.get(key)
                 if data:
@@ -139,7 +143,11 @@ class ProvenanceCollector:
             from app.core.redis_store import RedisStore
 
             redis = RedisStore.get_instance()
-            keys = await redis.client.keys(f"provenance:{deal_id}:*")
+            keys = []
+            async for key in redis.client.scan_iter(
+                match=f"provenance:{deal_id}:*", count=100
+            ):
+                keys.append(key)
             for key in keys:
                 data = await redis.client.get(key)
                 if data:

@@ -58,6 +58,21 @@ class AgentQualityStore:
                 )
                 """
             )
+            # Replication telemetry is written by log_replication_run and read
+            # by get_recent_replication; keep its schema with the other store tables.
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS replication_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_name TEXT NOT NULL,
+                    task_type TEXT NOT NULL,
+                    outputs TEXT NOT NULL,
+                    avg_similarity REAL NOT NULL,
+                    min_similarity REAL NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
             await db.commit()
 
     async def log_action(
@@ -106,38 +121,66 @@ class AgentQualityStore:
     async def update_best_practices(self, agent_name: str, task_type: str):
         """
         Analyze high-scoring actions to extract recurring patterns and update best practices.
-        In a real RL system, an LLM would summarize the action payloads.
-        Here we simply aggregate top actions.
+        Uses an LLM to summarize what specifically worked in the top actions.
         """
         async with aiosqlite.connect(self.db_path) as db:
             # Get top 5 highest scoring actions for this agent+task
             async with db.execute(
                 """
                 SELECT action_payload, score, feedback FROM agent_actions
-                WHERE agent_name = ? AND task_type = ? AND score > 0.7
+                WHERE agent_name = ? AND task_type = ? AND score > 0.8
                 ORDER BY score DESC LIMIT 5
                 """,
                 (agent_name, task_type),
             ) as cursor:
                 top_actions = await cursor.fetchall()
 
-            if not top_actions:
+            if len(top_actions) < 2:
+                # Need at least a few samples to distill a pattern
                 return
 
-            # Naive extraction for proof-of-concept
-            # We construct a summary of what worked
+            # Prepare samples for LLM distillation
+            samples = []
+            for row in top_actions:
+                try:
+                    payload = json.loads(row[0])
+                    samples.append({
+                        "task": payload.get("task", ""),
+                        "score": row[1],
+                        "feedback": row[2]
+                    })
+                except:
+                    continue
+
+            # Use LLM to distill the "secret sauce"
+            from app.core.llm.llm_gateway import get_llm_gateway
+            
+            distillation_prompt = f"""You are a Lead Quant for an M&A platform. 
+Analyze these successful runs for agent '{agent_name}' on task '{task_type}' and distill 
+the top 1-2 SPECIFIC tactics that led to high scores. 
+
+Successful Samples:
+{json.dumps(samples, indent=2)}
+
+Output a single concise paragraph (under 40 words) describing the successful pattern. 
+Start with 'Historically successful approach: ...'
+"""
+            try:
+                gateway = get_llm_gateway()
+                response = await gateway.call(
+                    provider="gemini", # default to high quality for distillation
+                    prompt=distillation_prompt,
+                    system_prompt="Extract only the most impactful successful pattern. Be concise.",
+                    temperature=0.0
+                )
+                practice_desc = response["content"].strip()
+            except Exception as e:
+                self.logger.warning("Distillation failed, using fallback", error=str(e))
+                practice_desc = f"Historically successful approach: Focused on deep data extraction and explicit reasoning for {task_type}."
+
             avg_score = sum(row[1] for row in top_actions) / len(top_actions)
 
-            # Formulate the "practice"
-            feedbacks = [row[2] for row in top_actions if row[2]]
-            if feedbacks:
-                practice_desc = (
-                    f"Historically successful approach: {' | '.join(feedbacks)}"
-                )
-            else:
-                practice_desc = "Historically successful approach: Ensure deep data coverage using available tools."
-
-            # Upsert into best_practices
+            # Upsert into best_practices (simple insert for now, could be smarter about merging)
             await db.execute(
                 """
                 INSERT INTO best_practices (agent_name, task_type, practice_description, avg_score)
@@ -146,6 +189,7 @@ class AgentQualityStore:
                 (agent_name, task_type, practice_desc, avg_score),
             )
             await db.commit()
+            self.logger.info("Best practices updated via LLM", agent=agent_name, task=task_type)
 
     async def get_historical_best_practices(
         self, agent_name: str, task_type: str

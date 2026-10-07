@@ -1,0 +1,28 @@
+DEALFORGE AI TEST CASE STUDIES
+==============================
+
+CASE STUDY 1: PROJECT AETHER (Enterprise SaaS)
+- Target: Skybound CRM
+- ARR: $15M
+- High CAC Payback: 28 months
+- Burn Rate: $2.4M annually
+- Testing: Financial Analyst, Valuation Agent
+
+CASE STUDY 2: PROJECT LUMINA (Healthcare Tech)
+- Target: HealthNodes
+- Status: Pre-revenue Seed
+- Regulatory: HIPAA scrutiny, SOC2 pending
+- Testing: Compliance Agent, Legal Advisor
+
+CASE STUDY 3: PROJECT SOLARIS (Renewables)
+- Target: Horizon Solar Farm
+- EBITDA: 8.5M EUR
+- Duration: 15-year PPA
+- Testing: DCF / LBO Architect, Risk Assessor
+
+CASE STUDY 4: PROJECT NEBULA (Distressed)
+- Target: ModHome (Furniture E-com)
+- Revenue: $80M (Down 30%)
+- Debt: $25M (Approaching default)
+- Inventory: Overstocked ($40M)
+- Testing: Business Analyst, Scoring Agent, Integration Planner

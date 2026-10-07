@@ -1,11 +1,3 @@
-import platform
-
-platform.system = lambda: "Windows"
-platform.release = lambda: "10"
-platform.version = lambda: "10.0.19045"
-platform.machine = lambda: "AMD64"
-platform.architecture = lambda *a, **kw: ("64bit", "WindowsPE")
-
 from fastapi import (
     FastAPI,
     Depends,
@@ -19,13 +11,18 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from contextlib import asynccontextmanager
+import asyncio
 import uuid
 import json
+import os
+import re
+import aiosqlite
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.config import get_settings
+from app.core.cors_config import get_cors_origins
 from app.db.session import init_db, close_db, get_db, AsyncSessionLocal
 from app.orchestrator.state import DealState, DealStage
 from app.core.memory.pageindex_client import get_pageindex_client
@@ -54,6 +51,68 @@ structlog.configure(
 
 logger = structlog.get_logger()
 
+
+def _is_uncalibrated_source_report(data: Any) -> bool:
+    return isinstance(data, dict) and (
+        data.get("confidence_basis") == "not_calibrated_source_report"
+        or data.get("synthesis_status") == "deterministic_source_report"
+    )
+
+REPORT_DOWNLOAD_HEADERS = {
+    "Cache-Control": "private, no-store",
+    "X-Content-Type-Options": "nosniff",
+}
+REQUIRED_REPORT_FORMATS = {"docx", "pdf", "pptx", "xlsx"}
+
+
+def _explicit_public_ticker(text: str) -> Optional[str]:
+    match = re.search(
+        r"\((?:(?:NASDAQ|NYSE|NYSEAMERICAN|AMEX|OTC)\s*:\s*)?([A-Z]{1,5})\)"
+        r"|\bticker\s*(?:is|=|:)\s*([A-Z]{1,5})\b",
+        text or "",
+    )
+    return next((group for group in match.groups() if group), None) if match else None
+
+
+def _explicit_company_name(text: str) -> Optional[str]:
+    """Extract an issuer phrase immediately preceding its parenthesized ticker."""
+    match = re.search(
+        r"\b(?:for|of|assess|analyze|evaluate|screen|review|research|fetch)\s+"
+        r"([A-Z][A-Za-z0-9&.',’ -]{1,79}?)\s+"
+        r"\((?:(?:NASDAQ|NYSE|NYSEAMERICAN|AMEX|OTC)\s*:\s*)?[A-Z]{1,5}\)",
+        text or "",
+        re.IGNORECASE,
+    )
+    return re.sub(r"^(?:the\s+|for\s+)+", "", match.group(1).strip(" ,.-"), flags=re.IGNORECASE) if match else None
+
+
+def _deal_identity_for_export(deal: Dict[str, Any], todo_list: Any) -> Dict[str, Any]:
+    """Recover explicit issuer identity for legacy exports created with placeholders."""
+    resolved = dict(deal)
+    current = str(resolved.get("target_company") or "").strip().lower()
+    if current not in {"", "target company", "the target", "unknown"}:
+        return resolved
+    items = todo_list.get("items", []) if isinstance(todo_list, dict) else getattr(todo_list, "items", [])
+    prompt_parts = []
+    for item in items or []:
+        if isinstance(item, dict):
+            prompt_parts.extend((str(item.get("title") or ""), str(item.get("description") or "")))
+        else:
+            prompt_parts.extend((str(getattr(item, "title", "") or ""), str(getattr(item, "description", "") or "")))
+    prompt = " ".join(prompt_parts)
+    company = _explicit_company_name(prompt)
+    ticker = _explicit_public_ticker(prompt)
+    fallback = todo_list.get("company_name") if isinstance(todo_list, dict) else getattr(todo_list, "company_name", None)
+    if not company and fallback and str(fallback).strip().lower() not in {"target company", "the target", "unknown"}:
+        company = str(fallback).strip()
+    if company:
+        resolved["target_company"] = company
+    elif ticker:
+        resolved["target_company"] = ticker
+    if ticker:
+        resolved["ticker"] = ticker
+    return resolved
+
 from app.core.redis_store import RedisStore
 
 
@@ -64,6 +123,21 @@ async def async_lifespan(app: FastAPI):
     logger.info("Starting DealForge AI")
     await init_db()
 
+    # Probes make billable completion calls, so run them only by operator request.
+    if settings.LLM_STARTUP_PROBE:
+        try:
+            from app.core.llm.capability_probe import probe_fallback_chain
+
+            logger.info("Running pre-flight LLM capability probe...")
+            results = await probe_fallback_chain()
+            healthy_count = sum(1 for r in results.values() if r["healthy"])
+            logger.info(
+                "LLM health check complete",
+                healthy=f"{healthy_count}/{len(results)}",
+            )
+        except Exception as e:
+            logger.warning("startup_probe_failed", error=str(e))
+
     # Load previously saved settings
     from app.core.settings_service import SettingsService
 
@@ -73,6 +147,19 @@ async def async_lifespan(app: FastAPI):
 
     # Initialize Redis Store
     RedisStore.get_instance()
+
+    # ── Initialize OfficeCLI (if auto-download enabled) ──
+    if settings.OFFICECLI_AUTO_DOWNLOAD:
+        try:
+            from app.core.reports.officecli_service import get_officecli_service
+
+            oc = get_officecli_service()
+            if oc.is_available():
+                logger.info("OfficeCLI initialized", path=oc._binary_path)
+            else:
+                logger.info("OfficeCLI not available (will auto-download on first use)")
+        except Exception as e:
+            logger.warning("officecli_init_failed", error=str(e))
 
     yield
 
@@ -101,16 +188,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-        "http://localhost:5175",
-        "http://127.0.0.1:5175",
-    ],
+    allow_origins=get_cors_origins(settings.CORS_ORIGINS),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -118,7 +196,28 @@ app.add_middleware(
 )
 
 # Security
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
+
+
+def require_admin_token(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Simple bearer token guard for admin/sensitive endpoints."""
+    expected = (settings.ADMIN_API_TOKEN or "").strip()
+    enforce = settings.REQUIRE_ADMIN_TOKEN or bool(expected)
+    if not enforce:
+        return True
+
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="Admin token enforcement enabled but ADMIN_API_TOKEN is not configured",
+        )
+
+    token = ((credentials.credentials if credentials else "") or "").strip()
+    if token != expected:
+        raise HTTPException(status_code=403, detail="Invalid admin token")
+    return True
 
 
 # ===== Pydantic Models for API =====
@@ -144,6 +243,14 @@ class DealResponse(BaseModel):
     status: str
     target_company: str
     current_stage: str
+
+
+class TemplateMergeRequest(BaseModel):
+    """Request to merge template with data"""
+
+    template_path: str
+    output_path: str
+    data: Dict[str, Any]
     final_score: Optional[float] = None
     final_recommendation: Optional[str] = None
     created_at: str
@@ -214,7 +321,21 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+    # Check OfficeCLI availability
+    officecli_status = "unavailable"
+    try:
+        from app.core.reports.officecli_service import get_officecli_service
+
+        oc = get_officecli_service()
+        officecli_status = "ready" if oc.is_available() else "unavailable"
+    except Exception:
+        pass
+
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "officecli": officecli_status,
+    }
 
 
 # ===== Deal Management Routes =====
@@ -224,7 +345,7 @@ async def health_check():
 async def create_deal(request: DealCreateRequest):
     """Create a new deal and persist it in the in-memory store"""
     deal_id = str(uuid.uuid4())
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
 
     logger.info(
         "Creating new deal",
@@ -276,14 +397,33 @@ async def update_deal(deal_id: str, request: Request):
 
     body = await request.json()
 
+    if body.get("status") == "completed":
+        from app.core.tasks.task_manager import get_task_manager
+
+        task_lists = await get_task_manager().get_lists_for_deal(deal_id)
+        if not task_lists or any(
+            not task_list.items or any(item.status != "done" for item in task_list.items)
+            for task_list in task_lists
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Deal cannot be marked completed until every task in its saved plans is done.",
+            )
+
     for key in ("status", "current_stage", "final_score", "final_recommendation"):
         if key in body:
             deal[key] = body[key]
 
-    deal["updated_at"] = datetime.utcnow().isoformat()
+    deal["updated_at"] = datetime.now(timezone.utc).isoformat()
     await redis_store.save_deal(deal_id, deal)
     logger.info("deal_updated", deal_id=deal_id, updates=list(body.keys()))
     return deal
+
+
+@app.patch("/api/v1/deals/{deal_id}")
+async def patch_deal(deal_id: str, request: Request):
+    """Patch a deal record with status/stage/score updates."""
+    return await update_deal(deal_id, request)
 
 
 @app.get("/api/v1/deals/{deal_id}/provenance")
@@ -308,6 +448,16 @@ async def export_deal_provenance(deal_id: str):
     return export_data
 
 
+@app.get("/api/v1/deals/{deal_id}/agent-messages")
+async def get_deal_agent_messages(deal_id: str):
+    """Retrieve the inter-agent message history for a specific deal."""
+    from app.orchestrator.agent_bus import get_agent_message_bus
+
+    bus = get_agent_message_bus()
+    messages = bus.get_message_history(deal_id)
+    return {"deal_id": deal_id, "messages": messages}
+
+
 @app.get("/api/v1/dashboard/metrics")
 async def dashboard_metrics():
     """Return live dashboard KPIs and agent activity feed"""
@@ -316,8 +466,26 @@ async def dashboard_metrics():
     agent_activity = await redis_store.get_global_activity()
 
     total = len(deals)
-    scores = [d["final_score"] for d in deals if d.get("final_score") is not None]
-    avg_score = round(sum(scores) / len(scores) * 100, 1) if scores else 0
+    completed_deal_ids = {deal.get("id") for deal in deals if deal.get("status") == "completed"}
+    uncalibrated_runs = {
+        (event.get("deal_id"), event.get("agent_type"))
+        for event in agent_activity
+        if _is_uncalibrated_source_report(event.get("data"))
+    }
+    confidences = [
+        float(confidence)
+        for deal in deals
+        if deal.get("id") in completed_deal_ids
+        for agent_type, confidence in (deal.get("_confidence_scores") or {}).items()
+        if (deal.get("id"), agent_type) not in uncalibrated_runs
+        and isinstance(confidence, (int, float))
+        and 0 <= confidence <= 1
+    ]
+    avg_confidence = (
+        round(sum(confidences) / len(confidences) * 100, 1)
+        if confidences
+        else None
+    )
     high_risk = sum(
         1 for d in deals if d.get("final_score") is not None and d["final_score"] < 0.5
     )
@@ -328,7 +496,7 @@ async def dashboard_metrics():
         "total_deals": total,
         "active_deals": active,
         "completed_deals": completed,
-        "avg_confidence": avg_score,
+        "avg_confidence": avg_confidence,
         "high_risk_alerts": high_risk,
         "deals": deals,
         "agent_activity": agent_activity[-20:],  # last 20 events
@@ -337,8 +505,8 @@ async def dashboard_metrics():
 
 @app.post("/api/v1/agent-activity")
 async def log_agent_activity(event: dict):
-    """Log an agent completion event and auto-complete deals when all agents have run"""
-    event.setdefault("timestamp", datetime.utcnow().isoformat())
+    """Persist agent activity without inferring task-list or deal completion."""
+    event.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
 
     redis_store = RedisStore.get_instance()
     await redis_store.add_activity(event)
@@ -355,7 +523,10 @@ async def log_agent_activity(event: dict):
                 deal["agents_run"] = deal.get("agents_run", []) + [agent_type]
 
             # Track per-agent confidence for final score calculation
-            if "confidence" in event:
+            source_only = _is_uncalibrated_source_report(event.get("data"))
+            if source_only:
+                deal.get("_confidence_scores", {}).pop(agent_type, None)
+            elif "confidence" in event:
                 if "_confidence_scores" not in deal:
                     deal["_confidence_scores"] = {}
                 deal["_confidence_scores"][agent_type] = float(event["confidence"])
@@ -363,37 +534,97 @@ async def log_agent_activity(event: dict):
             # Use explicit final_score if provided
             if event.get("final_score") is not None:
                 deal["final_score"] = float(event["final_score"])
-                deal["status"] = "completed"
-                deal["current_stage"] = "completed"
-
-            # Auto-complete fallback: mark done when at least 4 agents have run
-            agents_done = set(deal.get("agents_run", []))
-            if len(agents_done) >= 4 and deal["status"] != "completed":
-                # Compute score from collected confidences
-                scores = list(deal.get("_confidence_scores", {}).values())
-                if scores:
-                    deal["final_score"] = round(sum(scores) / len(scores), 4)
-                else:
-                    deal["final_score"] = 0.75  # reasonable default
-                deal["status"] = "completed"
-                deal["current_stage"] = "completed"
 
             await redis_store.save_deal(deal_id, deal)
+            try:
+                from app.core.document_store import DocumentStore
+
+                await DocumentStore.get_instance().invalidate(deal_id)
+            except Exception as exc:
+                logger.warning(
+                    "report_cache_invalidation_failed",
+                    deal_id=deal_id,
+                    error_type=type(exc).__name__,
+                )
 
     return {"status": "logged"}
 
 
+class RateOutputRequest(BaseModel):
+    """Request to rate an agent output"""
+
+    action_id: int
+    rating: int = Field(..., ge=1, le=5)
+    feedback: Optional[str] = ""
+
+
+@app.post("/api/v1/rate-output")
+async def rate_output(request: RateOutputRequest):
+    """
+    Submit a user rating for an agent action.
+    This provides a strong 'user_feedback' reward signal to the RL loop.
+    """
+    from app.core.quality.agent_quality_store import AgentQualityStore
+    from app.core.reflection.reflection_engine import RewardEngine
+
+    # 1. Convert 1-5 rating to 0-1 scale
+    feedback_score = (request.rating - 1) / 4.0
+
+    # 2. Re-calculate reward with user feedback
+    # Note: Ideally we'd fetch the original reflection_score,
+    # but for now we'll assume a baseline or use the feedback directly.
+    # In a full impl, we'd query agent_actions for the existing score.
+    reward_engine = RewardEngine()
+
+    # We use a high weight for user feedback when explicitly provided
+    reward = reward_engine.compute_reward(
+        reflection_score=feedback_score,  # Use feedback as proxy if reflection unknown
+        user_feedback=feedback_score,
+        task_completed=True,
+    )
+
+    # 3. Update the record
+    store = AgentQualityStore()
+    await store.initialize()
+    await store.reward_action(
+        request.action_id, reward, f"user_rating={request.rating} | {request.feedback}"
+    )
+
+    # 4. Trigger best practice update if rating is high
+    if request.rating >= 4:
+        # We need the agent_name and task_type
+        async with aiosqlite.connect(store.db_path) as db:
+            async with db.execute(
+                "SELECT agent_name, task_type FROM agent_actions WHERE id = ?",
+                (request.action_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    await store.update_best_practices(row[0], row[1])
+
+    return {"status": "success", "reward": reward}
+
+
 @app.get("/api/v1/deals/{deal_id}/report")
-async def generate_deal_report(deal_id: str, format: str = "pdf"):
+async def generate_deal_report(
+    deal_id: str, format: str = "pdf", _: bool = Depends(require_admin_token)
+):
     """
     Generate a McKinsey-style report for a deal.
-    Supported formats: pptx, xlsx, pdf
+    Supported formats: docx, pptx, xlsx, pdf
     """
+    raise HTTPException(
+        status_code=409,
+        detail="Direct report generation is disabled. Generate in Reports Hub, review, approve, then download.",
+    )
+
+    # Kept temporarily for reference while older clients migrate to Reports Hub.
     from fastapi.responses import Response
     from app.core.reports.report_generator import (
         generate_pptx,
         generate_excel,
         generate_pdf,
+        generate_docx,
     )
 
     redis_store = RedisStore.get_instance()
@@ -405,12 +636,11 @@ async def generate_deal_report(deal_id: str, format: str = "pdf"):
 
     # Collect agent results from activity log
     activities = await redis_store.get_deal_activity(deal_id)
-    agent_results = []
-    seen = set()
-    for evt in activities:
-        if evt.get("agent_type") not in seen:
-            seen.add(evt["agent_type"])
-            agent_results.append(evt)
+    from app.core.reports.document_planner import prepare_document_payload
+    from app.agents.base import get_agent_registry
+    agent_results, analyst_data, evidence_brief = await prepare_document_payload(
+        get_agent_registry(), deal, activities
+    )
 
     # Sanitize company name for Safe HTTP Headers
     raw_name = deal.get("target_company", "report")
@@ -420,45 +650,26 @@ async def generate_deal_report(deal_id: str, format: str = "pdf"):
     if not safe_name:
         safe_name = "report"
 
-    # Run Business Analyst here to format the final delivery payload dynamically
-    from app.agents.base import get_agent_registry
-
-    registry = get_agent_registry()
-    ba_agent = registry.get("business_analyst")
-    analyst_data = {}
-
-    if ba_agent:
-        logger.info("Executing Business Analyst formatting layer before download...")
-        try:
-            ba_result = await ba_agent.run(
-                "Format report payload",
-                context={"deal_id": deal_id, "deal_data": agent_results},
-            )
-            if ba_result.success:
-                analyst_data = ba_result.data
-        except Exception as e:
-            logger.error("Business Analyst failed during download", error=str(e))
-
     fmt = format.lower()
 
     # Query Knowledge Base for context
     try:
         from app.core.memory.pageindex_client import get_pageindex_client
         from app.core.reports.report_generator import KBReportEnricher
+
         kb = get_pageindex_client()
         enricher = KBReportEnricher(kb)
         kb_context = await enricher.get_company_context(
-            deal.get("target_company", ""),
-            deal.get("industry", "")
+            deal.get("target_company", ""), deal.get("industry", "")
         )
         format_context = await enricher.get_formatting_context(deal.get("name", ""))
         kb_references = enricher.get_references()
-        
+
         analyst_data["_rag_context"] = {
             "kb_context": kb_context,
             "format_context": format_context,
             "references": kb_references,
-            "chunks_used": len(kb_references)
+            "chunks_used": len(kb_references),
         }
     except Exception as e:
         logger.warning(f"Failed to enrich report with KB data: {e}")
@@ -468,6 +679,7 @@ async def generate_deal_report(deal_id: str, format: str = "pdf"):
 
     provenance_records = await get_provenance_collector().get_records(deal_id)
     deal_stage = deal.get("current_stage", "deep_dive")
+    analyst_data["_evidence_brief"] = evidence_brief
 
     if fmt == "pptx":
         content = generate_pptx(
@@ -489,16 +701,24 @@ async def generate_deal_report(deal_id: str, format: str = "pdf"):
         )
         media_type = "application/pdf"
         filename = f"DealForge_{safe_name}.pdf"
+    elif fmt == "docx":
+        content = generate_docx(
+            deal, analyst_data, agent_results, provenance_records, deal_stage
+        )
+        media_type = (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+        filename = f"DealForge_{safe_name}.docx"
     else:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported format: {format}. Use pptx, xlsx, or pdf.",
+            detail=f"Unsupported format: {format}. Use docx, pptx, xlsx, or pdf.",
         )
 
     return Response(
         content=content,
         media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={**REPORT_DOWNLOAD_HEADERS, "Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
@@ -507,20 +727,194 @@ async def generate_deal_report(deal_id: str, format: str = "pdf"):
 # ══════════════════════════════════════════════════════════════════
 
 
+# ══════════════════════════════════════════════════════════════════
+#  OfficeCLI Template Merge Endpoint
+# ══════════════════════════════════════════════════════════════════
+
+
+@app.post("/api/v1/documents/merge")
+async def merge_document_template(request: TemplateMergeRequest):
+    """
+    Merge JSON data into a DOCX/XLSX/PPTX template using OfficeCLI.
+
+    Replace {{variable}} placeholders in template with JSON data values.
+    Supports .docx, .xlsx, .pptx formats.
+    """
+    from app.core.reports.officecli_service import get_officecli_service
+
+    service = get_officecli_service()
+    if not service.is_available():
+        raise HTTPException(
+            status_code=503,
+            detail="OfficeCLI not available. Install officecli binary.",
+        )
+
+    result = await service.merge_template(
+        request.template_path,
+        request.output_path,
+        request.data,
+    )
+
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Merge failed"))
+
+    return {"success": True, "output": request.output_path}
+
+
+@app.get("/api/v1/documents/template/{template_path:path}/variables")
+async def get_template_vars(template_path: str):
+    """Extract {{variable}} names from a template"""
+    from app.core.reports.officecli_service import get_officecli_service
+
+    service = get_officecli_service()
+    if not service.is_available():
+        raise HTTPException(status_code=503, detail="OfficeCLI not available")
+
+    variables = service.get_template_variables(template_path)
+    return {"variables": variables}
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Batch Document Processing
+# ══════════════════════════════════════════════════════════════════
+
+
+class BatchMergeItem(BaseModel):
+    template_path: str
+    output_path: str
+    data: Dict[str, Any]
+
+
+class BatchMergeRequest(BaseModel):
+    items: List[BatchMergeItem]
+    parallel: bool = True
+
+
+@app.post("/api/v1/documents/batch")
+async def batch_merge_documents(request: BatchMergeRequest):
+    """
+    Batch merge multiple templates in parallel or sequential.
+
+    Each item contains a template_path, output_path, and data dict.
+    Set parallel=true for concurrent processing (faster but more memory).
+    """
+    from app.core.reports.officecli_service import get_officecli_service
+
+    service = get_officecli_service()
+    if not service.is_available():
+        raise HTTPException(status_code=503, detail="OfficeCLI not available")
+
+    results = []
+    if request.parallel:
+        import asyncio
+
+        async def merge_item(item: BatchMergeItem) -> Dict[str, Any]:
+            result = await service.merge_template(
+                item.template_path,
+                item.output_path,
+                item.data,
+            )
+            return {
+                "template": item.template_path,
+                "output": item.output_path,
+                **result,
+            }
+
+        tasks = [merge_item(item) for item in request.items]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        results = [
+            r if isinstance(r, dict) else {"success": False, "error": str(r)}
+            for r in results
+        ]
+    else:
+        for item in request.items:
+            result = await service.merge_template(
+                item.template_path,
+                item.output_path,
+                item.data,
+            )
+            results.append(
+                {
+                    "template": item.template_path,
+                    "output": item.output_path,
+                    **result,
+                }
+            )
+
+    success_count = sum(1 for r in results if r.get("success"))
+    return {
+        "total": len(request.items),
+        "success": success_count,
+        "failed": len(request.items) - success_count,
+        "results": results,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Document Validation
+# ══════════════════════════════════════════════════════════════════
+
+
+@app.post("/api/v1/documents/validate")
+async def validate_document(path: str):
+    """
+    Validate a document for structural issues using OfficeCLI.
+
+    Returns issues found in the document (formatting, consistency, etc).
+    """
+    from app.core.reports.officecli_service import get_officecli_service
+
+    service = get_officecli_service()
+    if not service.is_available():
+        raise HTTPException(status_code=503, detail="OfficeCLI not available")
+
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"Document not found: {path}")
+
+    result = await service.validate_document(path)
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Document Hub — Generate Once, Download Instantly
+# ══════════════════════════════════════════════════════════════════
+
+
+class ReportApprovalRequest(BaseModel):
+    reviewer: str = Field(..., min_length=2, max_length=120)
+    attestation: bool = Field(..., description="Reviewer confirms the report was checked for client release")
+
+
+def _require_approved_report(metadata: Optional[Dict[str, Any]]) -> None:
+    if not metadata:
+        raise HTTPException(status_code=404, detail="Report artifact not found.")
+    if not metadata.get("report_version") or not metadata.get("analysis_fingerprint"):
+        raise HTTPException(
+            status_code=409,
+            detail="This legacy artifact has no verified report version. Regenerate it before client delivery.",
+        )
+    if metadata.get("release_status") != "approved":
+        raise HTTPException(
+            status_code=409,
+            detail="Client delivery is blocked until a reviewer approves this report in Reports Hub.",
+        )
+
+
 @app.post("/api/v1/deals/{deal_id}/documents/generate")
-async def generate_deal_documents(deal_id: str):
+async def generate_deal_documents(deal_id: str, _: bool = Depends(require_admin_token)):
     """
-    Generate & cache all report formats (PPTX, Excel, PDF) for a deal.
-    
+    Generate & cache all report formats (DOCX, PPTX, Excel, PDF) for a deal.
+
     This runs the BusinessAnalyst formatting layer and KB enrichment ONCE,
-    then generates all 3 formats and caches them in Redis for instant downloads.
+    then generates each format and caches successful, validated artifacts in Redis.
     """
-    from fastapi.responses import JSONResponse
     from app.core.document_store import DocumentStore
     from app.core.reports.report_generator import (
         generate_pptx,
         generate_excel,
         generate_pdf,
+        generate_docx,
     )
 
     redis_store = RedisStore.get_instance()
@@ -528,36 +922,39 @@ async def generate_deal_documents(deal_id: str):
     deal = await redis_store.get_deal(deal_id)
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
+    if deal.get("status") not in {"completed", "ready"}:
+        raise HTTPException(status_code=409, detail="Complete the analysis before generating deliverables.")
 
     import re
 
-    # ── Step 1: Collect agent results (ONCE) ──
+    # ── Step 1: Collect the persisted task results; activity is metadata only ──
+    from app.core.tasks.task_manager import get_task_manager
+    task_lists = await get_task_manager().get_lists_for_deal(deal_id)
+    saved_tasks = [item for task_list in task_lists for item in task_list.items]
+    if task_lists and (
+        not any(item.status == "done" and isinstance(item.result, dict) for item in saved_tasks)
+        or any(item.status != "done" or not isinstance(item.result, dict) for item in saved_tasks)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Saved analysis still has unfinished or unpersisted tasks; finish or review the run before generating deliverables.",
+        )
     activities = await redis_store.get_deal_activity(deal_id)
-    agent_results = []
-    seen = set()
-    for evt in activities:
-        if evt.get("agent_type") not in seen:
-            seen.add(evt["agent_type"])
-            agent_results.append(evt)
+    from app.agents.base import get_agent_registry
+    from app.core.reports.document_planner import build_report_agent_results, prepare_document_payload
+    report_inputs = build_report_agent_results(task_lists, activities)
+    agent_results, analyst_data, evidence_brief = await prepare_document_payload(
+        get_agent_registry(), deal, report_inputs
+    )
 
-    # ── Step 2: Run BusinessAnalyst formatting layer (ONCE) ──
-    from app.agents.base import get_agent_registry as _get_registry
+    try:
+        from app.core.reports.document_planner import extract_chat_context
 
-    registry = _get_registry()
-    ba_agent = registry.get("business_analyst")
-    analyst_data = {}
-
-    if ba_agent:
-        logger.info("Document Hub: Running Business Analyst formatting layer...")
-        try:
-            ba_result = await ba_agent.run(
-                "Format report payload",
-                context={"deal_id": deal_id, "deal_data": agent_results},
-            )
-            if ba_result.success:
-                analyst_data = ba_result.data
-        except Exception as e:
-            logger.error("Business Analyst failed during doc generation", error=str(e))
+        analyst_data["_chat_context"] = extract_chat_context(
+            await redis_store.list_conversations(limit=200), deal_id
+        )
+    except Exception as exc:
+        logger.warning("Report chat-context lookup unavailable", deal_id=deal_id, error_type=type(exc).__name__)
 
     # ── Step 3: Enrich with Knowledge Base (ONCE) ──
     try:
@@ -586,54 +983,172 @@ async def generate_deal_documents(deal_id: str):
 
     provenance_records = await get_provenance_collector().get_records(deal_id)
     deal_stage = deal.get("current_stage", "deep_dive")
+    analyst_data["_evidence_brief"] = evidence_brief
 
     # ── Step 5: Sanitize filename ──
     raw_name = deal.get("target_company", "report")
     safe_name = re.sub(r"[^A-Za-z0-9]", "_", raw_name)
     safe_name = re.sub(r"_+", "_", safe_name).strip("_") or "report"
 
-    # ── Step 6: Generate all 3 formats & cache ──
+    # ── Step 6: Generate and validate every format before publishing any ──
     formats_generated = []
     errors = []
+    pending_artifacts = {}
+    report_version = str(uuid.uuid4())
+    import hashlib
+
+    snapshot_bytes = json.dumps(
+        {
+            "deal": deal,
+            "analysis": analyst_data,
+            "agent_results": agent_results,
+            "provenance": provenance_records,
+        },
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8")
     metadata = {
         "target_company": deal.get("target_company", "Unknown"),
         "deal_name": deal.get("name", "Unknown"),
         "agents_count": len(agent_results),
         "safe_filename": safe_name,
+        "report_version": report_version,
+        "analysis_fingerprint": hashlib.sha256(snapshot_bytes).hexdigest(),
+        "release_status": "pending_review",
+        "review_status": analyst_data.get("_document_qa", {}).get("status", "review_required"),
+        "review_warnings": analyst_data.get("_document_qa", {}).get("warnings", []),
     }
 
     format_generators = {
         "pptx": generate_pptx,
         "xlsx": generate_excel,
         "pdf": generate_pdf,
+        "docx": generate_docx,
     }
+
+    from app.core.reports.report_guardrails import ReportGuardrails
+    from starlette.concurrency import run_in_threadpool
 
     for fmt, generator in format_generators.items():
         try:
-            content = generator(
-                deal, analyst_data, agent_results, provenance_records, deal_stage
+            content = await run_in_threadpool(
+                generator, deal, analyst_data, agent_results, provenance_records, deal_stage
             )
-            await doc_store.save_document(deal_id, fmt, content, metadata)
-            formats_generated.append(fmt)
-            logger.info(f"Document Hub: Generated {fmt.upper()}", deal_id=deal_id)
-        except Exception as e:
-            errors.append({"format": fmt, "error": str(e)})
-            logger.error(f"Document Hub: Failed to generate {fmt}", error=str(e))
+            validation = ReportGuardrails.validate_artifact(fmt, content)
+            if not validation["valid"]:
+                raise ValueError("Generated artifact failed structural validation.")
 
-    # Return the manifest
+            # Validate with OfficeCLI if available
+            try:
+                from app.core.reports.officecli_service import get_officecli_service
+
+                oc = get_officecli_service()
+                if oc.is_available() and fmt in ("pptx", "xlsx", "docx"):
+                    from tempfile import TemporaryDirectory
+                    import tempfile
+
+                    with TemporaryDirectory() as tmpdir:
+                        temp_path = os.path.join(tmpdir, f"temp_{fmt}.{fmt}")
+                        with open(temp_path, "wb") as f:
+                            f.write(content)
+                        validation = await oc.validate_document(temp_path)
+                        if validation.get("issues") or validation.get("success") is False:
+                            raise ValueError("Generated document failed OfficeCLI validation.")
+            except Exception as ve:
+                if isinstance(ve, ValueError):
+                    raise
+                logger.warning(f"Document validation failed for {fmt}", error=str(ve))
+            pending_artifacts[fmt] = content
+            logger.info(f"Document Hub: Validated {fmt.upper()}", deal_id=deal_id)
+        except Exception as e:
+            errors.append({"format": fmt, "error": f"Generation failed ({type(e).__name__})."})
+            logger.error(
+                "document_generation_failed",
+                deal_id=deal_id,
+                format=fmt,
+                error_type=type(e).__name__,
+            )
+
+    if not errors and len(pending_artifacts) == len(format_generators):
+        try:
+            await doc_store.replace_documents(deal_id, pending_artifacts, metadata)
+            formats_generated = list(pending_artifacts)
+        except Exception as exc:
+            errors.append({"format": "bundle", "error": f"Bundle publication failed ({type(exc).__name__})."})
+            logger.error("document_bundle_publish_failed", deal_id=deal_id, error_type=type(exc).__name__)
+
+    # A failed regeneration leaves the previously published bundle untouched.
     manifest = await doc_store.list_documents(deal_id)
 
     return {
         "deal_id": deal_id,
-        "status": "complete" if not errors else "partial",
+        "status": "complete" if not errors else ("partial" if formats_generated else "failed"),
         "formats_generated": formats_generated,
         "errors": errors,
         "documents": manifest,
+        "coverage": {
+            "chat_context_attached": bool(analyst_data.get("_chat_context")),
+            "successful_analyses": evidence_brief.get("successful_analysis_count", 0),
+            "source_records": len(evidence_brief.get("sources", [])),
+            "financial_data_points": len(evidence_brief.get("data_points", [])),
+            "open_data_gaps": len(evidence_brief.get("unknowns", [])),
+            "human_review_required": analyst_data.get("_document_qa", {}).get("status") == "review_required",
+            "release_status": "pending_review",
+        },
+    }
+
+
+@app.post("/api/v1/deals/{deal_id}/documents/approve")
+async def approve_deal_documents(
+    deal_id: str,
+    request: ReportApprovalRequest,
+    _: bool = Depends(require_admin_token),
+):
+    """Record reviewer attestation before enabling client delivery downloads."""
+    from app.core.document_store import DocumentStore
+
+    if not request.attestation:
+        raise HTTPException(status_code=422, detail="Reviewer attestation is required.")
+    store = DocumentStore.get_instance()
+    documents = await store.list_documents(deal_id)
+    if not documents:
+        raise HTTPException(status_code=404, detail="Generate report artifacts before approval.")
+    versions = {document.get("report_version") for document in documents}
+    fingerprints = {document.get("analysis_fingerprint") for document in documents}
+    formats = {document.get("format") for document in documents}
+    if (
+        None in versions or len(versions) != 1 or None in fingerprints
+        or len(fingerprints) != 1 or formats != REQUIRED_REPORT_FORMATS
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Report artifacts are incomplete or from different analysis versions. Regenerate the full bundle before approval.",
+        )
+    now = datetime.now(timezone.utc).isoformat()
+    approved = []
+    for document in documents:
+        updated = await store.update_document_metadata(deal_id, document["format"], {
+            "release_status": "approved",
+            "approved_at": now,
+            "approved_by": request.reviewer.strip(),
+            "reviewer_attestation": True,
+        })
+        if updated:
+            approved.append(document["format"])
+    if not approved:
+        raise HTTPException(status_code=404, detail="No report artifacts are available to approve.")
+    logger.info("report_release_approved", deal_id=deal_id, reviewer=request.reviewer.strip(), formats=approved)
+    return {
+        "deal_id": deal_id,
+        "report_version": next(iter(versions)),
+        "release_status": "approved",
+        "approved_by": request.reviewer.strip(),
+        "formats": approved,
     }
 
 
 @app.get("/api/v1/deals/{deal_id}/documents")
-async def list_deal_documents(deal_id: str):
+async def list_deal_documents(deal_id: str, _: bool = Depends(require_admin_token)):
     """
     Return a manifest of all available cached documents for a deal.
     Each entry includes format, size, generated timestamp, and status.
@@ -658,7 +1173,7 @@ async def list_deal_documents(deal_id: str):
 
 
 @app.get("/api/v1/deals/{deal_id}/documents/bundle")
-async def download_deal_bundle(deal_id: str):
+async def download_deal_bundle(deal_id: str, _: bool = Depends(require_admin_token)):
     """
     Download a ZIP bundle containing all cached documents for a deal.
     """
@@ -667,26 +1182,49 @@ async def download_deal_bundle(deal_id: str):
     from fastapi.responses import Response
     from app.core.document_store import DocumentStore
 
+    if not await RedisStore.get_instance().get_deal(deal_id):
+        raise HTTPException(status_code=404, detail="Deal not found")
+
     doc_store = DocumentStore.get_instance()
     documents = await doc_store.list_documents(deal_id)
 
     if not documents:
+        raise HTTPException(status_code=404, detail="No cached report bundle is available.")
+
+    versions = {document.get("report_version") for document in documents}
+    fingerprints = {document.get("analysis_fingerprint") for document in documents}
+    formats = {document.get("format") for document in documents}
+    if (
+        len(versions) != 1 or None in versions or len(fingerprints) != 1
+        or None in fingerprints or formats != REQUIRED_REPORT_FORMATS
+    ):
         raise HTTPException(
-            status_code=404,
-            detail="No cached documents found. Call POST /documents/generate first.",
+            status_code=409,
+            detail="Report bundle versions are inconsistent or unverified. Regenerate the full bundle.",
         )
+
+    for document in documents:
+        _require_approved_report(document)
 
     # Build ZIP in memory
     zip_buffer = io.BytesIO()
     safe_name = documents[0].get("safe_filename", "report")
 
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        included = 0
         for doc_meta in documents:
             fmt = doc_meta["format"]
             content = await doc_store.get_document(deal_id, fmt)
             if content:
                 filename = f"DealForge_{safe_name}.{fmt}"
                 zf.writestr(filename, content)
+                included += 1
+
+    if not included:
+        raise HTTPException(
+            status_code=404,
+            detail="Cached report files expired. Regenerate the deliverables.",
+        )
 
     zip_buffer.seek(0)
     zip_filename = f"DealForge_{safe_name}_Reports.zip"
@@ -694,12 +1232,12 @@ async def download_deal_bundle(deal_id: str):
     return Response(
         content=zip_buffer.read(),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{zip_filename}"'},
+        headers={**REPORT_DOWNLOAD_HEADERS, "Content-Disposition": f'attachment; filename="{zip_filename}"'},
     )
 
 
 @app.get("/api/v1/deals/{deal_id}/documents/{fmt}")
-async def download_deal_document(deal_id: str, fmt: str):
+async def download_deal_document(deal_id: str, fmt: str, _: bool = Depends(require_admin_token)):
     """
     Download a single cached document by format (pdf, pptx, xlsx).
     Returns cached bytes instantly — no regeneration.
@@ -710,10 +1248,10 @@ async def download_deal_document(deal_id: str, fmt: str):
     doc_store = DocumentStore.get_instance()
     fmt = DocumentStore.get_extension(fmt.lower())
 
-    if fmt not in ("pptx", "xlsx", "pdf"):
+    if fmt not in ("pptx", "xlsx", "pdf", "docx"):
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported format: {fmt}. Use pptx, xlsx, or pdf.",
+            detail=f"Unsupported format: {fmt}. Use pptx, xlsx, pdf, or docx.",
         )
 
     # Try cache first
@@ -725,13 +1263,14 @@ async def download_deal_document(deal_id: str, fmt: str):
         )
 
     meta = await doc_store.get_document_meta(deal_id, fmt)
+    _require_approved_report(meta)
     safe_name = (meta or {}).get("safe_filename", "report")
     filename = f"DealForge_{safe_name}.{fmt}"
 
     return Response(
         content=content,
         media_type=DocumentStore.get_content_type(fmt),
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={**REPORT_DOWNLOAD_HEADERS, "Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
@@ -862,24 +1401,33 @@ class _QueryBody(BaseModel):
 async def documents_query(body: _QueryBody):
     """Semantic search over the RAG Knowledge Base."""
     try:
+        from app.core.laya.graph_nodes import sanitize_brief
+
+        safe_query = sanitize_brief(body.query, max_chars=4000)
         client = get_pageindex_client()
         filters = {"deal_id": body.deal_id} if body.deal_id else None
-        chunks = await client.query(query=body.query, top_k=body.top_k, filters=filters)
+        chunks = await client.query(query=safe_query, top_k=body.top_k, filters=filters)
         return {
-            "query": body.query,
+            "query": safe_query,
             "results": [
                 {
-                    "content": c.content,
+                    "content": sanitize_brief(c.content, max_chars=5000),
                     "page": c.page_number,
                     "relevance": c.relevance_score,
                     "chunk_id": c.chunk_id,
+                    # Citation + provenance metadata (RAG v2; absent on cloud/legacy chunks)
+                    "citation": (c.metadata or {}).get("citation", ""),
+                    "filename": (c.metadata or {}).get("filename", ""),
+                    "doc_id": (c.metadata or {}).get("doc_id", ""),
+                    "section_path": (c.metadata or {}).get("section_path", []),
+                    "laya_relevance": (c.metadata or {}).get("laya_relevance"),
                 }
                 for c in chunks
             ],
         }
     except Exception as e:
-        logger.error("documents_query failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("documents_query failed", error_type=type(e).__name__)
+        raise HTTPException(status_code=500, detail="Knowledge search failed. Check service logs for a redacted diagnostic.")
 
 
 @app.post("/api/v1/documents/upload")
@@ -887,6 +1435,7 @@ async def documents_upload(file: UploadFile = File(...), deal_id: Optional[str] 
     """Upload and index a document into the Knowledge Base."""
     import tempfile, os
 
+    tmp_path: Optional[str] = None
     try:
         suffix = os.path.splitext(file.filename or ".txt")[1]
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -901,8 +1450,6 @@ async def documents_upload(file: UploadFile = File(...), deal_id: Optional[str] 
 
         result = await client.ingest_document(tmp_path, metadata=metadata)
 
-        os.unlink(tmp_path)
-
         return {
             "status": "indexed",
             "index_id": getattr(result, "index_id", ""),
@@ -912,6 +1459,12 @@ async def documents_upload(file: UploadFile = File(...), deal_id: Optional[str] 
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 @app.post("/api/v1/documents/upload/bulk")
@@ -925,6 +1478,7 @@ async def documents_upload_bulk(
     results = []
 
     for file in files:
+        tmp_path: Optional[str] = None
         try:
             suffix = os.path.splitext(file.filename or ".txt")[1]
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -937,7 +1491,6 @@ async def documents_upload_bulk(
                 metadata["deal_id"] = deal_id
 
             res = await client.ingest_document(tmp_path, metadata=metadata)
-            os.unlink(tmp_path)
 
             results.append(
                 {
@@ -953,6 +1506,12 @@ async def documents_upload_bulk(
             results.append(
                 {"filename": file.filename, "status": "failed", "error": str(e)}
             )
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
     return {"results": results}
 
@@ -1111,26 +1670,158 @@ async def run_deal_workflow(deal_id: str):
 
 @app.get("/api/v1/deals/{deal_id}/status")
 async def get_deal_status(deal_id: str):
-    """Get current deal workflow status"""
+    """Get persisted deal status and task progress."""
+    redis_store = RedisStore.get_instance()
+    deal = await redis_store.get_deal(deal_id)
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
+
+    from app.core.tasks.task_manager import get_task_manager
+
+    task_lists = await get_task_manager().get_lists_for_deal(deal_id)
+    totals = {"total": 0, "pending": 0, "in_progress": 0, "done": 0, "blocked": 0}
+    for task_list in task_lists:
+        for item in task_list.items:
+            totals["total"] += 1
+            if item.status in totals:
+                totals[item.status] += 1
+
     return {
         "deal_id": deal_id,
-        "status": "in_progress",  # Would fetch from DB
-        "current_stage": "analysis",
+        "status": deal.get("status", "created"),
+        "current_stage": deal.get("current_stage", "init"),
+        "task_progress": totals,
+        "task_lists": [
+            {
+                "id": task_list.id,
+                "status": task_list.status,
+                "summary": task_list.to_dict()["summary"],
+            }
+            for task_list in task_lists
+        ],
     }
 
 
 @app.get("/api/v1/deals/{deal_id}/results")
 async def get_deal_results(deal_id: str):
-    """Get complete deal analysis results"""
-    # This would fetch from database in production
+    """Return persisted task analyses and agent activity for a deal."""
+    from app.core.reports.evidence_brief import _contains_execution_error
+
+    redis_store = RedisStore.get_instance()
+    deal = await redis_store.get_deal(deal_id)
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
+
+    from app.core.tasks.task_manager import get_task_manager
+
+    task_lists = await get_task_manager().get_lists_for_deal(deal_id)
+    activities = await redis_store.get_deal_activity(deal_id)
+    activities_by_agent: Dict[str, List[dict]] = {}
+    for event in activities:
+        activities_by_agent.setdefault(event.get("agent_type", "unknown"), []).append(event)
+
+    analyses = []
+    seen_results = set()
+    for task_list in task_lists:
+        for item in task_list.items:
+            if item.result is None:
+                continue
+            result_key = json.dumps(
+                [item.assigned_agent, item.result], sort_keys=True, default=str
+            )
+            seen_results.add(result_key)
+            matching_event = next(
+                (
+                    event
+                    for event in reversed(activities_by_agent.get(item.assigned_agent, []))
+                    if event.get("data") == item.result
+                ),
+                {},
+            )
+            analyses.append(
+                {
+                    "agent_type": item.assigned_agent,
+                    "task_title": item.title,
+                    "task_id": item.id,
+                    "status": item.status,
+                    "success": item.status == "done" and not _contains_execution_error(item.result),
+                    "provider": matching_event.get("provider"),
+                    "confidence": (
+                        None
+                        if _is_uncalibrated_source_report(item.result)
+                        else matching_event.get("confidence")
+                    ),
+                    "reasoning": matching_event.get("reasoning"),
+                    "timestamp": item.updated_at,
+                    "data": item.result,
+                }
+            )
+
+    for agent_type, events in activities_by_agent.items():
+        for event in events:
+            data = event.get("data")
+            if not isinstance(data, dict):
+                continue
+            result_key = json.dumps([agent_type, data], sort_keys=True, default=str)
+            if result_key in seen_results:
+                continue
+            seen_results.add(result_key)
+            analyses.append(
+                {
+                    "agent_type": agent_type,
+                    "task_title": event.get("summary"),
+                    "task_id": event.get("task_id"),
+                    "status": "done",
+                    "success": bool(event.get("success", True)) and not _contains_execution_error(
+                        {"data": data, "reasoning": event.get("reasoning")}
+                    ),
+                    "provider": event.get("provider"),
+                    "confidence": (
+                        None
+                        if _is_uncalibrated_source_report(data)
+                        else event.get("confidence")
+                    ),
+                    "reasoning": event.get("reasoning"),
+                    "timestamp": event.get("timestamp"),
+                    "data": data,
+                }
+            )
+
+    analyses.sort(key=lambda item: item.get("timestamp") or "")
+    section_agents = {
+        "financial_analysis": "financial_analyst",
+        "legal_analysis": "legal_advisor",
+        "risk_assessment": "risk_assessor",
+        "market_research": "market_researcher",
+        "valuation_analysis": "valuation_agent",
+        "dcf_lbo_analysis": "dcf_lbo_architect",
+    }
+    latest_by_agent = {}
+    for analysis in analyses:
+        latest_by_agent[analysis["agent_type"]] = analysis["data"]
+
+    task_progress = {"total": 0, "pending": 0, "in_progress": 0, "done": 0, "blocked": 0}
+    for task_list in task_lists:
+        for item in task_list.items:
+            task_progress["total"] += 1
+            if item.status in task_progress:
+                task_progress[item.status] += 1
+
+    from app.core.reports.evidence_brief import build_evidence_brief
+
     return {
         "deal_id": deal_id,
-        "financial_analysis": {},
-        "legal_analysis": {},
-        "risk_assessment": {},
-        "market_research": {},
-        "final_score": None,
-        "recommendation": None,
+        "status": deal.get("status", "created"),
+        "current_stage": deal.get("current_stage", "init"),
+        "analyses": analyses,
+        "evidence_brief": build_evidence_brief(deal, analyses),
+        "task_progress": task_progress,
+        **{
+            section: latest_by_agent.get(agent_type, {})
+            for section, agent_type in section_agents.items()
+        },
+        "final_score": deal.get("final_score"),
+        "recommendation": deal.get("final_recommendation"),
     }
 
 
@@ -1173,16 +1864,19 @@ async def run_agent(request: AgentRunRequest):
 # ===== Document & PageIndex Routes =====
 
 
-@app.post("/api/v1/documents/upload")
+@app.post("/api/v1/legacy/documents/upload")
 async def upload_document(deal_id: str, file: UploadFile = File(...)):
     """Upload and index a document"""
     logger.info("Uploading document", deal_id=deal_id, filename=file.filename)
 
-    # Save file temporarily
-    temp_path = f"/tmp/{file.filename}"
-    with open(temp_path, "wb") as f:
+    import tempfile
+
+    # Save file safely to a temporary file
+    suffix = os.path.splitext(file.filename or ".txt")[1]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         content = await file.read()
-        f.write(content)
+        tmp.write(content)
+        temp_path = tmp.name
 
     # Index with PageIndex
     pageindex = get_pageindex_client()
@@ -1204,9 +1898,14 @@ async def upload_document(deal_id: str, file: UploadFile = File(...)):
         return DocumentUploadResponse(
             document_id=str(uuid.uuid4()), filename=file.filename, status="failed"
         )
+    finally:
+        try:
+            os.unlink(temp_path)
+        except Exception:
+            pass
 
 
-@app.post("/api/v1/documents/query")
+@app.post("/api/v1/legacy/documents/query")
 async def query_documents(request: DocumentQueryRequest):
     """Query indexed documents"""
     pageindex = get_pageindex_client()
@@ -1231,14 +1930,14 @@ async def query_documents(request: DocumentQueryRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/v1/pageindex/stats")
+@app.get("/api/v1/legacy/pageindex/stats")
 async def pageindex_stats():
     """Get self-hosted PageIndex storage stats"""
     pageindex = get_pageindex_client()
     return pageindex.get_stats()
 
 
-@app.get("/api/v1/pageindex/documents")
+@app.get("/api/v1/legacy/pageindex/documents")
 async def pageindex_documents(deal_id: Optional[str] = None):
     """List all indexed documents"""
     pageindex = get_pageindex_client()
@@ -1286,7 +1985,7 @@ async def model_routing():
 # ===== Dynamic Model Discovery =====
 
 
-@app.get("/api/v1/models/available")
+@app.get("/api/v1/models/available-legacy")
 async def list_available_models():
     """
     Query all configured LLM providers for their available models IN PARALLEL.
@@ -1383,8 +2082,9 @@ async def list_available_models():
         try:
             async with _httpx.AsyncClient(timeout=8.0) as c:
                 r = await c.get(
-                    "https://generativelanguage.googleapis.com/v1/models",
-                    params={"key": api_key, "pageSize": 100},
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    headers={"x-goog-api-key": api_key},
+                    params={"pageSize": 100},
                 )
                 if r.status_code == 200:
                     all_models = r.json().get("models", [])
@@ -1474,7 +2174,22 @@ async def list_available_models():
         except Exception as e:
             return ("openai", {"status": "error", "models": [], "error": str(e)})
 
-    # Query all providers IN PARALLEL â€” each with its own individual timeout
+    async def _get_vertex():
+        # Fallback list for Vertex when its key-validation call succeeds.
+        models = [
+            {"id": "gemini-3.8-flash", "name": "Gemini 3.8 Flash (GA)"},
+            {"id": "gemini-3.7-flash", "name": "Gemini 3.7 Flash (GA)"},
+            {"id": "gemini-3.6-flash", "name": "Gemini 3.6 Flash (GA)"},
+            {"id": "gemini-3.5-flash-lite", "name": "Gemini 3.5 Flash-Lite (GA)"},
+            {"id": "gemini-3.1-flash-lite", "name": "Gemini 3.1 Flash-Lite (GA)"},
+            {"id": "gemini-3.1-pro-preview", "name": "Gemini 3.1 Pro (Preview)"},
+            {"id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash"},
+            {"id": "gemini-2.5-flash-lite", "name": "Gemini 2.5 Flash-Lite"},
+            {"id": "gemini-2.5-pro", "name": "Gemini 2.5 Pro"},
+        ]
+        return ("vertex", {"status": "online", "models": models})
+
+    # Query all providers IN PARALLEL — each with its own individual timeout
     results = await asyncio.gather(
         asyncio.wait_for(
             _get_ollama(getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434")),
@@ -1489,6 +2204,7 @@ async def list_available_models():
         asyncio.wait_for(_get_gemini(settings.GEMINI_API_KEY or ""), timeout=10),
         asyncio.wait_for(_get_mistral(settings.MISTRAL_API_KEY or ""), timeout=10),
         asyncio.wait_for(_get_openai(settings.OPENAI_API_KEY or ""), timeout=10),
+        asyncio.wait_for(_get_vertex(), timeout=5),
         return_exceptions=True,
     )
 
@@ -1638,7 +2354,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "type": "heartbeat_ack",
                         "deal_id": deal_id,
                         "action": "irr_recompute_triggered",
-                        "timestamp": datetime.utcnow().isoformat(),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
                 )
 
@@ -1726,6 +2442,118 @@ async def get_deal_tasks(deal_id: str):
     return {"deal_id": deal_id, "todo_lists": [tl.to_dict() for tl in lists]}
 
 
+@app.get("/api/v1/deals/{deal_id}/exports/docx")
+async def download_analysis_docx(deal_id: str, _: bool = Depends(require_admin_token)):
+    """Synthesize persisted agent results and download a validated evidence-led DOCX."""
+    from fastapi.responses import Response
+    from app.core.reports.report_generator import generate_docx
+    from app.core.reports.report_guardrails import ReportGuardrails
+
+    redis_store = RedisStore.get_instance()
+    deal = await redis_store.get_deal(deal_id)
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
+
+    tm = get_task_manager()
+    lists = await tm.get_lists_for_deal(deal_id)
+    with_results = [todo for todo in lists if any(item.result is not None for item in todo.items)]
+    if not with_results:
+        raise HTTPException(status_code=404, detail="No saved analysis results are available for this deal")
+
+    latest = max(with_results, key=lambda todo: todo.created_at or "")
+    report_deal = _deal_identity_for_export(deal, latest.to_dict())
+    import re
+
+    prompts = " ".join(item.description or "" for item in latest.items)
+    company_match = re.search(
+        r"\b(?:fictional|company\s+(?:called|named)|target\s+company(?:\s+is)?|"
+        r"analyze|acquire|buy|acquisition\s+of|merge\s+with|for)\s+"
+        r"(?:the\s+)?(?:fictional\s+)?([A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,3})",
+        prompts,
+        re.IGNORECASE,
+    )
+    if company_match and str(report_deal.get("target_company") or "").strip().lower() in {"", "target company", "the target", "unknown"}:
+        report_deal["target_company"] = company_match.group(1).strip()
+    activities = await redis_store.get_deal_activity(deal_id)
+    if not activities:
+        activities = [
+            {
+                "agent_type": item.assigned_agent or "unknown",
+                "success": item.status == "done" and isinstance(item.result, dict),
+                "summary": item.title,
+                "reasoning": item.description,
+                "data": item.result if isinstance(item.result, dict) else {},
+                "timestamp": item.updated_at or item.created_at,
+            }
+            for item in latest.items
+        ]
+
+    try:
+        from app.agents.base import get_agent_registry
+        from app.core.reports.document_planner import prepare_document_payload
+        from app.core.provenance import get_provenance_collector
+
+        agent_results, analyst_data, evidence_brief = await prepare_document_payload(
+            get_agent_registry(), report_deal, activities
+        )
+        analyst_data["_evidence_brief"] = evidence_brief
+        provenance = await get_provenance_collector().get_records(deal_id)
+        content = generate_docx(
+            report_deal, analyst_data, agent_results, provenance,
+            report_deal.get("current_stage", "deep_dive"),
+        )
+        validation = ReportGuardrails.validate_artifact("docx", content)
+        if not validation["valid"]:
+            raise ValueError("Generated Word report failed structural validation.")
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    filename_base = re.sub(r"[^A-Za-z0-9_-]+", "_", report_deal.get("target_company", "deal-report")).strip("_") or "deal-report"
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            **REPORT_DOWNLOAD_HEADERS,
+            "Content-Disposition": f'attachment; filename="DealForge_{filename_base}.docx"',
+        },
+    )
+
+
+@app.get("/api/v1/deals/{deal_id}/exports/json")
+async def download_analysis_json(deal_id: str, _: bool = Depends(require_admin_token)):
+    """Download the latest persisted analysis as a versioned JSON artifact."""
+    from fastapi.responses import Response
+    from app.core.reports.analysis_export import build_analysis_export_payload
+
+    deal = await RedisStore.get_instance().get_deal(deal_id)
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    lists = await get_task_manager().get_lists_for_deal(deal_id)
+    with_results = [todo for todo in lists if any(item.result is not None for item in todo.items)]
+    if not with_results:
+        raise HTTPException(status_code=404, detail="No saved analysis results are available for this deal")
+    latest = max(with_results, key=lambda todo: todo.created_at or "")
+    deal = _deal_identity_for_export(deal, latest.to_dict())
+    payload = build_analysis_export_payload(deal, latest.to_dict())
+    filename_base = re.sub(r"[^A-Za-z0-9_-]+", "_", payload["deal"]["target_company"] or "deal-analysis").strip("_") or "deal-analysis"
+    return Response(
+        content=json.dumps(payload, indent=2, ensure_ascii=False, default=str),
+        media_type="application/json",
+        headers={
+            **REPORT_DOWNLOAD_HEADERS,
+            "Content-Disposition": f'attachment; filename="DealForge_{filename_base}.json"',
+        },
+    )
+
+
+@app.get("/api/v1/tasks/all")
+async def get_all_deal_tasks():
+    """Get todo lists across all deals."""
+    tm = get_task_manager()
+    lists = await tm.list_all_lists()
+    return {"todo_lists": [tl.to_dict() for tl in lists]}
+
+
 @app.get("/api/v1/tasks/{list_id}")
 async def get_todo_list(list_id: str):
     """Get a specific todo list."""
@@ -1770,6 +2598,19 @@ async def approve_todo_list(list_id: str):
     """Approve a todo list for execution."""
     tm = get_task_manager()
     todo = await tm.approve_list(list_id)
+    if not todo:
+        raise HTTPException(status_code=404, detail="Todo list not found")
+    return {"success": True, "status": todo.status}
+
+
+@app.patch("/api/v1/tasks/{list_id}/status")
+async def update_todo_list_status(list_id: str, body: Dict[str, Any]):
+    """Update execution status while enforcing valid task-list transitions."""
+    tm = get_task_manager()
+    try:
+        todo = await tm.set_list_status(list_id, body.get("status", ""))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     if not todo:
         raise HTTPException(status_code=404, detail="Todo list not found")
     return {"success": True, "status": todo.status}
@@ -1835,13 +2676,15 @@ async def knowledge_search(q: str, top_k: int = 5):
     """Search the knowledge base."""
     pageindex = get_pageindex_client()
     try:
+        from app.core.laya.graph_nodes import sanitize_brief
+        q = sanitize_brief(q, max_chars=4000)
         results = await pageindex.query(query=q, top_k=top_k)
         return {
             "query": q,
             "results": (
                 [
                     {
-                        "content": r.content[:500],
+                        "content": sanitize_brief(r.content[:500], max_chars=500),
                         "metadata": r.metadata,
                         "score": r.relevance_score,
                     }
@@ -1852,7 +2695,8 @@ async def knowledge_search(q: str, top_k: int = 5):
             ),
         }
     except Exception as e:
-        return {"query": q, "results": [], "error": str(e)}
+        logger.warning("knowledge_search_failed", error_type=type(e).__name__)
+        return {"query": q, "results": [], "error": "Knowledge search failed. Check service logs for a redacted diagnostic."}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1935,7 +2779,7 @@ async def chat_clarify(request: Request):
     """
     from app.core.validation.chat_guard import check_prompt
 
-    MAX_CLARIFICATION_ROUNDS = 1
+    MAX_CLARIFICATION_ROUNDS = 3
 
     body = await request.json()
     prompt = body.get("prompt", "")
@@ -1948,21 +2792,11 @@ async def chat_clarify(request: Request):
 
     deal_id = body.get("deal_id", "unknown")
     company_name = body.get("company_name", "Target Company")
+    if str(company_name or "").strip().lower() in {"", "target company", "the target", "unknown"}:
+        company_name = _explicit_company_name(prompt) or "Target Company"
     clarification_round = body.get("clarification_round", 0)
-
-    # ── Guard: skip clarification after max rounds ──
-    if clarification_round >= MAX_CLARIFICATION_ROUNDS:
-        logger.info(
-            "clarification_skipped",
-            reason="max_rounds_reached",
-            round=clarification_round,
-            deal_id=deal_id,
-        )
-        return {
-            "phase": "clarification",
-            "clarifying_questions": [],
-            "skip_reason": "Maximum clarification rounds reached. Proceeding to planning.",
-        }
+    user_skipped = body.get("user_skipped", False)
+    skipped_questions = body.get("skipped_questions", [])
 
     from app.agents.project_manager import ProjectManagerAgent
     from app.core.llm.model_router import get_model_router
@@ -1995,13 +2829,12 @@ async def chat_clarify(request: Request):
             ],
         }
 
-    from app.core.mcp import get_provider_status
+    from app.core.mcp.external_client import planning_tool_summaries
 
-    mcp_status = get_provider_status()
-    configured_mcps = [p for p in mcp_status if p.get("configured")]
+    live_mcp_tools = await planning_tool_summaries()
 
     router = get_model_router()
-    provider, _ = await router.get_provider_with_fallback("project_manager")
+    provider, _ = await router.get_provider_for_text("project_manager", prompt)
     llm_client = get_llm_client(provider)
 
     pm = ProjectManagerAgent(llm_client=llm_client)
@@ -2011,7 +2844,12 @@ async def chat_clarify(request: Request):
             "deal_id": deal_id,
             "company_name": company_name,
             "user_prompt": prompt,
-            "available_mcp_providers": configured_mcps,
+            "available_mcp_tools": live_mcp_tools,
+            "clarification_round": clarification_round,
+            "user_skipped_clarification": user_skipped,
+            "skipped_questions": skipped_questions,
+            "max_clarification_rounds": MAX_CLARIFICATION_ROUNDS,
+            "routed_provider": provider,
         },
     )
     return result
@@ -2070,6 +2908,11 @@ async def chat_plan(request: Request):
 
     body = await request.json()
     prompt = body.get("prompt", "")
+    local_only = bool(body.get("local_only")) or bool(re.search(
+        r"\b(?:local[- ]only|lm\s*studio\s+only|no\s+(?:cloud|remote)\s+(?:llm|models?))\b",
+        prompt,
+        re.IGNORECASE,
+    ))
 
     # guardrail: ensure prompt passes basic safety checks
     guard = check_prompt(prompt)
@@ -2078,14 +2921,37 @@ async def chat_plan(request: Request):
 
     deal_id = body.get("deal_id", "unknown")
     company_name = body.get("company_name", "Target Company")
+    ticker = _explicit_public_ticker(prompt)
+    if str(company_name or "").strip().lower() in {"", "target company", "the target", "unknown"}:
+        company_name = _explicit_company_name(prompt) or (ticker or "Target Company")
     user_answers = body.get("user_answers", [])
+
+    # Keep the deal identity consistent with the explicit issuer in this analysis,
+    # so subsequent reports and structured exports do not retain a UI placeholder.
+    if deal_id and company_name and company_name != "Target Company":
+        try:
+            store = RedisStore.get_instance()
+            deal = await store.get_deal(deal_id)
+            if deal:
+                current_name = str(deal.get("target_company") or "").strip().lower()
+                if current_name in {"", "target company", "the target", "unknown"}:
+                    update = {"target_company": company_name}
+                    if ticker:
+                        update["ticker"] = ticker
+                    await store.update_deal(deal_id, update)
+        except Exception as exc:
+            logger.warning("chat_plan_deal_identity_update_failed", deal_id=deal_id, error=str(exc))
 
     from app.agents.project_manager import ProjectManagerAgent
     from app.core.llm.model_router import get_model_router
     from app.core.llm import get_llm_client
 
     router = get_model_router()
-    provider, _ = await router.get_provider_with_fallback("project_manager")
+    if local_only:
+        configured = router.get_provider_for_agent("project_manager")
+        provider = configured if configured in {"lmstudio", "ollama"} else "lmstudio"
+    else:
+        provider, _ = await router.get_provider_for_text("project_manager", prompt)
     llm_client = get_llm_client(provider)
 
     pm = ProjectManagerAgent(llm_client=llm_client)
@@ -2094,24 +2960,46 @@ async def chat_plan(request: Request):
         context={
             "deal_id": deal_id,
             "company_name": company_name,
+            "ticker": ticker or "",
             "user_prompt": prompt,
             "user_answers": user_answers,
+            "routed_provider": provider,
+            "focus_mode": body.get("focus_mode", "balanced"),
         },
     )
 
     return {
         "success": True,
         "reasoning": result.get("message", ""),
-        "confidence": 0.9,
+        "confidence": (result.get("laya_decision") or {}).get("track_confidence"),
         "execution_time_ms": result.get("execution_time_ms", 0),
-        "data": {"todo_list": result.get("todo_list", {})},
+        "data": {
+            "todo_list": result.get("todo_list", {}),
+            "laya_decision": result.get("laya_decision"),
+            "selected_agents": result.get("selected_agents", []),
+        },
     }
+
+
+async def _await_agent_execution(execution, agent_type: str, timeout_seconds: int):
+    try:
+        return await asyncio.wait_for(execution, timeout=timeout_seconds)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(
+            f"{agent_type} exceeded the {timeout_seconds}-second execution deadline"
+        ) from exc
 
 
 @app.post("/api/v1/chat/execute-task")
 async def chat_execute_task(request: Request):
     """Execute a single task from the scrum master's plan via the assigned agent."""
     from app.core.validation.chat_guard import check_prompt
+    from app.api.stream import (
+        emit_agent_starting,
+        emit_agent_completed,
+        emit_agent_error,
+    )
+    timeout_seconds = max(1, int(get_settings().AGENT_TIMEOUT_SECONDS))
 
     body = await request.json()
     agent_type = body.get("agent_type", "")
@@ -2124,15 +3012,43 @@ async def chat_execute_task(request: Request):
 
     deal_id = body.get("deal_id", "")
     task_id = body.get("task_id", "")
+    task_list_id = body.get("task_list_id")
     task_title = body.get("title", "")
-    ticker = body.get("ticker", "")
-    company_name = body.get("company_name", "")
+    ticker = body.get("ticker", "") or ""
+    company_name = body.get("company_name", "") or ""
+    local_only = bool(body.get("local_only", False)) or bool(re.search(
+        r"\b(?:local[- ]only|lm\s*studio\s+only|no\s+(?:cloud|remote)\s+(?:llm|models?))\b",
+        task_description,
+        re.IGNORECASE,
+    ))
+
+    if task_list_id and task_id:
+        task_manager = get_task_manager()
+        todo = await task_manager.get_todo_list(task_list_id)
+        if not todo or todo.deal_id != deal_id:
+            raise HTTPException(status_code=404, detail="Approved task list not found for this deal")
+        if todo.status not in {"approved", "in_progress"}:
+            raise HTTPException(status_code=409, detail="Task list must be approved before agent execution")
+        planned_task = next((item for item in todo.items if item.id == task_id), None)
+        if not planned_task:
+            raise HTTPException(status_code=404, detail="Task is not part of the approved plan")
+        completed_ids = {item.id for item in todo.items if item.status == "done"}
+        unmet_dependencies = [dependency for dependency in planned_task.depends_on if dependency not in completed_ids]
+        if unmet_dependencies:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "dependencies_not_satisfied", "blocked_by": unmet_dependencies},
+            )
+
+    # Prefer an explicitly supplied public ticker in the user/task text over
+    # heuristic company-name extraction, which can select an unrelated phrase.
+    ticker = ticker or _explicit_public_ticker(task_description) or ""
+    if not ticker and company_name.strip().lower() not in {"target company", "the target", "unknown"}:
+        ticker = company_name
 
     # Fallback to todo_list metadata if ticker is missing
     deal_id = body.get("deal_id")
     if not ticker and deal_id:
-        from app.core.tasks.task_manager import get_task_manager
-
         tm = get_task_manager()
         lists = await tm.get_lists_for_deal(deal_id)
         if lists:
@@ -2144,7 +3060,7 @@ async def chat_execute_task(request: Request):
                 company_name = latest_list.company_name
 
     # If unresolvable, pass company_name as the ticker hint so agents can use it for web search
-    if not ticker and company_name:
+    if not ticker and company_name.strip().lower() not in {"target company", "the target", "unknown"}:
         ticker = company_name
 
     from app.agents.base import get_agent_registry
@@ -2156,35 +3072,69 @@ async def chat_execute_task(request: Request):
         "due_diligence_agent": "due_diligence_agent",
         "treasury_agent": "treasury_cash",
         "prospectus_agent": "prospectus_processing",
+        "data_curator_agent": "data_curator",
+        "complex_reasoning_agent": "complex_reasoning",
+        "report_architect_agent": "report_architect",
     }
     resolved_type = AGENT_NAME_ALIASES.get(agent_type, agent_type)
 
     try:
-        router = get_model_router()
-        provider, used_fallback = await router.get_provider_with_fallback(resolved_type)
-        client = get_llm_client(provider)
-
         registry = get_agent_registry()
         agent = registry.get(resolved_type)
+        input_only = bool(
+            agent
+            and getattr(agent, "is_input_only_request", lambda _: False)(task_description)
+        )
+        if input_only:
+            provider, used_fallback, client = "deterministic", False, None
+        elif local_only:
+            configured = get_model_router().get_provider_for_agent(resolved_type)
+            provider = configured if configured in {"lmstudio", "ollama"} else "lmstudio"
+            used_fallback, client = False, get_llm_client(provider)
+        else:
+            router = get_model_router()
+            provider, used_fallback = await router.get_provider_for_text(
+                resolved_type, task_description
+            )
+            client = get_llm_client(provider)
 
         if agent:
-            agent.llm = client
-            result = await agent.run(
-                task_description,
-                context={
-                    "deal_id": deal_id,
-                    "task_id": task_id,
-                    "ticker": ticker,
-                    "company_name": company_name,
-                    "agent_outputs": body.get("agent_outputs", {}),
-                },
-            )
+            if client is not None:
+                agent.llm = client
+            agent_context = {
+                "deal_id": deal_id,
+                "task_id": task_id,
+                "ticker": ticker,
+                "company_name": company_name,
+                "user_prompt": body.get("user_prompt", ""),
+                "agent_outputs": body.get("agent_outputs", {}),
+                "routed_provider": provider,
+                "local_only": local_only,
+            }
+            agent._current_context = agent_context
+            if input_only or resolved_type == "financial_analyst":
+                execution = agent.run(task_description, context=agent_context)
+            else:
+                execution = agent.run_with_structure(task_description, context=agent_context)
+            result = await _await_agent_execution(execution, agent_type, timeout_seconds)
         else:
+            if deal_id:
+                try:
+                    await emit_agent_starting(
+                        deal_id, agent_type, task_id or "", task_title or ""
+                    )
+                except Exception:
+                    pass  # SSE is best-effort
+
             # Fallback: use a generic LLM call
-            response = await client.generate(
-                prompt=task_description,
-                system_prompt=f"You are a {agent_type.replace('_', ' ')} at an investment bank. "
-                f"Provide a thorough analysis.",
+            response = await _await_agent_execution(
+                client.generate(
+                    prompt=task_description,
+                    system_prompt=f"You are a {agent_type.replace('_', ' ')} at an investment bank. "
+                    f"Provide a thorough analysis.",
+                ),
+                agent_type,
+                timeout_seconds,
             )
             result = type(
                 "AgentOutput",
@@ -2198,20 +3148,50 @@ async def chat_execute_task(request: Request):
                 },
             )()
 
+        # Emit SSE: agent completed (only if success)
+        if deal_id and result.success and not agent:
+            try:
+                await emit_agent_completed(
+                    deal_id,
+                    agent_type,
+                    task_id or "",
+                    result.data,
+                    result.reasoning,
+                    result.confidence,
+                    result.execution_time_ms or 0,
+                )
+            except Exception:
+                pass  # SSE is best-effort
+
+        actual_provider = (
+            "deterministic"
+            if isinstance(getattr(result, "data", None), dict)
+            and result.data.get("synthesis_status") == "deterministic_source_report"
+            else provider
+        )
         return {
             "success": result.success,
             "reasoning": result.reasoning,
             "confidence": result.confidence,
             "execution_time_ms": result.execution_time_ms,
             "data": result.data,
-            "provider": provider,
+            "provider": actual_provider,
             "used_fallback": used_fallback,
             "task_title": task_title,
             "task_id": task_id,
         }
 
+
     except Exception as e:
         logger.error("task_execution_error", agent=agent_type, error=str(e))
+
+        # Emit SSE: agent error
+        if deal_id:
+            try:
+                await emit_agent_error(deal_id, agent_type, task_id or "", str(e))
+            except Exception:
+                pass  # SSE is best-effort
+
         return {
             "success": False,
             "reasoning": str(e),
@@ -2229,7 +3209,7 @@ async def chat_execute_task(request: Request):
 
 
 @app.get("/api/v1/settings")
-async def get_settings_api():
+async def get_settings_api(_: bool = Depends(require_admin_token)):
     """Load saved settings."""
     from app.core.settings_service import SettingsService
 
@@ -2238,13 +3218,23 @@ async def get_settings_api():
 
 
 @app.post("/api/v1/settings")
-async def save_settings_api(request: Request):
+async def save_settings_api(
+    request: Request,
+    _: bool = Depends(require_admin_token),
+):
     """Save settings and apply to running system."""
     from app.core.settings_service import SettingsService
 
     body = await request.json()
     svc = SettingsService.get_instance()
     updated = svc.update(body)
+    # Hot-reload the live router so routing/model changes apply immediately
+    try:
+        from app.core.llm.model_router import get_model_router
+
+        get_model_router().refresh_from_settings()
+    except Exception as e:
+        logger.warning("router_refresh_failed", error=str(e))
     return {"status": "saved", "settings": updated}
 
 
@@ -2254,7 +3244,7 @@ async def save_settings_api(request: Request):
 
 
 @app.get("/api/v1/gateway/usage")
-async def gateway_usage():
+async def gateway_usage(_: bool = Depends(require_admin_token)):
     """Get LLM gateway usage stats (RPM/TPM/cache/cost)."""
     from app.core.llm.llm_gateway import get_llm_gateway
 
@@ -2263,7 +3253,10 @@ async def gateway_usage():
 
 
 @app.post("/api/v1/gateway/call")
-async def gateway_call(request: Request):
+async def gateway_call(
+    request: Request,
+    _: bool = Depends(require_admin_token),
+):
     """Make a direct LLM call through the gateway (with rate limiting + retry)."""
     from app.core.llm.llm_gateway import get_llm_gateway
 
@@ -2280,7 +3273,10 @@ async def gateway_call(request: Request):
 
 
 @app.post("/api/v1/gateway/hybrid")
-async def gateway_hybrid(request: Request):
+async def gateway_hybrid(
+    request: Request,
+    _: bool = Depends(require_admin_token),
+):
     """Hybrid reasoning: local compress → cloud reason."""
     from app.core.llm.llm_gateway import get_llm_gateway
 
@@ -2300,7 +3296,10 @@ async def gateway_hybrid(request: Request):
 
 
 @app.post("/api/v1/gateway/limits")
-async def update_gateway_limits(request: Request):
+async def update_gateway_limits(
+    request: Request,
+    _: bool = Depends(require_admin_token),
+):
     """Update rate limits for a vendor."""
     from app.core.llm.llm_gateway import get_llm_gateway, VendorLimits
 
@@ -2336,24 +3335,45 @@ async def _fetch_gemini_models(api_key: str) -> dict:
     try:
         async with _httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
-                f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                headers={"x-goog-api-key": api_key},
+                params={"pageSize": 100},
             )
             if resp.status_code == 200:
                 data = resp.json()
-                models = [
-                    {
-                        "id": m["name"].replace("models/", ""),
-                        "name": m.get("displayName", m["name"]),
-                        "context_window": m.get("inputTokenLimit", 0),
-                        "daily_limit": (
-                            "1,500 RPD (free)"
-                            if "flash" in m.get("name", "").lower()
-                            else "50 RPD (free)"
-                        ),
+                models_by_id = {}
+                for model in data.get("models", []):
+                    model_id = model.get("name", "").removeprefix("models/")
+                    if (
+                        not model_id.startswith("gemini-")
+                        or model_id.startswith(("gemini-1.5-", "gemini-2.0-"))
+                        or "generateContent"
+                        not in model.get("supportedGenerationMethods", [])
+                    ):
+                        continue
+                    models_by_id[model_id] = {
+                        "id": model_id,
+                        "name": model.get("displayName") or model_id,
+                        "context_window": model.get("inputTokenLimit", 0),
+                        "output_token_limit": model.get("outputTokenLimit", 0),
                     }
-                    for m in data.get("models", [])
-                    if "generateContent" in m.get("supportedGenerationMethods", [])
+                preferred = [
+                    "gemini-3.8-flash",
+                    "gemini-3.7-flash",
+                    "gemini-3.6-flash",
+                    "gemini-3.5-flash",
+                    "gemini-3.5-flash-lite",
+                    "gemini-3.1-flash-lite",
+                    "gemini-3.1-pro-preview",
+                    "gemini-2.5-flash",
+                    "gemini-2.5-flash-lite",
+                    "gemini-2.5-pro",
                 ]
+                rank = {model_id: index for index, model_id in enumerate(preferred)}
+                models = sorted(
+                    models_by_id.values(),
+                    key=lambda model: (rank.get(model["id"], len(rank)), model["id"]),
+                )
                 return {"status": "online", "models": models}
             return {
                 "status": "error",
@@ -2362,6 +3382,34 @@ async def _fetch_gemini_models(api_key: str) -> dict:
             }
     except Exception as e:
         return {"status": "offline", "models": [], "error": str(e)}
+
+
+async def _fetch_nvidia_models(api_key: str, base_url: str) -> dict:
+    """List models currently exposed by the configured NVIDIA NIM endpoint."""
+    if not api_key or api_key == "***":
+        return {"status": "no_key", "models": []}
+    endpoint = f"{base_url.rstrip('/')}/models"
+    try:
+        async with _httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                endpoint,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if resp.status_code != 200:
+                return {
+                    "status": "error",
+                    "models": [],
+                    "error": f"HTTP {resp.status_code}",
+                }
+            models_by_id = {
+                model["id"]: {"id": model["id"], "name": model.get("id", "")}
+                for model in resp.json().get("data", [])
+                if model.get("id")
+            }
+            models = sorted(models_by_id.values(), key=lambda model: model["id"].lower())
+            return {"status": "online", "models": models}
+    except Exception:
+        return {"status": "offline", "models": [], "error": "NVIDIA model endpoint unavailable"}
 
 
 async def _fetch_mistral_models(api_key: str) -> dict:
@@ -2449,6 +3497,36 @@ async def _fetch_openai_models(api_key: str) -> dict:
         return {"status": "offline", "models": [], "error": str(e)}
 
 
+async def _fetch_openrouter_models(api_key: str) -> dict:
+    """Fetch OpenRouter's live model catalog without exposing credential details."""
+    if not api_key or api_key == "***":
+        return {"status": "no_key", "models": []}
+    try:
+        async with _httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                "https://openrouter.ai/api/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if resp.status_code != 200:
+                return {"status": "error", "models": [], "error": f"HTTP {resp.status_code}"}
+            models_by_id = {}
+            for model in resp.json().get("data", []):
+                model_id = model.get("id")
+                if not model_id:
+                    continue
+                models_by_id.setdefault(model_id, {
+                    "id": model_id,
+                    "name": model.get("name") or model_id,
+                    "context_window": model.get("context_length"),
+                    "prompt_price": (model.get("pricing") or {}).get("prompt"),
+                    "completion_price": (model.get("pricing") or {}).get("completion"),
+                })
+            models = sorted(models_by_id.values(), key=lambda item: item["id"].lower())
+            return {"status": "online", "models": models}
+    except Exception:
+        return {"status": "offline", "models": [], "error": "OpenRouter model catalog unavailable"}
+
+
 async def _fetch_ollama_models(base_url: str) -> dict:
     """Fetch locally-running Ollama models."""
     try:
@@ -2482,23 +3560,169 @@ async def _fetch_lmstudio_models(base_url: str) -> dict:
         return {"status": "offline", "models": []}
 
 
+async def _fetch_vertex_models(
+    api_key: str, project_id: str = "", location: str = "us-central1"
+) -> dict:
+    """Validate Vertex AI API key with a real test call and return available models."""
+    if not api_key or api_key == "***":
+        return {"status": "no_key", "models": []}
+
+    # Key format validation — we no longer strictly enforce prefixes
+    if not api_key:
+        return {"status": "no_key", "models": []}
+
+    # Keep a concise fallback list for Vertex when its test call succeeds.
+    VERTEX_MODELS = [
+        {
+            "id": "gemini-3.8-flash",
+            "name": "Gemini 3.8 Flash (GA)",
+            "context_window": 1048576,
+        },
+        {
+            "id": "gemini-3.7-flash",
+            "name": "Gemini 3.7 Flash (GA)",
+            "context_window": 1048576,
+        },
+        {
+            "id": "gemini-3.6-flash",
+            "name": "Gemini 3.6 Flash (GA)",
+            "context_window": 1048576,
+        },
+        {
+            "id": "gemini-3.5-flash-lite",
+            "name": "Gemini 3.5 Flash-Lite (GA)",
+            "context_window": 1048576,
+        },
+        {
+            "id": "gemini-3.1-flash-lite",
+            "name": "Gemini 3.1 Flash-Lite (GA)",
+            "context_window": 1048576,
+        },
+        {
+            "id": "gemini-3.1-pro-preview",
+            "name": "Gemini 3.1 Pro (Preview)",
+            "context_window": 1048576,
+        },
+        {
+            "id": "gemini-2.5-flash",
+            "name": "Gemini 2.5 Flash",
+            "context_window": 1048576,
+        },
+        {
+            "id": "gemini-2.5-flash-lite",
+            "name": "Gemini 2.5 Flash-Lite",
+            "context_window": 1048576,
+        },
+        {
+            "id": "gemini-2.5-pro",
+            "name": "Gemini 2.5 Pro",
+            "context_window": 1048576,
+        },
+    ]
+
+    # Validate the key by making a minimal real API call to Vertex REST endpoint
+    # We use generateContent (non-streaming) for the test call for better stability
+    test_url = (
+        f"https://aiplatform.googleapis.com/v1/publishers/google/models/"
+        f"gemini-2.5-flash-lite:generateContent?key={api_key}"
+    )
+    test_payload = {
+        "contents": [{"role": "user", "parts": [{"text": "Hi"}]}],
+        "generationConfig": {"maxOutputTokens": 5},
+    }
+    try:
+        async with _httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(test_url, json=test_payload)
+            if resp.status_code == 200:
+                return {"status": "online", "models": VERTEX_MODELS}
+
+            # Log the failure for debugging
+            logger.error(
+                "vertex_test_failed", status_code=resp.status_code, body=resp.text[:500]
+            )
+
+            if resp.status_code == 400:
+                # 400 can mean project not set but key is valid — still usable
+                err_body = resp.json().get("error", {})
+                msg = err_body.get("message", "")
+                if "API_KEY_INVALID" in msg or "API key not valid" in msg:
+                    return {
+                        "status": "error",
+                        "models": [],
+                        "error": f"API key rejected by Google: {msg}",
+                    }
+                # Other 400s (e.g., missing project) — key is valid, configuration issue
+                return {"status": "online", "models": VERTEX_MODELS}
+            elif resp.status_code in (401, 403):
+                err_body = resp.json().get("error", {})
+                msg = err_body.get("message", resp.text[:200])
+                return {"status": "error", "models": [], "error": f"Auth failed: {msg}"}
+            else:
+                return {
+                    "status": "error",
+                    "models": [],
+                    "error": f"HTTP {resp.status_code}: {resp.text[:200]}",
+                }
+    except _httpx.ReadTimeout:
+        logger.error("vertex_test_timeout")
+        return {
+            "status": "offline",
+            "models": [],
+            "error": "Request timed out (Google AI is slow)",
+        }
+    except Exception as e:
+        logger.exception("vertex_test_exception", error=str(e))
+        return {"status": "offline", "models": [], "error": str(e)}
+
+
 @app.get("/api/v1/models/available")
-async def get_available_models():
+async def get_available_models(_: bool = Depends(require_admin_token)):
     """
     Query all configured LLM providers simultaneously and return their available models.
     This powers the Settings page model selection dropdowns.
+    Reads from SettingsService first (UI-saved config), falling back to env vars.
     """
-    gemini_key = _os.environ.get("GEMINI_API_KEY", "")
-    openai_key = _os.environ.get("OPENAI_API_KEY", "")
-    mistral_key = _os.environ.get("MISTRAL_API_KEY", "").strip()
-    ollama_url = _os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-    lmstudio_url = _os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
+    from app.core.settings_service import SettingsService
+
+    svc = SettingsService.get_instance()
+
+    def _key(svc_key: str, env_key: str, default: str = "") -> str:
+        """Read from saved settings first, then env var, then default."""
+        val = svc.get(svc_key, "")
+        if val and val != "***":
+            return val
+        return os.environ.get(env_key, default)
+
+    gemini_key = _key("gemini_api_key", "GEMINI_API_KEY")
+    openai_key = _key("openai_api_key", "OPENAI_API_KEY")
+    openrouter_key = _key("openrouter_api_key", "OPENROUTER_API_KEY")
+    mistral_key = _key("mistral_api_key", "MISTRAL_API_KEY").strip()
+    vertex_key = _key("vertex_api_key", "VERTEX_API_KEY")
+    nvidia_key = _key("nvidia_api_key", "NVIDIA_API_KEY")
+    nvidia_base_url = _key(
+        "nvidia_base_url",
+        "NVIDIA_BASE_URL",
+        "https://integrate.api.nvidia.com/v1",
+    )
+    vertex_project = _key("vertex_project_id", "VERTEX_PROJECT_ID")
+    vertex_location = svc.get(
+        "vertex_location", os.environ.get("VERTEX_LOCATION", "us-central1")
+    )
+    ollama_url = _key("ollama_base_url", "OLLAMA_BASE_URL", "http://localhost:11434")
+    lmstudio_url = _key(
+        "lmstudio_base_url", "LMSTUDIO_BASE_URL", "http://localhost:1234/v1"
+    )
 
     # Fetch all providers in parallel
     results = await _asyncio.gather(
         _fetch_gemini_models(gemini_key),
         _fetch_mistral_models(mistral_key),
         _fetch_openai_models(openai_key),
+        _fetch_openrouter_models(openrouter_key),
+        _fetch_vertex_models(
+            vertex_key, project_id=vertex_project, location=vertex_location
+        ),
+        _fetch_nvidia_models(nvidia_key, nvidia_base_url),
         _fetch_ollama_models(ollama_url),
         _fetch_lmstudio_models(lmstudio_url),
         return_exceptions=True,
@@ -2513,44 +3737,78 @@ async def get_available_models():
         "gemini": _safe(results[0]),
         "mistral": _safe(results[1]),
         "openai": _safe(results[2]),
-        "ollama": _safe(results[3]),
-        "lmstudio": _safe(results[4]),
+        "openrouter": _safe(results[3]),
+        "vertex": _safe(results[4]),
+        "nvidia": _safe(results[5]),
+        "ollama": _safe(results[6]),
+        "lmstudio": _safe(results[7]),
     }
 
 
 @app.post("/api/v1/models/test")
-async def test_cloud_model(request: Request):
-    """Test a cloud API key directly from Settings UI before saving"""
+async def test_cloud_model(
+    request: Request,
+    _: bool = Depends(require_admin_token),
+):
+    """Verify model discovery and a bounded completion before saving a provider key."""
     body = await request.json()
     provider = body.get("provider", "")
     api_key = body.get("api_key", "")
 
-    if not provider or not api_key:
+    if not provider or not api_key or str(api_key).strip() in {"", "***", "placeholder_key"}:
         return {"ok": False, "error": "provider and api_key required"}
 
     try:
+        from app.core.settings_service import SettingsService
+        from app.core.llm.provider_probe import probe_provider
+
+        model_key = f"{provider}_model"
+        settings_service = SettingsService.get_instance()
+        model = str(body.get("model") or settings_service.get(model_key) or "").strip()
+        if not model:
+            return {"ok": False, "error": "Select a model before testing this provider."}
+
+        result = {"status": "unavailable", "models": []}
         if provider == "gemini":
             result = await _fetch_gemini_models(api_key)
         elif provider == "openai":
             result = await _fetch_openai_models(api_key)
+        elif provider == "openrouter":
+            result = await _fetch_openrouter_models(api_key)
         elif provider == "mistral":
             result = await _fetch_mistral_models(api_key)
+        elif provider == "vertex":
+            project_id = body.get("project_id", "")
+            location = body.get("location", "us-central1")
+            result = await _fetch_vertex_models(
+                api_key, project_id=project_id, location=location
+            )
+        elif provider == "nvidia":
+            base_url = body.get(
+                "base_url", "https://integrate.api.nvidia.com/v1"
+            )
+            result = await _fetch_nvidia_models(api_key, base_url)
         else:
-            return {"ok": False, "error": f"Unknown provider {provider}"}
+            return {"ok": False, "error": "Unknown provider"}
 
-        if result.get("status") == "online":
-            return {"ok": True, "models": result.get("models", [])}
-        else:
+        base_url = body.get("base_url") if provider == "nvidia" else None
+        generation = await probe_provider(provider, model, api_key, base_url=base_url)
+        if generation.get("ok"):
             return {
-                "ok": False,
-                "error": result.get("error", "API Key Invalid or rate limited"),
+                "ok": True,
+                "models": result.get("models", []) if result.get("status") == "online" else [],
+                "catalog_status": result.get("status", "unavailable"),
+                "generation": generation,
             }
+        return {"ok": False, "error": generation.get("error", "Model generation test failed."),
+                "generation": generation}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        logger.warning("provider_generation_test_failed", provider=provider, error_type=type(e).__name__)
+        return {"ok": False, "error": f"Provider test failed ({type(e).__name__})."}
 
 
 @app.get("/api/v1/llm/usage")
-async def llm_usage_stats():
+async def llm_usage_stats(_: bool = Depends(require_admin_token)):
     """
     Return live LLM usage stats: rate limits, token counts, API key health,
     and cache performance — for the frontend monitoring dashboard.
@@ -2565,17 +3823,21 @@ async def llm_usage_stats():
     api_key_map = {
         "gemini": settings.GEMINI_API_KEY,
         "openai": settings.OPENAI_API_KEY,
+        "openrouter": settings.OPENROUTER_API_KEY,
         "mistral": settings.MISTRAL_API_KEY,
+        "vertex": settings.VERTEX_API_KEY or settings.VERTEX_PROJECT_ID,
+        "nvidia": settings.NVIDIA_API_KEY,
+        "claude": settings.ANTHROPIC_API_KEY,
+        "groq": settings.GROQ_API_KEY,
     }
 
     # Known model metadata (context windows + pricing tier hints)
     model_metadata = {
         "gemini": {
             "popular_models": [
-                {"id": "gemini-2.5-flash", "context": "1M", "daily_free": "1,500 RPD"},
-                {"id": "gemini-2.0-flash", "context": "1M", "daily_free": "1,500 RPD"},
-                {"id": "gemini-1.5-pro", "context": "2M", "daily_free": "50 RPD"},
-                {"id": "gemini-1.5-flash", "context": "1M", "daily_free": "1,500 RPD"},
+                {"id": "gemini-3.8-flash", "context": "1M", "daily_free": "By plan"},
+                {"id": "gemini-3.5-flash-lite", "context": "1M", "daily_free": "By plan"},
+                {"id": "gemini-2.5-flash", "context": "1M", "daily_free": "By plan"},
             ]
         },
         "openai": {
@@ -2594,6 +3856,7 @@ async def llm_usage_stats():
                 {"id": "o1", "context": "200K", "daily_free": "Tier 1: 500 RPM"},
             ]
         },
+        "openrouter": {"popular_models": []},
         "mistral": {
             "popular_models": [
                 {
@@ -2611,6 +3874,29 @@ async def llm_usage_stats():
                     "context": "256K",
                     "daily_free": "Free: 1 RPM",
                 },
+            ]
+        },
+        "vertex": {
+            "popular_models": [
+                {"id": "gemini-2.5-flash", "context": "1M", "daily_free": "PAYG"},
+                {"id": "gemini-2.5-pro", "context": "1M", "daily_free": "PAYG"},
+            ]
+        },
+        "nvidia": {
+            "popular_models": [
+                {"id": "z-ai/glm-5.3", "context": "1M", "daily_free": "By model/plan"},
+            ]
+        },
+        "claude": {
+            "popular_models": [
+                {"id": "claude-3-5-sonnet", "context": "200K", "daily_free": "PAYG"},
+                {"id": "claude-3-7-sonnet", "context": "200K", "daily_free": "PAYG"},
+            ]
+        },
+        "groq": {
+            "popular_models": [
+                {"id": "llama-3.1-70b-versatile", "context": "128K", "daily_free": "Free tier"},
+                {"id": "llama-3.1-8b-instant", "context": "128K", "daily_free": "Free tier"},
             ]
         },
     }
@@ -2648,6 +3934,56 @@ async def llm_usage_stats():
     }
 
 
+@app.get("/api/v1/laya/status")
+async def laya_status(_: bool = Depends(require_admin_token)):
+    """Live Laya System-1 status for the Settings UI.
+
+    Reports the resolved backend, LM Studio reachability + loaded models,
+    and local/remote availability. Never raises — unreachable services
+    report ``reachable: False``.
+    """
+    from app.core.laya.client import get_laya_client, laya_configured
+
+    client = get_laya_client()
+    base, model, model_source, loaded_models = await client._resolve_lmstudio_endpoint()
+    from app.core.llm.model_router import get_model_router
+
+    generation_healthy = await get_model_router().check_local_health("lmstudio", force=True)
+    lmstudio: Dict[str, Any] = {
+        "base_url": base,
+        "model": model,
+        "model_source": model_source,
+        "loaded_models": loaded_models,
+        "reachable": False,
+        "generation_healthy": generation_healthy,
+        "health_status": "healthy" if generation_healthy else "unhealthy",
+        "models": [],
+    }
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=5.0) as http:
+            resp = await http.get(f"{base}/models")
+            if resp.status_code == 200:
+                lmstudio["reachable"] = True
+                lmstudio["models"] = [
+                    m.get("id", "")
+                    for m in (resp.json().get("data", []) or [])
+                    if m.get("id")
+                ][:50]
+    except Exception:
+        pass
+
+    return {
+        "enabled": laya_configured(),
+        "mode": client._mode(),
+        "backend": client.backend,
+        "lmstudio": lmstudio,
+        "local": {"installed": client._local_importable()},
+        "remote": {"url": client._remote_url()},
+    }
+
+
 # ═══════════════════════════════════════════════════════════
 #  DealForge 2.0 — MCP Integration API endpoints
 # ═══════════════════════════════════════════════════════════
@@ -2655,7 +3991,7 @@ async def llm_usage_stats():
 
 @app.get("/api/v1/mcp/status")
 @app.get("/api/v1/mcp/providers")
-async def mcp_providers():
+async def mcp_providers(_: bool = Depends(require_admin_token)):
     """
     Returns the status of all registered MCP data providers, including
     runtime-configured ones (set via the Settings UI).
@@ -2665,8 +4001,19 @@ async def mcp_providers():
     return {"providers": get_provider_status()}
 
 
+@app.get("/api/v1/mcp/tools")
+async def mcp_tools(_: bool = Depends(require_admin_token)):
+    """Discover live, read-only tools from configured Streamable HTTP MCP servers."""
+    from app.core.mcp.external_client import planning_tool_summaries
+
+    return {"tools": await planning_tool_summaries()}
+
+
 @app.post("/api/v1/mcp/initialize")
-async def mcp_initialize(request: Request):
+async def mcp_initialize(
+    request: Request,
+    _: bool = Depends(require_admin_token),
+):
     """
     Initialize and live-test an MCP provider API key.
     Persists the key in the runtime store for this session.
@@ -2684,7 +4031,10 @@ async def mcp_initialize(request: Request):
 
 
 @app.post("/api/v1/mcp/search")
-async def mcp_search_company(request: Request):
+async def mcp_search_company(
+    request: Request,
+    _: bool = Depends(require_admin_token),
+):
     """Search for a company across all configured MCP providers."""
     from app.core.mcp import get_mcp_router
 
@@ -2712,7 +4062,7 @@ async def scrum_clarify(request: Request):
     Body: { "task": "...", "context": {} }
     """
     from app.agents.project_manager import ProjectManagerAgent
-    from app.core.mcp import get_provider_status
+    from app.core.mcp.external_client import planning_tool_summaries
 
     from app.core.validation.chat_guard import check_prompt
 
@@ -2729,9 +4079,7 @@ async def scrum_clarify(request: Request):
         return {"error": "invalid_task", "details": guard}
 
     # Build MCP capability context for the agent
-    mcp_status = get_provider_status()
-    configured_mcps = [p for p in mcp_status if p["configured"]]
-    context["available_mcp_providers"] = configured_mcps
+    context["available_mcp_tools"] = await planning_tool_summaries()
 
     agent = ProjectManagerAgent()
     result = await agent.generate_clarifying_questions(task, context)
@@ -2748,7 +4096,7 @@ async def scrum_plan(request: Request):
     Body: { "task": "...", "context": {}, "answers": [...], "provided_data": {} }
     """
     from app.agents.project_manager import ProjectManagerAgent
-    from app.core.mcp import get_provider_status
+    from app.core.mcp.external_client import planning_tool_summaries
     from app.core.validation.chat_guard import check_prompt
 
     body = await request.json()
@@ -2764,8 +4112,7 @@ async def scrum_plan(request: Request):
     if not guard["valid"]:
         return {"error": "invalid_task", "details": guard}
 
-    mcp_status = get_provider_status()
-    context["available_mcp_providers"] = [p for p in mcp_status if p["configured"]]
+    context["available_mcp_tools"] = await planning_tool_summaries()
     context["user_answers"] = answers
     context["provided_data"] = provided_data
 
@@ -2915,14 +4262,15 @@ async def ofas_fetch_financial_data(request: Request):
     frequency = body.get("frequency", "annual")
 
     if not ticker:
-        raise HTTPException(status_code=400, detail="ticker is required")
+        raise HTTPException(status_code=400, detail="ticker or company_name is required")
 
     try:
         from app.core.tools.financial_data_api import FetchFinancialStatementsTool
 
         tool = FetchFinancialStatementsTool()
-        result = tool.execute(
+        result = await tool.execute(
             ticker=ticker,
+            company_name=body.get("company_name"),
             statements=statements,
             periods=periods,
             frequency=frequency,
@@ -3012,6 +4360,17 @@ async def ofas_recover_blocked(deal_id: str):
     except Exception as e:
         logger.error("OFAS recovery failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===== SSE Streaming API =====
+
+from app.api.stream import router as stream_router
+from app.api.ratings import router as ratings_router
+from app.api.pauses import router as pauses_router
+
+app.include_router(stream_router)
+app.include_router(ratings_router)
+app.include_router(pauses_router)
 
 
 # ===== Main Entry Point =====

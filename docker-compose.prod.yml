@@ -1,0 +1,72 @@
+# DealForge AI — Production Docker Compose
+# Standardized orchestration for cloud or local deployment
+
+version: "3.9"
+
+services:
+  # ═══════════════════════════════ BACKEND ═══════════════════════════════
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: dealforge-backend
+    environment:
+      - PYTHONUNBUFFERED=1
+      # LLM & Search API Keys (Loaded from .env.docker via env_file but documented here)
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
+      - VERTEX_API_KEY=${VERTEX_API_KEY:-}
+      - SERPER_API_KEY=${SERPER_API_KEY:-}
+      - SEARXNG_INSTANCE_URL=${SEARXNG_INSTANCE_URL:-}
+      # Model Choice
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      - MISTRAL_MODEL=${MISTRAL_MODEL:-mistral-large-latest}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+    env_file:
+      - .env.docker
+    volumes:
+      - dealforge-db:/app/data
+      - dealforge-reports:/app/reports
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: always
+    networks:
+      - dealforge-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: dealforge-redis
+    volumes:
+      - dealforge-redis-data:/data
+    restart: always
+    networks:
+      - dealforge-net
+
+  # ═══════════════════════════════ FRONTEND ══════════════════════════════
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.docker
+    container_name: dealforge-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: always
+    networks:
+      - dealforge-net
+
+volumes:
+  dealforge-db:
+  dealforge-reports:
+  dealforge-redis-data:
+
+networks:
+  dealforge-net:
+    driver: bridge

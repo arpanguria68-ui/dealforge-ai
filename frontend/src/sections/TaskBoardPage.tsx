@@ -3,8 +3,13 @@ import {
     CheckCircle2, Clock, Play, AlertTriangle, Trash2, Edit3, Plus,
     RefreshCw, ChevronDown, ChevronUp, GripVertical, Send, Loader2, ListTodo
 } from 'lucide-react';
+import { API_BASE } from '@/lib/api-base';
+import { toast } from 'sonner';
+import type { LucideIcon } from 'lucide-react';
 
-const API = 'http://localhost:8005';
+function errMsg(e: unknown): string {
+    return e instanceof Error ? e.message : 'Request failed';
+}
 
 interface TodoItem {
     id: string;
@@ -14,7 +19,7 @@ interface TodoItem {
     status: string;
     priority: string;
     order: number;
-    result: any;
+    result: unknown;
     depends_on: string[];
 }
 
@@ -28,7 +33,7 @@ interface TodoList {
     summary: { total: number; pending: number; in_progress: number; done: number };
 }
 
-const STATUS_CONFIG: Record<string, { icon: any; color: string; bg: string; label: string }> = {
+const STATUS_CONFIG: Record<string, { icon: LucideIcon; color: string; bg: string; label: string }> = {
     pending: { icon: Clock, color: 'text-slate-500', bg: 'bg-slate-100', label: 'Pending' },
     in_progress: { icon: Play, color: 'text-blue-500', bg: 'bg-blue-100', label: 'In Progress' },
     review: { icon: AlertTriangle, color: 'text-amber-500', bg: 'bg-amber-100', label: 'Review' },
@@ -82,25 +87,28 @@ export function TaskBoardPage() {
         setLoading(true);
         try {
             // We'll fetch from a known deal or list all
-            const res = await fetch(`${API}/api/v1/deals/all/tasks`);
+            const res = await fetch(`${API_BASE}/api/v1/tasks/all`);
             if (res.ok) {
                 const data = await res.json();
                 setTodoLists(data.todo_lists || []);
             }
         } catch (e) {
-            console.error('Failed to fetch tasks:', e);
+            toast.error(`Failed to fetch tasks: ${errMsg(e)}`);
         }
         setLoading(false);
     }, []);
 
-    useEffect(() => { fetchLists(); }, [fetchLists]);
+    useEffect(() => {
+        const timer = window.setTimeout(() => { void fetchLists(); }, 0);
+        return () => window.clearTimeout(timer);
+    }, [fetchLists]);
 
     // Create new todo list
     const createTodoList = async () => {
         if (!newDealId.trim()) return;
         setCreating(true);
         try {
-            const res = await fetch(`${API}/api/v1/deals/${newDealId}/tasks`, {
+            const res = await fetch(`${API_BASE}/api/v1/deals/${newDealId}/tasks`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ company_name: newCompany || newDealId }),
@@ -114,7 +122,7 @@ export function TaskBoardPage() {
                 setNewCompany('');
             }
         } catch (e) {
-            console.error('Failed to create todo list:', e);
+            toast.error(`Failed to create todo list: ${errMsg(e)}`);
         }
         setCreating(false);
     };
@@ -122,7 +130,7 @@ export function TaskBoardPage() {
     // Update a task
     const updateTask = async (listId: string, taskId: string, updates: Partial<TodoItem>) => {
         try {
-            const res = await fetch(`${API}/api/v1/tasks/${listId}/items/${taskId}`, {
+            const res = await fetch(`${API_BASE}/api/v1/tasks/${listId}/items/${taskId}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(updates),
@@ -135,21 +143,21 @@ export function TaskBoardPage() {
                 setEditingTask(null);
             }
         } catch (e) {
-            console.error('Update failed:', e);
+            toast.error(`Update failed: ${errMsg(e)}`);
         }
     };
 
     // Delete a task
     const deleteTask = async (listId: string, taskId: string) => {
         try {
-            await fetch(`${API}/api/v1/tasks/${listId}/items/${taskId}`, { method: 'DELETE' });
+            await fetch(`${API_BASE}/api/v1/tasks/${listId}/items/${taskId}`, { method: 'DELETE' });
             setTodoLists(prev => prev.map(l => l.id === listId ? {
                 ...l,
                 items: l.items.filter(t => t.id !== taskId),
                 summary: { ...l.summary, total: l.summary.total - 1 },
             } : l));
         } catch (e) {
-            console.error('Delete failed:', e);
+            toast.error(`Delete failed: ${errMsg(e)}`);
         }
     };
 
@@ -157,7 +165,7 @@ export function TaskBoardPage() {
     const addTask = async (listId: string) => {
         if (!newTaskTitle.trim()) return;
         try {
-            const res = await fetch(`${API}/api/v1/tasks/${listId}/items`, {
+            const res = await fetch(`${API_BASE}/api/v1/tasks/${listId}/items`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ title: newTaskTitle, assigned_agent: newTaskAgent, priority: 'medium' }),
@@ -171,17 +179,17 @@ export function TaskBoardPage() {
                 setShowNewTask(null);
             }
         } catch (e) {
-            console.error('Add task failed:', e);
+            toast.error(`Add task failed: ${errMsg(e)}`);
         }
     };
 
     // Approve list
     const approveList = async (listId: string) => {
         try {
-            await fetch(`${API}/api/v1/tasks/${listId}/approve`, { method: 'POST' });
+            await fetch(`${API_BASE}/api/v1/tasks/${listId}/approve`, { method: 'POST' });
             setTodoLists(prev => prev.map(l => l.id === listId ? { ...l, status: 'approved' } : l));
         } catch (e) {
-            console.error('Approve failed:', e);
+            toast.error(`Approve failed: ${errMsg(e)}`);
         }
     };
 
@@ -189,17 +197,17 @@ export function TaskBoardPage() {
     const executeAll = async (listId: string) => {
         setExecuting(listId);
         try {
-            const res = await fetch(`${API}/api/v1/tasks/${listId}/execute`, { method: 'POST' });
+            const res = await fetch(`${API_BASE}/api/v1/tasks/${listId}/execute`, { method: 'POST' });
             if (res.ok) {
                 // Refresh the list after execution
-                const listRes = await fetch(`${API}/api/v1/tasks/${listId}`);
+                const listRes = await fetch(`${API_BASE}/api/v1/tasks/${listId}`);
                 if (listRes.ok) {
                     const updated = await listRes.json();
                     setTodoLists(prev => prev.map(l => l.id === listId ? updated : l));
                 }
             }
         } catch (e) {
-            console.error('Execute failed:', e);
+            toast.error(`Execute failed: ${errMsg(e)}`);
         }
         setExecuting(null);
     };
@@ -419,9 +427,9 @@ export function TaskBoardPage() {
                                         </div>
 
                                         {/* Result preview */}
-                                        {task.result && (
+                                        {task.result !== undefined && task.result !== null && (
                                             <div className="mt-2 ml-10 p-2 bg-slate-50 rounded text-xs text-slate-600 max-h-24 overflow-y-auto">
-                                                <pre>{JSON.stringify(task.result, null, 2).slice(0, 300)}</pre>
+                                                <pre>{JSON.stringify(task.result, null, 2)?.slice(0, 300) || ''}</pre>
                                             </div>
                                         )}
                                     </div>

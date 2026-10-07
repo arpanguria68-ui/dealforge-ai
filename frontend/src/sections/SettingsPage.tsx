@@ -12,13 +12,17 @@ import {
     Database, Zap, AlertTriangle, Palette, FileText
 } from 'lucide-react';
 import { ApiUsageMonitor } from './ApiUsageMonitor';
-
-const API_BASE = 'http://localhost:8005';
+import { API_BASE, withAdminAuth } from '@/lib/api-base';
 
 const PROVIDER_OPTIONS = [
     { value: 'gemini', label: 'Google Gemini', icon: Cloud, color: 'text-blue-500' },
     { value: 'openai', label: 'OpenAI', icon: Cloud, color: 'text-green-500' },
+    { value: 'openrouter', label: 'OpenRouter', icon: Cloud, color: 'text-cyan-600' },
     { value: 'mistral', label: 'Mistral AI', icon: Cloud, color: 'text-orange-500' },
+    { value: 'vertex', label: 'Google Vertex AI', icon: Cloud, color: 'text-purple-600' },
+    { value: 'nvidia', label: 'NVIDIA NIM', icon: Cloud, color: 'text-lime-500' },
+    { value: 'claude', label: 'Anthropic Claude', icon: Cloud, color: 'text-amber-500' },
+    { value: 'groq', label: 'Groq', icon: Cloud, color: 'text-rose-500' },
     { value: 'ollama', label: 'Ollama (Local)', icon: Cpu, color: 'text-purple-500' },
     { value: 'lmstudio', label: 'LM Studio (Local)', icon: Cpu, color: 'text-pink-500' },
 ];
@@ -63,6 +67,27 @@ interface MCPProviderConfig {
     latency?: number;
 }
 
+interface ProviderModel {
+    id: string;
+    name: string;
+    context_window?: number;
+    daily_limit?: number | string;
+    [key: string]: unknown;
+}
+
+interface ProviderModelsResponse {
+    status: string;
+    models: ProviderModel[];
+}
+
+interface LayaStatus {
+    backend: string;
+    mode: string;
+    lmstudio?: { model?: string; model_source?: string; loaded_models?: string[]; reachable?: boolean; models?: string[]; base_url?: string };
+    remote?: { url?: string };
+    local?: { installed?: boolean };
+}
+
 const MCP_PROVIDERS_CONFIG = [
     {
         id: 'finnhub',
@@ -76,11 +101,11 @@ const MCP_PROVIDERS_CONFIG = [
     {
         id: 'massive',
         name: 'Massive.com',
-        description: 'Enterprise company intelligence, market research, alternative data',
+        description: 'U.S. market data, ticker reference, corporate actions, and market status',
         icon: '🏢',
         defaultKey: '',
         docsUrl: 'https://massive.com',
-        capabilities: ['Company Data', 'Market Research', 'Alternative Data', 'People Data'],
+        capabilities: ['Market Status', 'Stock Prices', 'Ticker Reference', 'Corporate Actions'],
     },
     {
         id: 'fmp',
@@ -151,11 +176,45 @@ interface SettingsState {
     // API Keys
     gemini_api_key: string;
     openai_api_key: string;
+    openrouter_api_key: string;
     mistral_api_key: string;
+    vertex_api_key: string;
+    nvidia_api_key: string;
+    anthropic_api_key: string;
+    groq_api_key: string;
+    // Laya System-1 decision layer
+    laya: {
+        enabled: boolean;
+        mode: string;
+        base_url: string;
+        lmstudio_url: string;
+        lmstudio_model: string;
+        fast_pool: string;
+        general_pool: string;
+        reasoning_pool: string;
+        fast_model: string;
+        general_model: string;
+        reasoning_model: string;
+    };
+    // RAG v2 tuning
+    rag: {
+        dense: boolean;
+        laya_rerank: boolean;
+        rerank_n: number;
+        w_tree: number;
+        w_bm25: number;
+        w_dense: number;
+    };
     // Cloud Model Names
     gemini_model: string;
     openai_model: string;
+    openrouter_model: string;
     mistral_model: string;
+    vertex_model: string;
+    vertex_project_id: string;
+    vertex_location: string;
+    nvidia_model: string;
+    nvidia_base_url: string;
     // Local LLMs
     ollama_base_url: string;
     ollama_model: string;
@@ -205,10 +264,42 @@ export function SettingsPage() {
     const [settings, setSettings] = useState<SettingsState>({
         gemini_api_key: '',
         openai_api_key: '',
+        openrouter_api_key: '',
         mistral_api_key: '',
+        vertex_api_key: '',
+        nvidia_api_key: '',
+        anthropic_api_key: '',
+        groq_api_key: '',
+        laya: {
+            enabled: true,
+            mode: 'auto',
+            base_url: '',
+            lmstudio_url: '',
+            lmstudio_model: '',
+            fast_pool: 'groq,gemini,mistral',
+            general_pool: 'gemini,openai,openrouter,mistral,nvidia,vertex',
+            reasoning_pool: 'vertex,claude,openai,openrouter,gemini',
+            fast_model: '',
+            general_model: '',
+            reasoning_model: '',
+        },
+        rag: {
+            dense: true,
+            laya_rerank: true,
+            rerank_n: 30,
+            w_tree: 0.4,
+            w_bm25: 0.3,
+            w_dense: 0.3,
+        },
         gemini_model: '',
         openai_model: '',
+        openrouter_model: 'openai/gpt-4o-mini',
         mistral_model: '',
+        vertex_model: 'gemini-3.8-flash',
+        vertex_project_id: '',
+        vertex_location: 'us-central1',
+        nvidia_model: 'z-ai/glm-5.3',
+        nvidia_base_url: 'https://integrate.api.nvidia.com/v1',
         ollama_base_url: 'http://localhost:11434',
         ollama_model: 'llama3',
         lmstudio_base_url: 'http://localhost:1234/v1',
@@ -281,9 +372,11 @@ export function SettingsPage() {
     const [showKeys, setShowKeys] = useState<Record<string, boolean>>({});
     const [saving, setSaving] = useState(false);
     const [saved, setSaved] = useState(false);
+    const [saveError, setSaveError] = useState('');
+    const [apiKeyConfigured, setApiKeyConfigured] = useState<Record<string, boolean>>({});
     const [ollamaStatus, setOllamaStatus] = useState<'checking' | 'online' | 'offline'>('checking');
     const [lmstudioStatus, setLmstudioStatus] = useState<'checking' | 'online' | 'offline'>('checking');
-    const [availableModels, setAvailableModels] = useState<Record<string, { status: string; models: Array<{ id: string; name: string;[k: string]: any }> }>>({});
+    const [availableModels, setAvailableModels] = useState<Record<string, ProviderModelsResponse>>({});
     const [fetchingModels, setFetchingModels] = useState(false);
     const [mcpState, setMcpState] = useState<Record<string, MCPProviderConfig>>(() =>
         Object.fromEntries(
@@ -291,19 +384,25 @@ export function SettingsPage() {
         )
     );
 
-    const [cloudApiTestStatus, setCloudApiTestStatus] = useState<Record<string, { status: 'idle' | 'testing' | 'connected' | 'error', errorMsg?: string }>>({
+    const [cloudApiTestStatus, setCloudApiTestStatus] = useState<Record<string, { status: 'idle' | 'testing' | 'connected' | 'error', errorMsg?: string, detail?: string }>>({
         gemini: { status: 'idle' },
         openai: { status: 'idle' },
-        mistral: { status: 'idle' }
+        openrouter: { status: 'idle' },
+        mistral: { status: 'idle' },
+        vertex: { status: 'idle' },
+        nvidia: { status: 'idle' }
     });
 
     // Fetch live model lists from all providers
     const fetchModels = useCallback(async () => {
         setFetchingModels(true);
         try {
-            const res = await fetch(`${API_BASE}/api/v1/models/available`, { signal: AbortSignal.timeout(15000) });
+            const res = await fetch(
+                `${API_BASE}/api/v1/models/available`,
+                withAdminAuth({ signal: AbortSignal.timeout(15000) })
+            );
             if (res.ok) {
-                const data = await res.json();
+                const data = await res.json() as Record<string, ProviderModelsResponse>;
                 setAvailableModels(data);
                 // Update local LLM status from the response
                 if (data.ollama) setOllamaStatus(data.ollama.status === 'online' ? 'online' : 'offline');
@@ -315,14 +414,17 @@ export function SettingsPage() {
                     const map: [string, keyof SettingsState][] = [
                         ['gemini', 'gemini_model'],
                         ['openai', 'openai_model'],
+                        ['openrouter', 'openrouter_model'],
                         ['mistral', 'mistral_model'],
+                        ['nvidia', 'nvidia_model'],
                         ['ollama', 'ollama_model'],
                         ['lmstudio', 'lmstudio_model'],
+                        ['vertex', 'vertex_model'],
                     ];
                     for (const [provider, field] of map) {
                         const models = data[provider]?.models || [];
                         const cur = prev[field] as string || '';
-                        if (models.length > 0 && (!cur || !models.some((m: any) => m.id === cur))) {
+                        if (models.length > 0 && (!cur || !models.some(m => m.id === cur))) {
                             updates[field as string] = models[0].id;
                         }
                     }
@@ -339,7 +441,10 @@ export function SettingsPage() {
         let apiKey = '';
         if (providerId === 'gemini') apiKey = settings.gemini_api_key;
         if (providerId === 'openai') apiKey = settings.openai_api_key;
+        if (providerId === 'openrouter') apiKey = settings.openrouter_api_key;
         if (providerId === 'mistral') apiKey = settings.mistral_api_key;
+        if (providerId === 'vertex') apiKey = settings.vertex_api_key;
+        if (providerId === 'nvidia') apiKey = settings.nvidia_api_key;
 
         if (!apiKey) {
             setCloudApiTestStatus(prev => ({ ...prev, [providerId]: { status: 'error', errorMsg: 'API Key is missing' } }));
@@ -348,28 +453,51 @@ export function SettingsPage() {
 
         setCloudApiTestStatus(prev => ({ ...prev, [providerId]: { status: 'testing' } }));
         try {
-            const res = await fetch(`${API_BASE}/api/v1/models/test`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ provider: providerId, api_key: apiKey }),
-            });
-            const data = await res.json();
-            if (data.ok && data.models) {
+            const body: Record<string, string> = { provider: providerId, api_key: apiKey };
+            const selectedModel = settings[`${providerId}_model` as keyof typeof settings];
+            if (typeof selectedModel === 'string') body.model = selectedModel;
+            // For Vertex AI, also send project_id and location so the backend can make a real test call
+            if (providerId === 'vertex') {
+                body.project_id = settings.vertex_project_id || '';
+                body.location = settings.vertex_location || 'us-central1';
+            }
+            if (providerId === 'nvidia') body.base_url = settings.nvidia_base_url;
+            const res = await fetch(
+                `${API_BASE}/api/v1/models/test`,
+                withAdminAuth({
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                })
+            );
+            const data = await res.json() as { ok?: boolean; models?: ProviderModel[]; error?: string; generation?: { model?: string; latency_ms?: number } };
+            const models = data.models;
+            if (data.ok && models) {
+                const persist = await fetch(
+                    `${API_BASE}/api/v1/settings`,
+                    withAdminAuth({
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ [`${providerId}_api_key`]: apiKey }),
+                    })
+                );
+                if (!persist.ok) throw new Error(`Key tested, but saving failed (HTTP ${persist.status}).`);
+                setApiKeyConfigured(prev => ({ ...prev, [providerId]: true }));
                 setCloudApiTestStatus(prev => ({
                     ...prev,
-                    [providerId]: { status: 'connected' },
+                    [providerId]: { status: 'connected', detail: `Generation verified: ${data.generation?.model || selectedModel || providerId}${typeof data.generation?.latency_ms === 'number' ? ` · ${data.generation.latency_ms} ms` : ''}` },
                 }));
                 // Update live models for this provider so Cloud Model Selection immediately populates
                 setAvailableModels(prev => ({
                     ...prev,
-                    [providerId]: { status: 'online', models: data.models }
+                    [providerId]: { status: 'online', models }
                 }));
                 // Auto-select first model if none is currently selected
-                if (data.models.length > 0) {
+                if (models.length > 0) {
                     setSettings(prev => {
                         const cur = prev[`${providerId}_model` as keyof typeof prev];
-                        if (!cur || !data.models.some((m: any) => m.id === cur)) {
-                            return { ...prev, [`${providerId}_model`]: data.models[0].id };
+                        if (!cur || !models.some(m => m.id === cur)) {
+                            return { ...prev, [`${providerId}_model`]: models[0].id };
                         }
                         return prev;
                     });
@@ -380,22 +508,31 @@ export function SettingsPage() {
                     [providerId]: { status: 'error', errorMsg: data.error || 'Invalid API Key' },
                 }));
             }
-        } catch (e: any) {
+        } catch (e) {
             setCloudApiTestStatus(prev => ({
                 ...prev,
-                [providerId]: { status: 'error', errorMsg: e.message || 'Network error' },
+                [providerId]: { status: 'error', errorMsg: e instanceof Error ? e.message : 'Network error' },
             }));
         }
     }
 
-    // Check local LLM status on mount
-    useEffect(() => {
-        checkLocalLLMs();
-        loadSettings();
-        fetchModels();
+    const [layaStatus, setLayaStatus] = useState<LayaStatus | null>(null);
+    const [layaStatusLoading, setLayaStatusLoading] = useState(false);
+    const layaModels = layaStatus?.lmstudio?.models ?? [];
+
+    const fetchLayaStatus = useCallback(async () => {
+        setLayaStatusLoading(true);
+        try {
+            const res = await fetch(
+                `${API_BASE}/api/v1/laya/status`,
+                withAdminAuth({ signal: AbortSignal.timeout(8000) })
+            );
+            if (res.ok) setLayaStatus(await res.json() as LayaStatus);
+        } catch { /* backend unreachable — card shows form values only */ }
+        setLayaStatusLoading(false);
     }, []);
 
-    async function checkLocalLLMs() {
+    const checkLocalLLMs = useCallback(async () => {
         // Check Ollama
         try {
             const res = await fetch(`${settings.ollama_base_url}/api/tags`, { signal: AbortSignal.timeout(3000) });
@@ -407,37 +544,68 @@ export function SettingsPage() {
             const res = await fetch(`${settings.lmstudio_base_url}/models`, { signal: AbortSignal.timeout(3000) });
             setLmstudioStatus(res.ok ? 'online' : 'offline');
         } catch { setLmstudioStatus('offline'); }
-    }
+    }, [settings.ollama_base_url, settings.lmstudio_base_url]);
 
-    async function loadSettings() {
+    const loadSettings = useCallback(async () => {
         try {
-            const res = await fetch(`${API_BASE}/api/v1/settings`);
+            const res = await fetch(`${API_BASE}/api/v1/settings`, withAdminAuth());
             if (res.ok) {
                 const data = await res.json();
-                setSettings(prev => ({ ...prev, ...data }));
+                setApiKeyConfigured({
+                    gemini: Boolean(data.gemini_api_key_configured),
+                    openai: Boolean(data.openai_api_key_configured),
+                    openrouter: Boolean(data.openrouter_api_key_configured),
+                    mistral: Boolean(data.mistral_api_key_configured),
+                    vertex: Boolean(data.vertex_api_key_configured),
+                    nvidia: Boolean(data.nvidia_api_key_configured),
+                });
+                setSettings(prev => ({ ...prev, ...data, laya: { ...prev.laya, ...(data.laya || {}) } }));
             }
         } catch { /* Backend may not be running yet */ }
-    }
+    }, []);
+
+    useEffect(() => {
+        void checkLocalLLMs();
+        void loadSettings();
+        void fetchModels();
+        void fetchLayaStatus();
+    }, [checkLocalLLMs, loadSettings, fetchModels, fetchLayaStatus]);
 
     async function saveSettings() {
         setSaving(true);
         try {
-            const res = await fetch(`${API_BASE}/api/v1/settings`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(settings),
-            });
+            const res = await fetch(
+                `${API_BASE}/api/v1/settings`,
+                withAdminAuth({
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(settings),
+                })
+            );
             if (res.ok) {
+                const result = await res.json() as { settings?: Record<string, unknown> };
+                const resultSettings = result.settings || {};
+                setApiKeyConfigured({
+                    gemini: Boolean(resultSettings.gemini_api_key_configured),
+                    openai: Boolean(resultSettings.openai_api_key_configured),
+                    openrouter: Boolean(resultSettings.openrouter_api_key_configured),
+                    mistral: Boolean(resultSettings.mistral_api_key_configured),
+                    vertex: Boolean(resultSettings.vertex_api_key_configured),
+                    nvidia: Boolean(resultSettings.nvidia_api_key_configured),
+                });
+                setSaveError('');
                 setSaved(true);
                 setTimeout(() => setSaved(false), 3000);
+            } else {
+                setSaveError(`Could not save settings (HTTP ${res.status}).`);
             }
         } catch (e) {
-            console.error('Failed to save settings', e);
+            setSaveError(e instanceof Error ? e.message : 'Could not save settings. Check the backend connection and try again.');
         }
         setSaving(false);
     }
 
-    function updateField(field: string, value: string) {
+    function updateField<K extends keyof SettingsState>(field: K, value: SettingsState[K]) {
         setSettings(prev => ({ ...prev, [field]: value }));
     }
 
@@ -479,11 +647,14 @@ export function SettingsPage() {
         if (!key && providerId !== 'ddg') return;
         setMcpState(prev => ({ ...prev, [providerId]: { ...prev[providerId], status: 'testing' } }));
         try {
-            const res = await fetch(`${API_BASE}/api/v1/mcp/initialize`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ provider: providerId, api_key: key }),
-            });
+            const res = await fetch(
+                `${API_BASE}/api/v1/mcp/initialize`,
+                withAdminAuth({
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ provider: providerId, api_key: key }),
+                })
+            );
             const data = await res.json();
             if (data.ok) {
                 setMcpState(prev => ({
@@ -496,10 +667,10 @@ export function SettingsPage() {
                     [providerId]: { ...prev[providerId], status: 'error', errorMsg: data.error || 'Unknown error' },
                 }));
             }
-        } catch (e: any) {
+        } catch (e) {
             setMcpState(prev => ({
                 ...prev,
-                [providerId]: { ...prev[providerId], status: 'error', errorMsg: e.message },
+                [providerId]: { ...prev[providerId], status: 'error', errorMsg: e instanceof Error ? e.message : 'Request failed' },
             }));
         }
     }
@@ -534,11 +705,17 @@ export function SettingsPage() {
                     <CardDescription>Enter your API keys for cloud LLM providers.</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
+                    {Object.entries(cloudApiTestStatus).filter(([, state]) => state.status === 'connected' && state.detail).map(([provider, state]) => (
+                        <p key={provider} className="text-xs text-emerald-700 dark:text-emerald-400">
+                            {provider}: {state.detail}
+                        </p>
+                    ))}
                     {/* Gemini */}
                     <div className="space-y-2">
                         <Label className="flex items-center gap-2">
                             <Cloud className="h-4 w-4 text-blue-500" /> Google Gemini API Key
                         </Label>
+                        {apiKeyConfigured.gemini && <p className="text-xs text-emerald-600">A key is saved. Enter a new key to replace it.</p>}
                         {cloudApiTestStatus.gemini?.status === 'error' && cloudApiTestStatus.gemini?.errorMsg && (
                             <div className="flex items-start gap-1.5 rounded-md bg-red-50 dark:bg-red-950/20 p-2 text-xs text-red-600">
                                 <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
@@ -586,6 +763,7 @@ export function SettingsPage() {
                         <Label className="flex items-center gap-2">
                             <Cloud className="h-4 w-4 text-green-500" /> OpenAI API Key
                         </Label>
+                        {apiKeyConfigured.openai && <p className="text-xs text-emerald-600">A key is saved. Enter a new key to replace it.</p>}
                         {cloudApiTestStatus.openai?.status === 'error' && cloudApiTestStatus.openai?.errorMsg && (
                             <div className="flex items-start gap-1.5 rounded-md bg-red-50 dark:bg-red-950/20 p-2 text-xs text-red-600">
                                 <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
@@ -633,6 +811,7 @@ export function SettingsPage() {
                         <Label className="flex items-center gap-2">
                             <Cloud className="h-4 w-4 text-orange-500" /> Mistral API Key
                         </Label>
+                        {apiKeyConfigured.mistral && <p className="text-xs text-emerald-600">A key is saved. Enter a new key to replace it.</p>}
                         {cloudApiTestStatus.mistral?.status === 'error' && cloudApiTestStatus.mistral?.errorMsg && (
                             <div className="flex items-start gap-1.5 rounded-md bg-red-50 dark:bg-red-950/20 p-2 text-xs text-red-600">
                                 <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
@@ -673,19 +852,235 @@ export function SettingsPage() {
                             </Button>
                         </div>
                     </div>
+                    <Separator />
+
+                    {/* OpenRouter */}
+                    <div className="space-y-2">
+                        <Label className="flex items-center gap-2">
+                            <Cloud className="h-4 w-4 text-cyan-600" /> OpenRouter API Key
+                        </Label>
+                        {apiKeyConfigured.openrouter && <p className="text-xs text-emerald-600">A key is saved. Enter a new key to replace it.</p>}
+                        <p className="text-xs text-muted-foreground">Use one OpenRouter key to access its model catalog. Model availability, pricing, and tool support vary by model.</p>
+                        {cloudApiTestStatus.openrouter?.status === 'error' && cloudApiTestStatus.openrouter.errorMsg && (
+                            <div className="flex items-start gap-1.5 rounded-md bg-red-50 dark:bg-red-950/20 p-2 text-xs text-red-600">
+                                <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                                {cloudApiTestStatus.openrouter.errorMsg}
+                            </div>
+                        )}
+                        <div className="flex gap-2">
+                            <div className="relative flex-1">
+                                <Input
+                                    id="openrouter-key"
+                                    type={showKeys.openrouter ? 'text' : 'password'}
+                                    value={settings.openrouter_api_key}
+                                    onChange={e => {
+                                        updateField('openrouter_api_key', e.target.value);
+                                        setCloudApiTestStatus(prev => ({ ...prev, openrouter: { status: 'idle' } }));
+                                    }}
+                                    placeholder="sk-or-v1-..."
+                                    className="pr-10"
+                                />
+                                <button type="button" aria-label={showKeys.openrouter ? 'Hide OpenRouter API key' : 'Show OpenRouter API key'} onClick={() => toggleShowKey('openrouter')} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                                    {showKeys.openrouter ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                                </button>
+                            </div>
+                            <Button
+                                size="sm"
+                                variant={cloudApiTestStatus.openrouter?.status === 'connected' ? 'outline' : 'default'}
+                                onClick={() => testCloudApi('openrouter')}
+                                disabled={cloudApiTestStatus.openrouter?.status === 'testing' || !settings.openrouter_api_key}
+                                className="shrink-0"
+                            >
+                                {cloudApiTestStatus.openrouter?.status === 'testing' ? (
+                                    <><Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />Testing...</>
+                                ) : cloudApiTestStatus.openrouter?.status === 'connected' ? (
+                                    <><CheckCircle className="h-3.5 w-3.5 mr-1.5" />Connected</>
+                                ) : (
+                                    <><Zap className="h-3.5 w-3.5 mr-1.5" />Initialize &amp; Test</>
+                                )}
+                            </Button>
+                        </div>
+                    </div>
+                    <Separator />
+
+                    {/* Vertex AI */}
+                    <div className="space-y-3">
+                        <Label className="flex items-center gap-2">
+                            <Cloud className="h-4 w-4 text-purple-600" /> Google Vertex AI
+                        </Label>
+                        {apiKeyConfigured.vertex && <p className="text-xs text-emerald-600">Credentials are saved. Enter a new key to replace them.</p>}
+                        {cloudApiTestStatus.vertex?.status === 'error' && cloudApiTestStatus.vertex?.errorMsg && (
+                            <div className="flex items-start gap-1.5 rounded-md bg-red-50 dark:bg-red-950/20 p-2 text-xs text-red-600">
+                                <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                                {cloudApiTestStatus.vertex.errorMsg}
+                            </div>
+                        )}
+                        <div className="rounded-md border border-blue-200 bg-blue-50 dark:bg-blue-950/20 dark:border-blue-800 p-2.5 text-xs text-blue-800 dark:text-blue-300 space-y-1">
+                            <p className="font-medium">Vertex AI Authentication</p>
+                            <p>Enter your Vertex AI API Key (Standard keys start with AIza, while OAuth2 tokens start with AQ or ya29).</p>
+                        </div>
+                        <div className="space-y-1">
+                            <Label htmlFor="vertex-key" className="text-xs text-muted-foreground">
+                                API Key or OAuth2 Token
+                            </Label>
+                            <div className="flex gap-2">
+                                <div className="relative flex-1">
+                                    <Input
+                                        id="vertex-key"
+                                        type={showKeys['vertex'] ? 'text' : 'password'}
+                                        value={settings.vertex_api_key}
+                                        onChange={e => {
+                                            updateField('vertex_api_key', e.target.value);
+                                            setCloudApiTestStatus(prev => ({ ...prev, vertex: { status: 'idle' } }));
+                                        }}
+                                        placeholder="AIzaSy..."
+                                        className="pr-10"
+                                    />
+                                    <button onClick={() => toggleShowKey('vertex')} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                                        {showKeys['vertex'] ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                                    </button>
+                                </div>
+                                <Button
+                                    size="sm"
+                                    variant={cloudApiTestStatus.vertex?.status === 'connected' ? 'outline' : 'default'}
+                                    onClick={() => testCloudApi('vertex')}
+                                    disabled={cloudApiTestStatus.vertex?.status === 'testing' || !settings.vertex_api_key}
+                                    className="shrink-0"
+                                >
+                                    {cloudApiTestStatus.vertex?.status === 'testing' ? (
+                                        <><Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />Testing...</>
+                                    ) : cloudApiTestStatus.vertex?.status === 'connected' ? (
+                                        <><CheckCircle className="h-3.5 w-3.5 mr-1.5" />Connected</>
+                                    ) : (
+                                        <><Zap className="h-3.5 w-3.5 mr-1.5" />Initialize & Test</>
+                                    )}
+                                </Button>
+                            </div>
+                        </div>
+                        {/* Validation warning removed to support all valid key types */}
+                        {/* GCP Project ID and Location */}
+                        <div className="grid grid-cols-2 gap-3">
+                            <div className="space-y-1">
+                                <Label htmlFor="vertex-project-id" className="text-xs text-muted-foreground">
+                                    GCP Project ID
+                                </Label>
+                                <Input
+                                    id="vertex-project-id"
+                                    value={settings.vertex_project_id}
+                                    onChange={e => updateField('vertex_project_id', e.target.value)}
+                                    placeholder="my-gcp-project"
+                                    className="h-8 text-sm"
+                                />
+                            </div>
+                            <div className="space-y-1">
+                                <Label htmlFor="vertex-location" className="text-xs text-muted-foreground">
+                                    Region/Location
+                                </Label>
+                                <select
+                                    id="vertex-location"
+                                    value={settings.vertex_location}
+                                    onChange={e => updateField('vertex_location', e.target.value)}
+                                    className="h-8 w-full rounded-md border bg-background px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
+                                >
+                                    <option value="us-central1">us-central1 (Iowa)</option>
+                                    <option value="us-east1">us-east1 (South Carolina)</option>
+                                    <option value="us-west1">us-west1 (Oregon)</option>
+                                    <option value="europe-west1">europe-west1 (Belgium)</option>
+                                    <option value="europe-west4">europe-west4 (Netherlands)</option>
+                                    <option value="asia-northeast1">asia-northeast1 (Tokyo)</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                    <Separator />
+
+                    {/* NVIDIA, Anthropic, and Groq provider settings */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div className="space-y-1">
+                            <Label htmlFor="nvidia-key" className="text-xs flex items-center gap-1.5">
+                                <Cloud className="h-3.5 w-3.5 text-lime-500" /> NVIDIA API Key
+                            </Label>
+                            {apiKeyConfigured.nvidia && <p className="text-xs text-emerald-600">A key is saved. Enter a new key to replace it.</p>}
+                            <Input
+                                id="nvidia-key"
+                                type={showKeys['nvidia'] ? 'text' : 'password'}
+                                value={settings.nvidia_api_key}
+                                onChange={e => {
+                                    updateField('nvidia_api_key', e.target.value);
+                                    setCloudApiTestStatus(prev => ({ ...prev, nvidia: { status: 'idle' } }));
+                                }}
+                                placeholder="nvapi-..."
+                                className="h-8 text-sm"
+                            />
+                            <Label htmlFor="nvidia-base-url" className="text-xs flex items-center gap-1.5 pt-2">
+                                NVIDIA API Base URL
+                            </Label>
+                            <Input
+                                id="nvidia-base-url"
+                                value={settings.nvidia_base_url}
+                                onChange={e => updateField('nvidia_base_url', e.target.value)}
+                                placeholder="https://integrate.api.nvidia.com/v1"
+                                className="h-8 text-sm"
+                            />
+                            <Button
+                                size="sm"
+                                variant={cloudApiTestStatus.nvidia?.status === 'connected' ? 'outline' : 'default'}
+                                onClick={() => testCloudApi('nvidia')}
+                                disabled={cloudApiTestStatus.nvidia?.status === 'testing' || !settings.nvidia_api_key}
+                                className="mt-2"
+                            >
+                                {cloudApiTestStatus.nvidia?.status === 'testing' ? (
+                                    <><Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />Testing...</>
+                                ) : cloudApiTestStatus.nvidia?.status === 'connected' ? (
+                                    <><CheckCircle className="h-3.5 w-3.5 mr-1.5" />Connected</>
+                                ) : (
+                                    <><Zap className="h-3.5 w-3.5 mr-1.5" />Initialize &amp; Test</>
+                                )}
+                            </Button>
+                            {cloudApiTestStatus.nvidia?.status === 'error' && cloudApiTestStatus.nvidia.errorMsg && (
+                                <p className="text-xs text-red-600">{cloudApiTestStatus.nvidia.errorMsg}</p>
+                            )}
+                        </div>
+                        <div className="space-y-1">
+                            <Label htmlFor="anthropic-key" className="text-xs flex items-center gap-1.5">
+                                <Cloud className="h-3.5 w-3.5 text-amber-500" /> Anthropic API Key
+                            </Label>
+                            <Input
+                                id="anthropic-key"
+                                type={showKeys['anthropic'] ? 'text' : 'password'}
+                                value={settings.anthropic_api_key}
+                                onChange={e => updateField('anthropic_api_key', e.target.value)}
+                                placeholder="sk-ant-..."
+                                className="h-8 text-sm"
+                            />
+                        </div>
+                        <div className="space-y-1">
+                            <Label htmlFor="groq-key" className="text-xs flex items-center gap-1.5">
+                                <Cloud className="h-3.5 w-3.5 text-rose-500" /> Groq API Key
+                            </Label>
+                            <Input
+                                id="groq-key"
+                                type={showKeys['groq'] ? 'text' : 'password'}
+                                value={settings.groq_api_key}
+                                onChange={e => updateField('groq_api_key', e.target.value)}
+                                placeholder="gsk_..."
+                                className="h-8 text-sm"
+                            />
+                        </div>
+                    </div>
                 </CardContent>
             </Card>
 
-            {/* ===== MCP Data Providers Section ===== */}
+            {/* ===== External API Providers Section ===== */}
             <Card className="border-t-4 border-t-teal-500">
                 <CardHeader>
                     <CardTitle className="flex items-center gap-2">
                         <Database className="h-5 w-5 text-teal-500" />
-                        MCP Data Providers
+                        External API Integrations
                     </CardTitle>
                     <CardDescription>
-                        Connect live financial data sources. When configured, the Scrum Master will auto-fetch
-                        market data, financials, and news — reducing your manual data entry burden.
+                        Credentialed finance and research APIs used by compatible tools. These are API integrations,
+                        not MCP protocol servers; availability and retrieved evidence are checked during analysis.
                     </CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
@@ -848,7 +1243,7 @@ export function SettingsPage() {
                                             onClick={() => {
                                                 const next = [...settings.search_priority];
                                                 [next[index], next[index - 1]] = [next[index - 1], next[index]];
-                                                updateField('search_priority', next as any);
+                                                updateField('search_priority', next);
                                             }}
                                         >
                                             <Zap className="h-3 w-3 rotate-180" />
@@ -861,7 +1256,7 @@ export function SettingsPage() {
                                             onClick={() => {
                                                 const next = [...settings.search_priority];
                                                 [next[index], next[index + 1]] = [next[index + 1], next[index]];
-                                                updateField('search_priority', next as any);
+                                                updateField('search_priority', next);
                                             }}
                                         >
                                             <Zap className="h-3 w-3" />
@@ -962,6 +1357,33 @@ export function SettingsPage() {
                                 )}
                             </select>
                         </div>
+                        {/* OpenRouter */}
+                        <div className="space-y-1">
+                            <Label htmlFor="openrouter-model" className="text-xs flex items-center gap-1">
+                                OpenRouter Model
+                                {availableModels.openrouter && (
+                                    <Badge variant="outline" className="text-[9px] px-1">
+                                        {availableModels.openrouter.models.length} available
+                                    </Badge>
+                                )}
+                            </Label>
+                            <select
+                                id="openrouter-model"
+                                value={settings.openrouter_model}
+                                onChange={e => updateField('openrouter_model', e.target.value)}
+                                className="h-9 w-full rounded-md border bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
+                            >
+                                {availableModels.openrouter?.models?.length ? (
+                                    availableModels.openrouter.models.map(m => (
+                                        <option key={m.id} value={m.id}>
+                                            {m.name || m.id}{m.context_window ? ` · ${Math.round(m.context_window / 1000)}K ctx` : ''}
+                                        </option>
+                                    ))
+                                ) : (
+                                    <option value={settings.openrouter_model}>{settings.openrouter_api_key ? 'Click Refresh Models' : 'Set OpenRouter API key first'}</option>
+                                )}
+                            </select>
+                        </div>
                         {/* Mistral */}
                         <div className="space-y-1">
                             <Label htmlFor="mistral-model" className="text-xs flex items-center gap-1">
@@ -993,8 +1415,66 @@ export function SettingsPage() {
                                 )}
                             </select>
                         </div>
-                    </div>
-                </CardContent>
+
+                        {/* NVIDIA NIM */}
+                        <div className="space-y-1">
+                            <Label htmlFor="nvidia-model" className="text-xs flex items-center gap-1">
+                                NVIDIA NIM Model
+                                {availableModels.nvidia && (
+                                    <Badge variant="outline" className="text-[9px] px-1">
+                                        {availableModels.nvidia.models.length} available
+                                    </Badge>
+                                )}
+                            </Label>
+                            <select
+                                id="nvidia-model"
+                                value={settings.nvidia_model}
+                                onChange={e => updateField('nvidia_model', e.target.value)}
+                                className="h-9 w-full rounded-md border bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
+                            >
+                                {availableModels.nvidia?.models?.length ? (
+                                    availableModels.nvidia.models.map(m => (
+                                        <option key={m.id} value={m.id}>{m.name || m.id}</option>
+                                    ))
+                                ) : (
+                                    <option value={settings.nvidia_model}>{settings.nvidia_api_key ? 'Click Refresh Models' : 'Set NVIDIA API key first'}</option>
+                                )}
+                            </select>
+                        </div>
+
+                         {/* Vertex AI */}
+                         <div className="space-y-1">
+                             <Label htmlFor="vertex-model" className="text-xs flex items-center gap-1">
+                                 Vertex AI Model
+                             </Label>
+                             <select
+                                 id="vertex-model"
+                                 value={settings.vertex_model}
+                                 onChange={e => updateField('vertex_model', e.target.value)}
+                                 className="h-9 w-full rounded-md border bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
+                             >
+                                 {availableModels.vertex?.models?.length ? (
+                                     availableModels.vertex.models.map(m => (
+                                         <option key={m.id} value={m.id}>
+                                             {m.name || m.id}
+                                         </option>
+                                     ))
+                                 ) : (
+                                     <>
+                                         <option value="gemini-3.8-flash">gemini-3.8-flash (Recommended)</option>
+                                         <option value="gemini-3.7-flash">gemini-3.7-flash</option>
+                                         <option value="gemini-3.6-flash">gemini-3.6-flash</option>
+                                         <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite</option>
+                                         <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite</option>
+                                         <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview</option>
+                                         <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                                         <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+                                     </>
+                                 )}
+                             </select>
+                         </div>
+                     </div>
+                 </CardContent>
             </Card>
 
             {/* ===== Local LLMs Section ===== */}
@@ -1094,7 +1574,7 @@ export function SettingsPage() {
                                 Agent → LLM Provider Routing
                             </CardTitle>
                             <CardDescription>
-                                Assign each agent to a cloud or local LLM provider. Specific models are globally chosen above.
+                                Set each agent’s preferred provider. Laya classifies each task and can override its model by complexity tier.
                             </CardDescription>
                         </div>
                         <div className="flex items-center gap-2">
@@ -1149,6 +1629,19 @@ export function SettingsPage() {
                             </div>
                         ))}
                     </div>
+                    <Separator className="my-5" />
+                    <div className="space-y-2">
+                        <p className="text-sm font-medium">Laya model selection by task complexity</p>
+                        <p className="text-xs text-muted-foreground">Set an optional exact model as provider:model. Laya applies it only when its task routing selects that provider; blank uses the provider’s default model.</p>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                            {([['fast_model', 'Fast / simple'], ['general_model', 'General'], ['reasoning_model', 'Reasoning / complex']] as const).map(([key, label]) => (
+                                <div className="space-y-1" key={key}>
+                                    <Label htmlFor={`laya-${key}`} className="text-xs">{label}</Label>
+                                    <Input id={`laya-${key}`} value={settings.laya[key]} onChange={e => setSettings(prev => ({ ...prev, laya: { ...prev.laya, [key]: e.target.value } }))} placeholder="e.g. gemini:gemini-3.8-flash" />
+                                </div>
+                            ))}
+                        </div>
+                    </div>
                 </CardContent>
             </Card>
 
@@ -1173,6 +1666,253 @@ export function SettingsPage() {
                             onCheckedChange={checked => updateField('pageindex_mode', checked ? 'local' : 'cloud')}
                         />
                     </div>
+                </CardContent>
+            </Card>
+
+            {/* ===== Laya System-1 + RAG Tuning ===== */}
+            <Card className="border-t-4 border-t-violet-500">
+                <CardHeader>
+                    <div className="flex items-center justify-between">
+                        <div>
+                            <CardTitle className="flex items-center gap-2">
+                                <Zap className="h-5 w-5 text-violet-500" />
+                                Laya System-1 + RAG Tuning
+                                {layaStatus && (
+                                    <Badge
+                                        variant="outline"
+                                        className={`text-[10px] ${layaStatus.backend !== 'off' && layaStatus.backend !== 'heuristic'
+                                            ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30'
+                                            : 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/30'}`}
+                                    >
+                                        {layaStatus.backend === 'off' ? 'disabled'
+                                            : layaStatus.backend === 'heuristic' ? 'fallback (no engine)'
+                                            : `live: ${layaStatus.backend}`}
+                                    </Badge>
+                                )}
+                            </CardTitle>
+                            <CardDescription>
+                                Fast decisions for routing, gating and rerank — plus hybrid RAG weights.
+                                Backends: in-process checkpoints, <code className="font-mono">laya-serve</code>, or your LM Studio model.
+                                Everything is fail-soft.
+                            </CardDescription>
+                        </div>
+                        <Button variant="outline" size="sm" onClick={fetchLayaStatus} disabled={layaStatusLoading} className="gap-1.5 shrink-0">
+                            <RefreshCw className={`h-3.5 w-3.5 ${layaStatusLoading ? 'animate-spin' : ''}`} />
+                            Status
+                        </Button>
+                    </div>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                    {layaStatus && (
+                        <div className="rounded-lg border bg-muted/20 p-3 text-xs space-y-1.5">
+                            <div className="flex items-center justify-between">
+                                <span className="text-muted-foreground">Mode / backend</span>
+                                <span className="font-mono font-medium">{layaStatus.mode} → {layaStatus.backend}</span>
+                            </div>
+                            <div className="flex items-center justify-between gap-2">
+                                <span className="text-muted-foreground shrink-0">Decision model</span>
+                                <span className="font-mono font-medium truncate" title={layaStatus.backend === 'lmstudio' ? layaStatus.lmstudio?.model : layaStatus.backend === 'remote' ? layaStatus.remote?.url : 'laya checkpoints'}>
+                                    {layaStatus.backend === 'lmstudio'
+                                        ? (layaStatus.lmstudio?.model || '—')
+                                        : layaStatus.backend === 'remote'
+                                            ? (layaStatus.remote?.url || '—')
+                                            : layaStatus.backend === 'local'
+                                                ? (layaStatus.local?.installed ? 'laya checkpoints (installed)' : 'not installed')
+                                                : '—'}
+                                </span>
+                            </div>
+                            {layaStatus.backend === 'lmstudio' && layaStatus.lmstudio?.model_source && (
+                                <div className="flex items-center justify-between gap-2">
+                                    <span className="text-muted-foreground shrink-0">Selected by</span>
+                                    <span className="font-mono">{layaStatus.lmstudio.model_source.replaceAll('_', ' ')}</span>
+                                </div>
+                            )}
+                            {layaStatus.backend === 'lmstudio' && (
+                                <div className="flex items-center justify-between gap-2">
+                                    <span className="text-muted-foreground shrink-0">LM Studio</span>
+                                    {layaStatus.lmstudio?.reachable ? (
+                                        <span className="flex items-center gap-1.5 text-emerald-600 dark:text-emerald-400 font-medium">
+                                            <CheckCircle className="h-3.5 w-3.5" />
+                                            online · {layaStatus.lmstudio.models?.length || 0} models
+                                            {layaModels.length > 0 && (
+                                                <span className="text-muted-foreground font-normal truncate max-w-[220px]" title={layaModels.join(', ')}>
+                                                    ({layaModels.slice(0, 3).join(', ')}{layaModels.length > 3 ? ', …' : ''})
+                                                </span>
+                                            )}
+                                        </span>
+                                    ) : (
+                                        <span className="flex items-center gap-1.5 text-red-500 font-medium">
+                                            <XCircle className="h-3.5 w-3.5" />
+                                            unreachable at {layaStatus.lmstudio?.base_url}
+                                        </span>
+                                    )}
+                                </div>
+                            )}
+                            {layaStatus.backend === 'lmstudio' && layaStatus.lmstudio?.reachable &&
+                                layaStatus.lmstudio?.model && !layaStatus.lmstudio.loaded_models?.includes(layaStatus.lmstudio.model) && (
+                                    <div className="flex items-start gap-1.5 rounded-md bg-amber-500/10 border border-amber-500/30 p-2 text-amber-600 dark:text-amber-400">
+                                        <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                                        Model "{layaStatus.lmstudio.model}" is not loaded in LM Studio; Laya may not be able to generate decisions until it is loaded.
+                                    </div>
+                                )}
+                        </div>
+                    )}
+                    <div className="flex items-center justify-between rounded-lg border p-4">
+                        <div>
+                            <p className="font-medium text-sm">Laya decision layer</p>
+                            <p className="text-xs text-muted-foreground">Tier routing, confidence pre-gate, tool shortlist, RAG rerank.</p>
+                        </div>
+                        <Switch
+                            id="laya-enabled"
+                            checked={settings.laya.enabled}
+                            onCheckedChange={checked => setSettings(prev => ({ ...prev, laya: { ...prev.laya, enabled: checked } }))}
+                        />
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div className="space-y-1">
+                            <Label htmlFor="laya-mode" className="text-xs">Mode</Label>
+                            <select
+                                id="laya-mode"
+                                value={settings.laya.mode}
+                                onChange={e => setSettings(prev => ({ ...prev, laya: { ...prev.laya, mode: e.target.value } }))}
+                                className="h-9 w-full rounded-md border bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
+                            >
+                                <option value="auto">auto (local → remote → off)</option>
+                                <option value="local">local (in-process)</option>
+                                <option value="remote">remote (laya-serve)</option>
+                                <option value="lmstudio">LM Studio (local chat model)</option>
+                                <option value="off">off</option>
+                            </select>
+                        </div>
+                        <div className="space-y-1">
+                            <Label htmlFor="laya-url" className="text-xs">Remote base URL</Label>
+                            <Input
+                                id="laya-url"
+                                value={settings.laya.base_url}
+                                onChange={e => setSettings(prev => ({ ...prev, laya: { ...prev.laya, base_url: e.target.value } }))}
+                                placeholder="http://laya-service:8000"
+                            />
+                        </div>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div className="space-y-1">
+                            <Label htmlFor="laya-lms-url" className="text-xs">LM Studio URL (lmstudio mode)</Label>
+                            <Input
+                                id="laya-lms-url"
+                                value={settings.laya.lmstudio_url}
+                                onChange={e => setSettings(prev => ({ ...prev, laya: { ...prev.laya, lmstudio_url: e.target.value } }))}
+                                placeholder="Blank = use Local LLM URL above"
+                            />
+                        </div>
+                        <div className="space-y-1">
+                            <Label htmlFor="laya-lms-model" className="text-xs">LM Studio model override (optional)</Label>
+                            <Input
+                                id="laya-lms-model"
+                                value={settings.laya.lmstudio_model}
+                                onChange={e => setSettings(prev => ({ ...prev, laya: { ...prev.laya, lmstudio_model: e.target.value } }))}
+                                placeholder="Blank = follow the selected LM Studio model"
+                            />
+                        </div>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div className="space-y-1">
+                            <Label htmlFor="laya-fast" className="text-xs">Fast pool (simple)</Label>
+                            <Input
+                                id="laya-fast"
+                                value={settings.laya.fast_pool}
+                                onChange={e => setSettings(prev => ({ ...prev, laya: { ...prev.laya, fast_pool: e.target.value } }))}
+                            />
+                        </div>
+                        <div className="space-y-1">
+                            <Label htmlFor="laya-general" className="text-xs">General pool</Label>
+                            <Input
+                                id="laya-general"
+                                value={settings.laya.general_pool}
+                                onChange={e => setSettings(prev => ({ ...prev, laya: { ...prev.laya, general_pool: e.target.value } }))}
+                            />
+                        </div>
+                        <div className="space-y-1">
+                            <Label htmlFor="laya-reasoning" className="text-xs">Reasoning pool (complex)</Label>
+                            <Input
+                                id="laya-reasoning"
+                                value={settings.laya.reasoning_pool}
+                                onChange={e => setSettings(prev => ({ ...prev, laya: { ...prev.laya, reasoning_pool: e.target.value } }))}
+                            />
+                        </div>
+                    </div>
+                    <Separator />
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div className="flex items-center justify-between rounded-lg border p-3">
+                            <span className="text-xs font-medium">Dense embeddings</span>
+                            <Switch
+                                checked={settings.rag.dense}
+                                onCheckedChange={checked => setSettings(prev => ({ ...prev, rag: { ...prev.rag, dense: checked } }))}
+                            />
+                        </div>
+                        <div className="flex items-center justify-between rounded-lg border p-3">
+                            <span className="text-xs font-medium">Laya rerank</span>
+                            <Switch
+                                checked={settings.rag.laya_rerank}
+                                onCheckedChange={checked => setSettings(prev => ({ ...prev, rag: { ...prev.rag, laya_rerank: checked } }))}
+                            />
+                        </div>
+                        <div className="space-y-1">
+                            <Label htmlFor="rag-rerank-n" className="text-xs">Rerank depth (N)</Label>
+                            <Input
+                                id="rag-rerank-n"
+                                type="number"
+                                min={5}
+                                max={50}
+                                value={settings.rag.rerank_n}
+                                onChange={e => setSettings(prev => ({ ...prev, rag: { ...prev.rag, rerank_n: parseInt(e.target.value) || 30 } }))}
+                            />
+                        </div>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div className="space-y-1">
+                            <Label htmlFor="rag-w-tree" className="text-xs">Weight: tree ({settings.rag.w_tree})</Label>
+                            <input
+                                id="rag-w-tree"
+                                type="range"
+                                min={0}
+                                max={1}
+                                step={0.05}
+                                value={settings.rag.w_tree}
+                                onChange={e => setSettings(prev => ({ ...prev, rag: { ...prev.rag, w_tree: parseFloat(e.target.value) } }))}
+                                className="w-full"
+                            />
+                        </div>
+                        <div className="space-y-1">
+                            <Label htmlFor="rag-w-bm25" className="text-xs">Weight: BM25 ({settings.rag.w_bm25})</Label>
+                            <input
+                                id="rag-w-bm25"
+                                type="range"
+                                min={0}
+                                max={1}
+                                step={0.05}
+                                value={settings.rag.w_bm25}
+                                onChange={e => setSettings(prev => ({ ...prev, rag: { ...prev.rag, w_bm25: parseFloat(e.target.value) } }))}
+                                className="w-full"
+                            />
+                        </div>
+                        <div className="space-y-1">
+                            <Label htmlFor="rag-w-dense" className="text-xs">Weight: dense ({settings.rag.w_dense})</Label>
+                            <input
+                                id="rag-w-dense"
+                                type="range"
+                                min={0}
+                                max={1}
+                                step={0.05}
+                                value={settings.rag.w_dense}
+                                onChange={e => setSettings(prev => ({ ...prev, rag: { ...prev.rag, w_dense: parseFloat(e.target.value) } }))}
+                                className="w-full"
+                            />
+                        </div>
+                    </div>
+                    <p className="text-[11px] text-muted-foreground">
+                        Saved with the rest of Settings. The backend picks these up from the settings store when present
+                        (env vars <code className="font-mono">LAYA_*</code> / <code className="font-mono">RAG_*</code> remain the default).
+                    </p>
                 </CardContent>
             </Card>
 
@@ -1356,6 +2096,7 @@ export function SettingsPage() {
                         <><Save className="mr-2 h-4 w-4" /> Save Settings</>
                     )}
                 </Button>
+                {saveError && <p role="alert" className="mr-4 self-center text-sm text-red-600">{saveError}</p>}
             </div>
         </div>
     );

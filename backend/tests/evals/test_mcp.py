@@ -1,36 +1,27 @@
+"""Offline contract tests for provider adapters and genuine MCP configuration."""
 import pytest
-from unittest.mock import Mock
-from .conftest import BENCHMARKS
-from backend.app.core.mcp import MCPClient as MCP  # Assuming MCP class or function
+
+from app.core.mcp import MCPClient
+
+
+def test_unknown_provider_rejected():
+    with pytest.raises(ValueError, match="Unknown MCP provider"):
+        MCPClient("not-a-provider")
+
 
 @pytest.mark.asyncio
-async def test_mcp_collaboration():
-    mcp = MCP()
-    agents = [Mock() for _ in range(3)]  # Mock agents
-    task = "Collaborative task"
-    
-    output = await mcp.coordinate(agents, task)
-    # Assert collaboration metrics, e.g., number of interactions
-    assert len(output.interactions) > 0
+async def test_unconfigured_provider_returns_actionable_result(monkeypatch):
+    monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+    client = MCPClient("finnhub")
+    result = await client.query("stock_price", {"symbol": "AAPL"})
+    assert result["configured"] is False
+    assert result["data"] is None
+    assert "FINNHUB_API_KEY" in result["error"]
 
-@pytest.mark.asyncio
-async def test_mcp_tool_usage():
-    mcp = MCP()
-    # Setup with mock tools
-    output = await mcp.run_task("task requiring tools")
-    tool_calls = output.tool_calls
-    efficiency = len(tool_calls) / some_expected  # Define properly
-    assert efficiency >= BENCHMARKS['tool_usage_efficiency']
 
-@pytest.mark.asyncio
-async def test_mcp_error_handling():
-    mcp = MCP()
-    # Simulate error in one agent
-    with pytest.raises(Exception):
-        await mcp.coordinate([Mock(side_effect=Exception("Error"))], "task")
-    # Or assert recovery
-    # recovery_rate = ... 
-    # assert recovery_rate >= BENCHMARKS['error_recovery']
+def test_provider_metadata_is_explicit_and_unique():
+    from app.core.mcp import MCP_PROVIDERS
 
-# More tests for MCP
-
+    assert MCP_PROVIDERS
+    assert all(provider.get("name") and provider.get("capabilities") for provider in MCP_PROVIDERS.values())
+    assert len(MCP_PROVIDERS) == len(set(MCP_PROVIDERS))

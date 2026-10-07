@@ -16,7 +16,7 @@ COPY . .
 
 # Set API base to use the backend container name within Docker network
 # (In production, update this to your actual backend URL or use relative paths)
-ENV VITE_API_BASE=http://localhost:8005
+ENV VITE_API_BASE=
 
 # Build for production
 RUN npm run build

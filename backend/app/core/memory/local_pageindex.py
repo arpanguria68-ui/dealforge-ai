@@ -17,12 +17,14 @@ import os
 import json
 import uuid
 import asyncio
+import re
 import shutil
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 import structlog
+from app.core.laya.graph_nodes import sanitize_brief
 
 try:
     import pypdf
@@ -406,34 +408,46 @@ class LocalPageIndexService:
         if not content.strip():
             content = f"[Empty or unreadable file: {os.path.basename(file_path)}]"
 
-        # Split into chunks of ~2000 chars
-        chunks = []
-        words = content.split()
-        current_chunk = []
-        current_len = 0
+        # Structure-aware chunking with overlap (see app.core.memory.chunking).
+        # Falls back to the legacy whitespace split only if the import fails
+        # (e.g. minimal edge installs).
+        try:
+            from app.core.memory.chunking import chunk_text, summarize
 
-        for word in words:
-            current_chunk.append(word)
-            current_len += len(word) + 1
-            if current_len >= 2000:
-                chunks.append(" ".join(current_chunk))
-                current_chunk = []
-                current_len = 0
+            pieces = chunk_text(content, source_title=os.path.basename(file_path))
+            chunks = [(c.text, c.title, c.section_path) for c in pieces]
+            summaries = [summarize(c.text) for c in pieces]
+        except Exception:
+            chunks, summaries = [], []
+            words = content.split()
+            current_chunk = []
+            current_len = 0
+            for word in words:
+                current_chunk.append(word)
+                current_len += len(word) + 1
+                if current_len >= 2000:
+                    text = " ".join(current_chunk)
+                    chunks.append((text, f"Section {len(chunks) + 1}", []))
+                    summaries.append(text[:200])
+                    current_chunk = []
+                    current_len = 0
+            if current_chunk:
+                text = " ".join(current_chunk)
+                chunks.append((text, f"Section {len(chunks) + 1}", []))
+                summaries.append(text[:200])
 
-        if current_chunk:
-            chunks.append(" ".join(current_chunk))
-
-        # Build a flat tree
+        # Build a flat tree (section-aware titles + citation metadata)
         nodes = []
-        for i, chunk in enumerate(chunks):
+        for i, ((text, title, path), summary) in enumerate(zip(chunks, summaries)):
             nodes.append(
                 {
                     "node_id": f"{i:04d}",
-                    "title": f"Section {i + 1}",
-                    "summary": chunk[:200] + "..." if len(chunk) > 200 else chunk,
+                    "title": title,
+                    "summary": summary,
                     "start_index": i,
                     "end_index": i + 1,
-                    "text": chunk,
+                    "text": text,
+                    "section_path": path,
                     "nodes": [],
                 }
             )
@@ -468,6 +482,7 @@ class LocalPageIndexService:
         Returns:
             List of SearchResult objects
         """
+        query = sanitize_brief(query)
         results: List[SearchResult] = []
 
         # Determine which documents to search
@@ -523,8 +538,14 @@ class LocalPageIndexService:
         tree search with LLM would be used. This is a fast local fallback
         that uses keyword overlap scoring.
         """
-        query_words = set(query.lower().split())
+        query_words = self._query_terms(query)
+        named_entity = self._query_named_entity(query)
         results = []
+        # Sibling count for citation "chunk i of N"
+        try:
+            total_nodes = len(tree_data.get("nodes", []) or [])
+        except Exception:
+            total_nodes = 0
 
         def walk_nodes(nodes, depth=0):
             if not isinstance(nodes, list):
@@ -537,10 +558,36 @@ class LocalPageIndexService:
                 title = node.get("title", "")
                 summary = node.get("summary", "")
                 text = node.get("text", "")
+                section_path = node.get("section_path", []) or []
                 searchable = f"{title} {summary} {text}".lower()
+                llm_provider_url = any(host in searchable for host in (
+                    "generativelanguage.googleapis.com",
+                    "api.openai.com",
+                    "openrouter.ai/api",
+                    "api.anthropic.com",
+                    "integrate.api.nvidia.com",
+                ))
+                if any(marker in searchable for marker in (
+                    "[error] llm call failed",
+                    "[provider unavailable]",
+                    "no configured provider returned a usable response",
+                )) or (llm_provider_url and any(marker in searchable for marker in (
+                    "failed", "forbidden", "unauthorized", "rate limit", "429", "500"
+                ))):
+                    walk_nodes(node.get("nodes", []) or [], depth + 1)
+                    continue
 
-                # Calculate relevance
-                searchable_words = set(searchable.split())
+                # A named entity in the query is a hard retrieval constraint.
+                # This prevents generic words such as "market" from surfacing
+                # unrelated companies' records in a deal-specific search.
+                doc_identity = " ".join(str(doc.metadata.get(key, "")) for key in (
+                    "company_name", "entity_name", "target_name", "ticker"
+                )).lower()
+                if named_entity and named_entity not in searchable and named_entity not in doc_identity:
+                    walk_nodes(node.get("nodes", []) or [], depth + 1)
+                    continue
+
+                searchable_words = self._query_terms(searchable)
                 overlap = query_words & searchable_words
                 if overlap:
                     relevance = len(overlap) / max(len(query_words), 1)
@@ -551,29 +598,112 @@ class LocalPageIndexService:
                     if any(w in title.lower() for w in query_words):
                         relevance = min(1.0, relevance + 0.2)
 
-                    content = text if text else summary
+                    content = sanitize_brief(text if text else summary, max_chars=2000)
 
                     if content:
+                        chunk_idx = node.get("start_index", 0)
+                        citation = (
+                            f"{doc.filename} › "
+                            f"{' › '.join(section_path) if section_path else title} "
+                            f"(chunk {chunk_idx + 1} of {max(total_nodes, 1)})"
+                        )
                         results.append(
                             SearchResult(
                                 chunk_id=f"{doc.doc_id}_{node.get('node_id', 'unknown')}",
                                 content=content[:2000],  # Cap content length
-                                page_number=node.get("start_index", 0),
+                                page_number=chunk_idx,
                                 node_title=title,
                                 relevance_score=round(relevance, 4),
                                 doc_id=doc.doc_id,
                                 metadata={
                                     "filename": doc.filename,
                                     "depth": depth,
+                                    "section_path": section_path,
+                                    "chunk_index": chunk_idx,
+                                    "total_chunks": max(total_nodes, 1),
+                                    "citation": citation,
                                     **doc.metadata,
                                 },
                             )
                         )
 
-                # Recurse into children
-                walk_nodes(node.get("nodes", []), depth + 1)
+                # Recurse into THIS node's children (was: root list re-walked
+                # on every iteration → exponential duplicates, children never
+                # searched).
+                walk_nodes(node.get("nodes", []) or [], depth + 1)
 
-        walk_nodes(tree_data.get("nodes", []))
+        walk_nodes(tree_data.get("nodes", []) or [], 0)
+        return [result for result in results if result.relevance_score >= 0.2]
+
+    @staticmethod
+    def _query_terms(text: str) -> set[str]:
+        stop_words = {"a", "an", "and", "are", "for", "from", "in", "is", "of", "on", "or", "the", "to", "with"}
+        return {word for word in re.findall(r"[a-z0-9]+", text.lower()) if word not in stop_words}
+
+    @staticmethod
+    def _query_named_entity(query: str) -> str:
+        matches = re.findall(r"\b[A-Z][a-zA-Z0-9&'-]*(?:\s+[A-Z][a-zA-Z0-9&'-]*)+\b", query)
+        if not matches:
+            return ""
+        words = matches[0].split()
+        if words[0].casefold() in {
+            "analyze", "assess", "compare", "evaluate", "fetch", "find", "for",
+            "list", "look", "research", "retrieve", "review", "search", "show",
+            "summarize", "tell", "what",
+        }:
+            words = words[1:]
+        return " ".join(words).lower() if len(words) >= 2 else ""
+
+    def get_all_chunks(self, deal_id: Optional[str] = None) -> List[SearchResult]:
+        """Get all chunks/nodes for a specific deal to support BM25 indexing (F-018)."""
+        results = []
+        docs = self.list_documents(deal_id)
+        for doc in docs:
+            try:
+                tree_path = Path(doc.tree_path)
+                if not tree_path.exists(): continue
+                with open(tree_path, "r", encoding="utf-8") as f:
+                    tree_data = json.load(f)
+                
+                def collect_nodes(nodes, total=0):
+                    for node in nodes:
+                        content = node.get("text") or node.get("summary")
+                        if content:
+                            # NOTE: SearchResult lives in THIS module. A previous
+                            # version imported it from pageindex_client (which
+                            # has no such name) → ImportError swallowed by the
+                            # except below → always returned []. That silently
+                            # disabled the BM25 half of HybridSearch.
+                            section_path = node.get("section_path", []) or []
+                            title = node.get("title", "")
+                            chunk_idx = node.get("start_index", 0)
+                            citation = (
+                                f"{doc.filename} › "
+                                f"{' › '.join(section_path) if section_path else title} "
+                                f"(chunk {chunk_idx + 1} of {max(total, 1)})"
+                            )
+                            results.append(SearchResult(
+                                chunk_id=f"{doc.doc_id}_{node.get('node_id')}",
+                                content=content[:2000],
+                                page_number=chunk_idx,
+                                node_title=title,
+                                relevance_score=0.0,
+                                doc_id=doc.doc_id,
+                                metadata={
+                                    **doc.metadata,
+                                    "filename": doc.filename,
+                                    "section_path": section_path,
+                                    "chunk_index": chunk_idx,
+                                    "total_chunks": max(total, 1),
+                                    "citation": citation,
+                                }
+                            ))
+                        collect_nodes(node.get("nodes", []), total)
+
+                root_nodes = tree_data.get("nodes", []) or []
+                collect_nodes(root_nodes, len(root_nodes))
+            except Exception:
+                continue
         return results
 
     # ===== Management =====

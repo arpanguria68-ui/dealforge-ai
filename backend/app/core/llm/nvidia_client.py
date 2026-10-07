@@ -21,10 +21,15 @@ class NvidiaClient:
             settings, "NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"
         )
         self.api_key = api_key or getattr(settings, "NVIDIA_API_KEY", None) or os.environ.get("NVIDIA_API_KEY") or "placeholder_key"
-        self.model = model or getattr(settings, "NVIDIA_MODEL", "z-ai/glm5")
+        self.model = model or getattr(settings, "NVIDIA_MODEL", "z-ai/glm-5.3")
 
         # Initialize AsyncOpenAI with NVIDIA URL and key
-        self.client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key)
+        self.client = AsyncOpenAI(
+            base_url=self.base_url,
+            api_key=self.api_key,
+            timeout=60.0,
+            max_retries=0,
+        )
         self.provider = "nvidia"
         self.max_context = 16384
 
@@ -33,6 +38,8 @@ class NvidiaClient:
         prompt: str,
         system_prompt: Optional[str] = None,
         tools: Optional[List[Dict]] = None,
+        temperature: float = 1.0,
+        max_tokens: int = 16384,
         **kwargs,
     ) -> Dict[str, Any]:
         """Generate using NVIDIA API"""
@@ -47,22 +54,11 @@ class NvidiaClient:
         params = {
             "model": self.model,
             "messages": messages,
-            "temperature": kwargs.get("temperature", 1.0),
+            "temperature": temperature,
             "top_p": kwargs.get("top_p", 1.0),
-            "max_tokens": kwargs.get("max_tokens", 16384),
-            "seed": 42,
+            "max_tokens": max_tokens,
             "stream": False,
         }
-
-        # NVIDIA specific kwargs (e.g., thinking mode for glm5)
-        # Wrap them in extra_body for AsyncOpenAI to pass them through
-        if "z-ai/glm5" in self.model:
-            params["extra_body"] = {
-                "chat_template_kwargs": {
-                    "enable_thinking": True,
-                    "clear_thinking": False
-                }
-            }
 
         # Handle tools if provided
         if tools:
@@ -92,7 +88,7 @@ class NvidiaClient:
         except Exception as e:
             logger.error(
                 "NVIDIA API call failed",
-                error=str(e),
+                error_type=type(e).__name__,
                 model=self.model
             )
             raise

@@ -21,6 +21,9 @@ from dataclasses import dataclass, field
 import structlog
 
 from app.config import get_settings
+from app.core.llm.model_registry import get_capabilities
+from app.core.llm.context_guard import enforce_context_limit
+from app.core.llm.token_counter import TokenCounter
 
 logger = structlog.get_logger()
 
@@ -149,7 +152,10 @@ async def exponential_backoff_retry(
             if hasattr(e, "response"):
                 status = getattr(e.response, "status_code", status)
 
-            if status not in RETRYABLE_STATUS or attempt >= max_retries:
+            # Rate/quota failures are provider-capacity signals, not transient transport
+            # failures. Fail over immediately instead of spending the report time budget
+            # retrying a provider that has already rejected the request.
+            if status not in RETRYABLE_STATUS or status == 429 or attempt >= max_retries:
                 raise
 
             sleep = min(max_delay, base_delay * (2**attempt))
@@ -159,7 +165,7 @@ async def exponential_backoff_retry(
                 attempt=attempt + 1,
                 status=status,
                 backoff_s=f"{sleep:.1f}",
-                error=str(e)[:100],
+                error_type=type(e).__name__,
             )
             await asyncio.sleep(sleep)
             attempt += 1
@@ -232,20 +238,28 @@ DEFAULT_VENDOR_LIMITS = {
         max_rpm=15, max_tpm=1_000_000, max_rpd=1_500
     ),  # Default to Flash limits
     "openai": VendorLimits(max_rpm=50, max_tpm=150_000, max_rpd=8_000),
+    "openrouter": VendorLimits(max_rpm=50, max_tpm=200_000, max_rpd=10_000),
     "mistral": VendorLimits(max_rpm=5, max_tpm=400_000, max_rpd=4_000),
     "ollama": VendorLimits(max_rpm=999, max_tpm=999_999, max_rpd=999_999),
     "lmstudio": VendorLimits(max_rpm=999, max_tpm=999_999, max_rpd=999_999),
     "nvidia": VendorLimits(max_rpm=50, max_tpm=500_000, max_rpd=10_000),
+    "vertex": VendorLimits(max_rpm=30, max_tpm=1_000_000, max_rpd=2_000),
+    "claude": VendorLimits(max_rpm=20, max_tpm=200_000, max_rpd=1_000),
+    "groq": VendorLimits(max_rpm=30, max_tpm=500_000, max_rpd=5_000),
 }
 
 # Fallback chain: if primary is over-quota, try these in order
 FALLBACK_CHAIN = {
-    "gemini": ["mistral", "openai", "ollama"],
-    "openai": ["gemini", "mistral", "ollama"],
+    "gemini": ["mistral", "openai", "openrouter", "ollama"],
+    "openai": ["gemini", "mistral", "openrouter", "ollama"],
+    "openrouter": ["gemini", "openai", "mistral", "ollama"],
     "mistral": ["gemini", "openai", "ollama"],
     "ollama": ["lmstudio", "gemini", "mistral", "nvidia"],
-    "lmstudio": ["ollama", "gemini", "mistral", "nvidia"],
+    "lmstudio": ["ollama", "openrouter", "nvidia", "gemini", "mistral"],
     "nvidia": ["gemini", "openai", "mistral"],
+    "vertex": ["gemini", "openai", "mistral"],
+    "claude": ["openai", "gemini", "mistral"],
+    "groq": ["gemini", "openai", "mistral"],
 }
 
 
@@ -293,6 +307,9 @@ class LLMGateway:
         max_tokens: int = 1024,
         temperature: float = 0.7,
         use_cache: bool = True,
+        model: Optional[str] = None,
+        json_mode: bool = False,
+        allow_fallback: bool = True,
     ) -> Dict[str, Any]:
         """
         Central LLM call — all requests go through here.
@@ -310,10 +327,13 @@ class LLMGateway:
         est_in = self.counter.estimate_messages(messages)
         est_total = est_in + max_tokens
 
+        # ── Resolve model name (F-009) ──
+        settings = get_settings()
+        if not model:
+            model = self._get_model_name(provider, settings)
+
         # ── Cache check (only for temperature=0) ──
         if use_cache and temperature == 0:
-            settings = get_settings()
-            model = self._get_model_name(provider, settings)
             cached = self.cache.get(provider, messages, model)
             if cached:
                 logger.info("llm_cache_hit", provider=provider)
@@ -323,6 +343,7 @@ class LLMGateway:
                     "tokens_est": est_total,
                     "cached": True,
                     "fallback_used": False,
+                    "model_used": model,
                 }
 
         # ── Rate limit check + fallback chain ──
@@ -351,60 +372,204 @@ class LLMGateway:
                     is_flash=is_flash,
                 )
 
-        limiter = self.limiters.get(provider)
-        if limiter and not limiter.can_send(est_total):
-            # Try fallback chain
-            actual_provider, fallback_used = self._find_available_provider(
-                provider, est_total
-            )
+        if not await self._provider_ready(provider, est_total):
+            if not allow_fallback:
+                return {
+                    "content": "[Provider unavailable] The requested local provider is not ready; fallback is disabled for this request.",
+                    "provider_used": provider,
+                    "tokens_est": est_total,
+                    "cached": False,
+                    "fallback_used": False,
+                    "error": "provider_unavailable_local_only",
+                }
+            actual_provider, fallback_used = await self._find_available_provider(provider, est_total)
             if actual_provider is None:
                 return {
-                    "content": "[Rate limited] All providers over quota. Try again later.",
+                    "content": "[Provider unavailable] No credentialed, healthy, unthrottled LLM provider is available.",
                     "provider_used": "none",
                     "tokens_est": est_total,
                     "cached": False,
                     "fallback_used": True,
-                    "error": "all_providers_over_quota",
+                    "error": "no_provider_available",
                 }
+
+        # ── Capability Lookup (F-009) ──
+        # actual_provider = self._resolve_provider(provider) # This line is redundant as actual_provider is already determined
+        actual_model = model if actual_provider == provider else self._get_model_name(actual_provider, settings)
+        caps = get_capabilities(actual_model, actual_provider)
+
+        # ── Context window guard (F-004) ──
+        prompt, system_prompt, was_truncated = enforce_context_limit(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            provider=actual_provider,
+            model=actual_model,
+            context_window=caps.context_window,
+        )
+        if was_truncated:
+            logger.warning("prompt_was_truncated", provider=actual_provider)
+
+        # ── JSON Mode Adaptation (F-003 / F-009) ──
+        # Use native JSON mode if requested and supported
+        use_json_mode = json_mode and caps.json_mode
+        if json_mode and not caps.json_mode:
+            logger.warning("model_lacks_native_json_support", model=model)
+            # Fallback will be handled by ReAct style if tools are present
+            # or manual formatting instructions in prompt.
+
+        # ── Tool calling capability check ──
+        if tools and not caps.tool_calling:
+             logger.warning("model_lacks_tool_support", model=model)
+             # Transition to text-based tool format or warn
 
         # ── Execute with retry ──
         client = get_llm_client(actual_provider)
+        if actual_provider == provider and actual_model:
+            # Provider-specific clients expose their configured model under one of these names.
+            for attr in ("model", "model_name"):
+                if hasattr(client, attr):
+                    setattr(client, attr, actual_model)
+                    break
 
         async def do_call():
             return await client.generate(
                 prompt=prompt,
                 system_prompt=system_prompt,
                 tools=tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                json_mode=use_json_mode,
             )
 
+        def has_output(candidate: Any) -> bool:
+            if not isinstance(candidate, dict):
+                return False
+            content = candidate.get("content")
+            calls = candidate.get("function_calls") or candidate.get("tool_calls")
+            return bool(isinstance(content, str) and content.strip()) or bool(calls)
+
+        def failure_reason(exc: Exception) -> str:
+            if isinstance(exc, asyncio.TimeoutError):
+                return "timed out"
+            if isinstance(exc, ValueError) and "reasoning consumed" in str(exc).lower():
+                return "reasoning exhausted the output budget before a visible answer"
+            if isinstance(exc, ValueError) and "empty completion" in str(exc).lower():
+                return "returned an empty completion"
+            status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None) or status
+            if status == 401:
+                return "rejected credentials (401)"
+            if status == 403:
+                return "access or billing denied (403)"
+            if status == 404:
+                return "model or endpoint not found (404)"
+            if status == 429:
+                return "rate-limited or quota exhausted (429)"
+            if isinstance(status, int) and status >= 500:
+                return f"provider service error ({status})"
+            return f"request failed ({type(exc).__name__})"
+
         result = None
+        failures = []
         try:
-            result = await exponential_backoff_retry(do_call)
+            candidate = await exponential_backoff_retry(do_call)
+            if not has_output(candidate):
+                raise ValueError("Provider returned an empty completion")
+            result = candidate
         except Exception as e:
-            logger.error("llm_call_failed", provider=actual_provider, error=str(e))
-            # Last resort: try local if we haven't already
-            if actual_provider not in ("ollama", "lmstudio"):
+            status = getattr(e, "status_code", None) or getattr(e, "status", None)
+            if hasattr(e, "response"):
+                status = getattr(e.response, "status_code", status)
+            is_auth_error = status in (401, 403) or any(
+                kw in str(e).lower()
+                for kw in ("unauthorized", "invalid api key", "authentication", "api key not valid")
+            )
+            logger.error(
+                "llm_call_failed",
+                provider=actual_provider,
+                error_type=type(e).__name__,
+                reason=failure_reason(e),
+                auth_error=is_auth_error,
+                status=status,
+            )
+            failures.append({"provider": actual_provider, "reason": failure_reason(e)})
+            if not allow_fallback:
+                raise RuntimeError(
+                    f"Local provider {actual_provider} failed ({failure_reason(e)}); fallback is disabled for this request."
+                ) from e
+            # Walk the full fallback chain (not just ollama)
+            for fallback_provider in self._fallback_candidates(actual_provider, est_total):
+                if fallback_provider == actual_provider or not await self._provider_ready(fallback_provider, est_total):
+                    continue
                 try:
-                    client = get_llm_client("ollama")
-                    result = await client.generate(
-                        prompt=prompt, system_prompt=system_prompt
+                    fallback_client = get_llm_client(fallback_provider)
+                    candidate = await fallback_client.generate(
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        tools=tools,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        json_mode=use_json_mode,
                     )
-                    actual_provider = "ollama"
+                    if not has_output(candidate):
+                        raise ValueError("Provider returned an empty completion")
+                    result = candidate
+                    logger.info(
+                        "fallback_succeeded",
+                        original=actual_provider,
+                        fallback=fallback_provider,
+                        auth_error=is_auth_error,
+                    )
+                    actual_provider = fallback_provider
+                    actual_model = self._get_model_name(fallback_provider, get_settings())
                     fallback_used = True
+                    break
                 except Exception as fallback_err:
-                    logger.error("llm_fallback_failed", error=str(fallback_err))
-            
+                    logger.warning(
+                        "fallback_attempt_failed",
+                        provider=fallback_provider,
+                        error_type=type(fallback_err).__name__,
+                        reason=failure_reason(fallback_err),
+                    )
+                    failures.append({"provider": fallback_provider, "reason": failure_reason(fallback_err)})
+
             if result is None:
+                attempt_summary = "; ".join(
+                    f"{item['provider']}: {item['reason']}" for item in failures
+                )
+                content = "[Error] No configured provider returned a usable response."
+                if attempt_summary:
+                    content = f"{content} Provider attempts: {attempt_summary}."
                 return {
-                    "content": f"[Error] LLM call failed: {str(e)[:200]}",
+                    "content": content,
                     "provider_used": actual_provider,
                     "tokens_est": est_total,
                     "cached": False,
                     "fallback_used": fallback_used,
-                    "error": str(e),
+                    "error": "provider_generation_failed",
+                    "failure_reasons": failures,
                 }
 
         content = result.get("content", "")
+
+        # Strip thinking tokens if present (F-001: DeepSeek-R1, QwQ, GLM5, etc.)
+        if content:
+            from app.core.llm.thinking_utils import detect_thinking_tag, extract_thinking
+            detected_tag = detect_thinking_tag(content)
+            if detected_tag:
+                clean_content, thinking_content = extract_thinking(content, detected_tag)
+                result["content"] = clean_content
+                result["thinking_content"] = thinking_content
+                result["thinking_stripped"] = True
+                content = clean_content
+                logger.debug(
+                    "thinking_tokens_stripped",
+                    provider=actual_provider,
+                    tag=detected_tag,
+                    thinking_length=len(thinking_content),
+                )
+
         actual_tokens = self.counter.estimate(content) + est_in
 
         # Register usage
@@ -413,8 +578,6 @@ class LLMGateway:
 
         # Cache deterministic responses
         if use_cache and temperature == 0 and content:
-            settings = get_settings()
-            model = self._get_model_name(actual_provider, settings)
             self.cache.set(actual_provider, messages, model, content)
 
         # Log call
@@ -434,6 +597,7 @@ class LLMGateway:
             "tokens_est": actual_tokens,
             "cached": False,
             "fallback_used": fallback_used,
+            "model_used": actual_model,
         }
 
     async def hybrid_reasoning(
@@ -481,30 +645,76 @@ class LLMGateway:
             temperature=0.2,
         )
 
-    def _find_available_provider(
+    def _fallback_candidates(self, original: str, est_tokens: int = 0) -> List[str]:
+        """Use token-aware Laya pool order, then provider policy and remaining routes."""
+        candidates = []
+        try:
+            from app.core.llm.model_router import get_model_router
+
+            router = get_model_router()
+            if est_tokens >= 16_000:
+                candidates.extend(router.reasoning_pool)
+                candidates.extend(router.general_pool)
+                candidates.extend(router.fast_pool)
+            elif est_tokens >= 4_000:
+                candidates.extend(router.general_pool)
+                candidates.extend(router.reasoning_pool)
+                candidates.extend(router.fast_pool)
+            else:
+                candidates.extend(router.fast_pool)
+                candidates.extend(router.general_pool)
+                candidates.extend(router.reasoning_pool)
+        except Exception:
+            pass
+        candidates.extend(FALLBACK_CHAIN.get(original, []))
+        candidates.extend(["nvidia", "vertex", "claude", "groq", "openai", "openrouter", "mistral", "gemini", "ollama", "lmstudio"])
+        candidates = [name for name in dict.fromkeys(candidates) if name != original]
+        if est_tokens >= 8_000:
+            candidates = [p for p in candidates if p not in ("ollama", "lmstudio")] + [
+                p for p in candidates if p in ("ollama", "lmstudio")
+            ]
+        return candidates
+
+    async def _provider_ready(self, provider: str, est_tokens: int) -> bool:
+        """Check credentials, local generation health, and gateway rate limits."""
+        try:
+            from app.core.llm.model_router import LOCAL_PROVIDERS, get_model_router
+
+            router = get_model_router()
+            if provider in LOCAL_PROVIDERS:
+                if not await router.check_local_health(provider):
+                    return False
+            elif not router._provider_credentialed(provider):
+                return False
+            settings = get_settings()
+            model = self._get_model_name(provider, settings)
+            if get_capabilities(model, provider).context_window < est_tokens:
+                return False
+            limiter = self.limiters.get(provider)
+            return limiter is None or limiter.can_send(est_tokens)
+        except Exception as exc:
+            logger.warning(
+                "provider_readiness_check_failed",
+                provider=provider,
+                error_type=type(exc).__name__,
+            )
+            return False
+
+    async def _find_available_provider(
         self, original: str, est_tokens: int
     ) -> Tuple[Optional[str], bool]:
-        """Walk the fallback chain to find a provider with quota."""
-        chain = FALLBACK_CHAIN.get(original, ["ollama"])
-        for alt in chain:
-            limiter = self.limiters.get(alt)
-            if limiter is None or limiter.can_send(est_tokens):
+        """Walk configured fallback providers, skipping missing credentials and unhealthy locals."""
+        for alt in self._fallback_candidates(original, est_tokens):
+            if await self._provider_ready(alt, est_tokens):
                 logger.info("fallback_provider", original=original, fallback=alt)
                 return alt, True
         return None, True
 
     @staticmethod
     def _get_model_name(provider: str, settings) -> str:
-        model_map = {
-            "gemini": "GEMINI_MODEL",
-            "openai": "OPENAI_MODEL",
-            "mistral": "MISTRAL_MODEL",
-            "ollama": "OLLAMA_MODEL",
-            "lmstudio": "LMSTUDIO_MODEL",
-            "nvidia": "NVIDIA_MODEL",
-        }
-        attr = model_map.get(provider, "GEMINI_MODEL")
-        return getattr(settings, attr, "unknown")
+        from app.core.llm.model_router import get_configured_model
+
+        return get_configured_model(provider, settings)
 
     def get_usage_stats(self) -> Dict[str, Any]:
         """Return usage stats for all vendors + cache stats."""

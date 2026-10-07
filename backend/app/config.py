@@ -24,10 +24,16 @@ class Settings(BaseSettings):
     # Security
     SECRET_KEY: str = "your-secret-key-change-in-production"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
+    ADMIN_API_TOKEN: Optional[str] = None
+    REQUIRE_ADMIN_TOKEN: bool = False
+    LLM_STARTUP_PROBE: bool = False
+    CORS_ORIGINS: Optional[str] = None
 
     # OpenAI / Codex
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_MODEL: str = "gpt-4o"
+    OPENROUTER_API_KEY: Optional[str] = None
+    OPENROUTER_MODEL: str = "openai/gpt-4o-mini"
     CODEX_MODEL: str = "gpt-5.1-codex-max"
 
     # Mistral
@@ -36,25 +42,36 @@ class Settings(BaseSettings):
 
     # Gemini
     GEMINI_API_KEY: Optional[str] = None
-    GEMINI_MODEL: str = "gemini-1.5-flash"
+    GEMINI_MODEL: str = "gemini-3.8-flash"
 
     # Vertex AI
     VERTEX_API_KEY: Optional[str] = None
     VERTEX_PROJECT_ID: Optional[str] = None
     VERTEX_LOCATION: str = "us-central1"
-    VERTEX_MODEL: str = "gemini-1.5-flash-002"
+    VERTEX_MODEL: str = "gemini-3.8-flash"
 
     # NVIDIA
     NVIDIA_API_KEY: Optional[str] = None
     NVIDIA_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
-    NVIDIA_MODEL: str = "z-ai/glm5"
+    NVIDIA_MODEL: str = "z-ai/glm-5.3"
+
+    # Anthropic Claude (used by ClaudeClient via ANTHROPIC_API_KEY)
+    ANTHROPIC_API_KEY: Optional[str] = None
+    CLAUDE_MODEL: str = "claude-3-5-sonnet"
+
+    # Groq (used by GroqClient via GROQ_API_KEY)
+    GROQ_API_KEY: Optional[str] = None
+    GROQ_MODEL: str = "llama-3.1-70b-versatile"
 
     # Local LLMs
-    DEFAULT_LLM_PROVIDER: str = "gemini"  # gemini, vertex, openai, mistral, ollama, lmstudio
+    DEFAULT_LLM_PROVIDER: str = (
+        "gemini"  # gemini, vertex, openai, mistral, ollama, lmstudio
+    )
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "llama3"
     LMSTUDIO_BASE_URL: str = "http://localhost:1234/v1"
     LMSTUDIO_MODEL: str = "local-model"
+    LMSTUDIO_REASONING: str = "off"
 
     # PageIndex
     PAGEINDEX_API_KEY: Optional[str] = None
@@ -71,11 +88,21 @@ class Settings(BaseSettings):
 
     # Agent Settings
     MAX_AGENT_ITERATIONS: int = 10
-    AGENT_TIMEOUT_SECONDS: int = 300
+    AGENT_TIMEOUT_SECONDS: int = 180
     AGENT_MODEL_MAP: Optional[str] = None
 
     # Deal Scoring
     DEAL_SCORING_THRESHOLD: float = 0.65
+
+    # Memory & Context (New PRD Requirements)
+    MEMORY_STALENESS_DAYS: int = 30
+    DEAL_ISOLATION_MODE: bool = True
+    SEARCH_CACHE_TTL: int = 86400  # 24 hours
+    MAX_CLARIFICATION_DEPTH: int = 3
+
+    # OfficeCLI (Document Automation)
+    OFFICECLI_PATH: Optional[str] = None  # Path to officecli binary
+    OFFICECLI_AUTO_DOWNLOAD: bool = True  # Auto-download if not found
 
     class Config:
         env_file = ".env"

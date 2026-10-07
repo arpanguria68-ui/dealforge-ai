@@ -17,3 +17,10 @@ checklists:
   - "AI model training data provenance"
   - "API dependency mapping"
   - "Open-source license (Copyleft) exposure"
+benchmarks:
+  gross_margin_median: 0.75
+  ebitda_margin_median: 0.25
+  revenue_multiple_median: 6.0
+  rule_of_40_median: 0.40
+  nrr_median: 1.10
+

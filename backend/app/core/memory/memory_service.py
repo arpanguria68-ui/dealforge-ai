@@ -1,5 +1,4 @@
-"""
-OFAS Memory Service — Cross-Agent Intelligence via MemoryEntry
+"""OFAS Memory Service — Cross-Agent Intelligence via MemoryEntry
 
 Activates the existing MemoryEntry SQLAlchemy table for persistent
 cross-deal intelligence. Agents can:
@@ -7,13 +6,27 @@ cross-deal intelligence. Agents can:
 - Read insights from other agents for richer context
 - Link memory entries to RAG chunk IDs for citation trails
 - Query by deal, agent, tags, or recency
+
+Enterprise Features:
+- Staleness detection: entries older than configurable TTL are annotated [STALE]
+- Deal isolation mode: prevents cross-deal reasoning leakage
+- Memory decay: low-relevance old entries are deprioritized
 """
 
 from typing import Dict, Any, Optional, List
-from datetime import datetime
+from datetime import datetime, timedelta
 import structlog
 
 logger = structlog.get_logger()
+
+from app.config import get_settings
+
+settings = get_settings()
+
+# ── Configurable Staleness Thresholds (days) ──
+STALENESS_WARNING_DAYS = settings.MEMORY_STALENESS_DAYS
+STALENESS_CRITICAL_DAYS = settings.MEMORY_STALENESS_DAYS * 3
+MAX_MEMORY_ENTRIES_PER_DEAL = 500
 
 
 class MemoryService:
@@ -102,12 +115,19 @@ class MemoryService:
         tags: Optional[List[str]] = None,
         limit: int = 10,
         min_relevance: float = 0.0,
+        deal_isolation: bool = False,
+        annotate_staleness: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Read memory entries with optional filters.
 
         Returns list of dicts with content, agent_type, tags, chunk_id, etc.
         Also increments access_count for returned entries.
+
+        Args:
+            deal_isolation: If True, strictly filters by deal_id to prevent
+                           cross-deal reasoning leakage.
+            annotate_staleness: If True, annotates old entries with [STALE] tags.
         """
         try:
             from app.db.models import MemoryEntry
@@ -119,6 +139,11 @@ class MemoryService:
 
                 if deal_id:
                     query = query.where(MemoryEntry.deal_id == deal_id)
+                elif deal_isolation:
+                    self.logger.warning(
+                        "Deal isolation enabled but no deal_id provided — returning empty"
+                    )
+                    return []
                 if agent_type:
                     query = query.where(MemoryEntry.agent_type == agent_type)
                 if min_relevance > 0:
@@ -144,22 +169,37 @@ class MemoryService:
                     entry.last_accessed = datetime.utcnow()
                 await session.commit()
 
-                return [
-                    {
+                now = datetime.utcnow()
+                output = []
+                for e in entries:
+                    content = e.content
+                    staleness_tag = None
+
+                    # ── Staleness annotation ──
+                    if annotate_staleness and e.created_at:
+                        age_days = (now - e.created_at).days
+                        if age_days >= STALENESS_CRITICAL_DAYS:
+                            staleness_tag = f"CRITICALLY_STALE:{age_days}d"
+                            content = f"[⚠️ STALE: {age_days} days old — verify before using] {content}"
+                        elif age_days >= STALENESS_WARNING_DAYS:
+                            staleness_tag = f"STALE:{age_days}d"
+                            content = f"[STALE: {age_days} days old] {content}"
+
+                    output.append({
                         "id": e.id,
-                        "content": e.content,
+                        "content": content,
                         "agent_type": e.agent_type,
                         "deal_id": e.deal_id,
                         "tags": e.tags or [],
                         "chunk_id": e.pageindex_chunk_id,
                         "relevance_score": e.relevance_score,
                         "access_count": e.access_count,
+                        "staleness": staleness_tag,
                         "created_at": (
                             e.created_at.isoformat() if e.created_at else None
                         ),
-                    }
-                    for e in entries
-                ]
+                    })
+                return output
 
         except Exception as e:
             self.logger.error("Memory read failed", error=str(e))
@@ -192,6 +232,40 @@ class MemoryService:
             self.logger.error("Link to RAG failed", error=str(e))
             return False
 
+    async def cleanup_stale_entries(
+        self,
+        max_age_days: int = 180,
+        min_relevance: float = 0.3,
+    ) -> int:
+        """
+        Remove old, low-relevance memory entries to prevent memory bloat.
+        Returns number of entries removed.
+        """
+        try:
+            from app.db.models import MemoryEntry
+            from sqlalchemy import delete
+
+            cutoff = datetime.utcnow() - timedelta(days=max_age_days)
+            session_factory = self._get_session_factory()
+            async with session_factory() as session:
+                stmt = delete(MemoryEntry).where(
+                    MemoryEntry.created_at < cutoff,
+                    MemoryEntry.relevance_score < min_relevance,
+                )
+                result = await session.execute(stmt)
+                await session.commit()
+                count = result.rowcount
+                self.logger.info(
+                    "Stale memory cleanup",
+                    removed=count,
+                    max_age_days=max_age_days,
+                    min_relevance=min_relevance,
+                )
+                return count
+        except Exception as e:
+            self.logger.error("Memory cleanup failed", error=str(e))
+            return 0
+
     async def get_cross_deal_insights(
         self,
         industry: Optional[str] = None,
@@ -201,6 +275,7 @@ class MemoryService:
         """
         Get insights across multiple deals — useful for pattern recognition.
         Returns the most accessed, highest-relevance entries.
+        NOTE: Cross-deal insights include a disclaimer to prevent reasoning leakage.
         """
         try:
             from app.db.models import MemoryEntry
@@ -233,7 +308,7 @@ class MemoryService:
 
                 return [
                     {
-                        "content": e.content,
+                        "content": f"[CROSS-DEAL INSIGHT — verify applicability] {e.content}",
                         "deal_id": e.deal_id,
                         "agent_type": e.agent_type,
                         "relevance_score": e.relevance_score,

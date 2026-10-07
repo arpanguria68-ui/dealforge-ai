@@ -2,12 +2,12 @@ import { useState, useEffect, useCallback } from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { Skeleton } from '@/components/ui/skeleton';
 import {
     Activity, Key, Zap, Clock, Database, RefreshCw,
-    CheckCircle, XCircle, Loader2, TrendingUp, AlertTriangle, Gauge
+    CheckCircle, XCircle, TrendingUp, AlertTriangle, Gauge
 } from 'lucide-react';
-
-const API_BASE = 'http://localhost:8005';
+import { API_BASE, withAdminAuth } from '@/lib/api-base';
 
 interface VendorUsage {
     vendor: string;
@@ -36,13 +36,22 @@ interface UsageData {
     recent_calls: number;
 }
 
+const LOCAL_VENDORS = new Set(['ollama', 'lmstudio']);
+
 const VENDOR_COLORS: Record<string, { bg: string; border: string; text: string; accent: string }> = {
     gemini: { bg: 'bg-blue-500/10', border: 'border-blue-500/30', text: 'text-blue-600 dark:text-blue-400', accent: 'bg-blue-500' },
     openai: { bg: 'bg-emerald-500/10', border: 'border-emerald-500/30', text: 'text-emerald-600 dark:text-emerald-400', accent: 'bg-emerald-500' },
+    openrouter: { bg: 'bg-cyan-500/10', border: 'border-cyan-500/30', text: 'text-cyan-700 dark:text-cyan-400', accent: 'bg-cyan-500' },
     mistral: { bg: 'bg-orange-500/10', border: 'border-orange-500/30', text: 'text-orange-600 dark:text-orange-400', accent: 'bg-orange-500' },
+    vertex: { bg: 'bg-violet-500/10', border: 'border-violet-500/30', text: 'text-violet-600 dark:text-violet-400', accent: 'bg-violet-500' },
+    nvidia: { bg: 'bg-lime-500/10', border: 'border-lime-500/30', text: 'text-lime-600 dark:text-lime-400', accent: 'bg-lime-500' },
+    claude: { bg: 'bg-amber-500/10', border: 'border-amber-500/30', text: 'text-amber-600 dark:text-amber-400', accent: 'bg-amber-500' },
+    groq: { bg: 'bg-rose-500/10', border: 'border-rose-500/30', text: 'text-rose-600 dark:text-rose-400', accent: 'bg-rose-500' },
     ollama: { bg: 'bg-purple-500/10', border: 'border-purple-500/30', text: 'text-purple-600 dark:text-purple-400', accent: 'bg-purple-500' },
     lmstudio: { bg: 'bg-pink-500/10', border: 'border-pink-500/30', text: 'text-pink-600 dark:text-pink-400', accent: 'bg-pink-500' },
 };
+
+const FALLBACK_COLOR = { bg: 'bg-gray-500/10', border: 'border-gray-500/30', text: 'text-gray-600 dark:text-gray-400', accent: 'bg-gray-500' };
 
 function UsageBar({ label, current, limit, pct, icon }: {
     label: string; current: number; limit: number; pct: number; icon: React.ReactNode
@@ -87,7 +96,10 @@ export function ApiUsageMonitor() {
 
     const fetchUsage = useCallback(async () => {
         try {
-            const res = await fetch(`${API_BASE}/api/v1/llm/usage`, { signal: AbortSignal.timeout(5000) });
+            const res = await fetch(
+                `${API_BASE}/api/v1/llm/usage`,
+                withAdminAuth({ signal: AbortSignal.timeout(5000) })
+            );
             if (res.ok) {
                 setUsage(await res.json());
                 setError(null);
@@ -101,17 +113,21 @@ export function ApiUsageMonitor() {
     }, []);
 
     useEffect(() => {
-        fetchUsage();
+        const initialFetch = window.setTimeout(() => { void fetchUsage(); }, 0);
         const interval = setInterval(fetchUsage, 10000); // Poll every 10s
-        return () => clearInterval(interval);
+        return () => {
+            window.clearTimeout(initialFetch);
+            clearInterval(interval);
+        };
     }, [fetchUsage]);
 
+    // Dynamic groups: any non-local vendor from the backend renders as cloud
     const cloudVendors = usage
-        ? Object.entries(usage.vendors).filter(([k]) => ['gemini', 'openai', 'mistral'].includes(k))
+        ? Object.entries(usage.vendors).filter(([k]) => !LOCAL_VENDORS.has(k))
         : [];
 
     const localVendors = usage
-        ? Object.entries(usage.vendors).filter(([k]) => ['ollama', 'lmstudio'].includes(k))
+        ? Object.entries(usage.vendors).filter(([k]) => LOCAL_VENDORS.has(k))
         : [];
 
     return (
@@ -147,15 +163,27 @@ export function ApiUsageMonitor() {
                 )}
 
                 {loading && !usage ? (
-                    <div className="flex items-center justify-center py-8 text-muted-foreground">
-                        <Loader2 className="h-5 w-5 animate-spin mr-2" /> Loading usage stats...
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4" aria-label="Loading usage stats">
+                        {[0, 1, 2].map(i => (
+                            <div key={i} className="rounded-xl border border-border p-4 space-y-3">
+                                <Skeleton className="h-4 w-24" />
+                                <Skeleton className="h-2 w-full" />
+                                <Skeleton className="h-2 w-full" />
+                                <Skeleton className="h-2 w-2/3" />
+                            </div>
+                        ))}
                     </div>
                 ) : usage && (
                     <>
                         {/* ─── Cloud Providers ─── */}
+                        {cloudVendors.length === 0 && (
+                            <div className="rounded-xl border border-dashed border-border p-6 text-center text-xs text-muted-foreground">
+                                No cloud vendors reporting. Configure API keys in Settings.
+                            </div>
+                        )}
                         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
                             {cloudVendors.map(([name, vendor]) => {
-                                const colors = VENDOR_COLORS[name] || VENDOR_COLORS.gemini;
+                                const colors = VENDOR_COLORS[name] || FALLBACK_COLOR;
                                 return (
                                     <div
                                         key={name}

@@ -29,21 +29,27 @@ class ReportArchitectAgent(BaseAgent):
         context = context or {}
         deal_id = context.get("deal_id", "unknown")
 
-        memory_context = []
-        if deal_id != "unknown" and hasattr(self, "retrieve_context"):
-            memory_context = await self.retrieve_context(
-                f"previous report templates industry {context.get('industry', '')} audience {context.get('audience', '')}",
-                top_k=3,
-            )
-
-        prompt = self._build_prompt(task, context, memory_context)
+        prompt = self._build_prompt(task, context, [])
         system_prompt = self._build_system_prompt()
 
-        response = await self.generate_with_tools(prompt, system_prompt)
+        # Document planning is a bounded formatting task; tools and retrieved facts
+        # would add cost and create an unnecessary path for unsupported claims.
+        try:
+            response = await self.generate_with_routed_fallback(prompt, system_prompt)
+        except Exception as exc:
+            self.logger.error("report_architect_provider_unavailable", error=str(exc))
+            return AgentOutput(
+                success=False,
+                data={},
+                reasoning=f"Report architecture provider unavailable: {type(exc).__name__}.",
+                confidence=0.0,
+            )
 
         try:
-            content = response.get("content", "")
+            content = response.get("content", "") if isinstance(response, dict) else str(response)
             blueprint = self._parse_output(content)
+            if not isinstance(blueprint, dict) or "sections" not in blueprint:
+                raise ValueError("Architect response did not contain a valid blueprint.")
 
             execution_time = (datetime.now() - start_time).total_seconds() * 1000
 
@@ -53,7 +59,7 @@ class ReportArchitectAgent(BaseAgent):
                 reasoning="Generated report configuration blueprint.",
                 confidence=0.9,
                 execution_time_ms=execution_time,
-                tool_calls=response.get("function_calls"),
+                tool_calls=[],
             )
 
         except Exception as e:
@@ -66,36 +72,25 @@ class ReportArchitectAgent(BaseAgent):
             )
 
     def _build_system_prompt(self) -> str:
-        return """You are the Report Architect Agent. Based on the target audience, deal type, and industry context, you select the appropriate report blueprint.
-You define sections, styling flags, and the visual component manifest (which charts to generate).
-
-OUTPUT JSON FORMAT:
-{
-  "report_type": "IC_Memo", 
-  "branding_config": {
-      "primary_color": "#003366",
-      "font": "Helvetica"
-  },
-  "sections": [
-      {"name": "Executive Summary", "depth": "high"},
-      {"name": "Investment Thesis", "depth": "high"},
-      {"name": "Risks & Mitigants", "depth": "medium"}
-  ],
-  "visual_component_manifest": [
-      "ebitda_waterfall",
-      "wacc_breakdown",
-      "driver_sensitivity_tornado"
-  ]
-}
-"""
+        return """You are a document-planning agent for investment and consulting deliverables.
+Choose a concise section order and visuals only from the supplied allow-lists and only when the evidence inventory says the data exists. The input inventory is a capability map, not evidence to embellish. Do not create financial claims, recommendations, mitigations, charts, or sections that imply unavailable analysis.
+Return ONLY JSON with this schema:
+{"sections":["executive_summary"],"visuals":[],"omitted_sections":[],"density":"standard","page_orientation":"portrait","planning_rationale":"One or two concise sentences explaining audience/coverage choices; no hidden chain-of-thought."}
+Use only section IDs provided in allowed_sections and visual IDs provided in available_visuals. density must be compact, standard, or detailed. page_orientation must be portrait or landscape. Keep rationale under 500 characters."""
 
     def _build_prompt(self, task: str, context: Dict, memory: List) -> str:
         company_name = context.get("company_name", "the target company")
         prompt = f"TASK: {task}\n"
         prompt += f"TARGET COMPANY: {company_name}\n"
-        prompt += "CONTEXT:\n"
-        prompt += f"Dealer Industry: {context.get('industry', 'General')}\n"
-        prompt += f"Report Target Audience: {context.get('audience', 'Investment Committee')}\n\n"
+        prompt += "DOCUMENT CONSTRAINTS (JSON):\n"
+        prompt += json.dumps({
+            "industry": context.get("industry", "General"),
+            "audience": context.get("audience", "Investment Committee"),
+            "available_data": context.get("available_data", {}),
+            "evidence_brief": context.get("evidence_brief", {}),
+            "allowed_sections": context.get("allowed_sections", []),
+            "available_visuals": context.get("available_visuals", []),
+        }, ensure_ascii=True, default=str)
 
         if memory:
             prompt += "PREVIOUS REPORT ARCHITECTURES ALIGNED TO THIS CONTEXT:\n"
@@ -112,4 +107,4 @@ OUTPUT JSON FORMAT:
         parsed = extract_and_parse_json(content)
         if parsed:
             return parsed
-        return {"raw_blueprint": content}
+        raise ValueError("Report blueprint response was not valid JSON.")

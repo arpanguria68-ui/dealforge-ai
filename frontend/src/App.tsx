@@ -1,27 +1,38 @@
-import { useState } from 'react';
-import { Dashboard } from './sections/Dashboard';
-import { SettingsPage } from './sections/SettingsPage';
-import { ChatWindow } from './sections/ChatWindow';
-import { TaskBoardPage } from './sections/TaskBoardPage';
-import { RAGDashboard } from './sections/RAGDashboard';
+import { lazy, Suspense, useState } from 'react';
 import { ChatSidebar } from '@/components/ChatSidebar';
 import {
   Zap, LayoutDashboard, Settings, Activity, Briefcase, MessageSquare, Database,
   CheckCircle2, XCircle, Loader2
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Toaster } from '@/components/ui/sonner';
+import { API_BASE } from '@/lib/api-base';
+import { useDealForgeStore } from '@/lib/dealforge-store';
 
 type Page = 'chat' | 'dashboard' | 'tasks' | 'knowledge' | 'settings';
 
+const Dashboard = lazy(() => import('./sections/Dashboard').then(module => ({ default: module.Dashboard })));
+const SettingsPage = lazy(() => import('./sections/SettingsPage').then(module => ({ default: module.SettingsPage })));
+const ChatWindow = lazy(() => import('./sections/ChatWindow').then(module => ({ default: module.ChatWindow })));
+const TaskBoardPage = lazy(() => import('./sections/TaskBoardPage').then(module => ({ default: module.TaskBoardPage })));
+const RAGDashboard = lazy(() => import('./sections/RAGDashboard').then(module => ({ default: module.RAGDashboard })));
+
 function App() {
   const [page, setPage] = useState<Page>('chat');
+  const [visitedPages, setVisitedPages] = useState<Set<Page>>(() => new Set(['chat']));
   const [sysStatus, setSysStatus] = useState<null | 'checking' | 'ok' | 'error'>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const createConversation = useDealForgeStore(state => state.createConversation);
+
+  function navigateTo(nextPage: Page) {
+    setVisitedPages(previous => new Set(previous).add(nextPage));
+    setPage(nextPage);
+  }
 
   async function checkSystemStatus() {
     setSysStatus('checking');
     try {
-      const res = await fetch('http://localhost:8005/health', { signal: AbortSignal.timeout(3000) });
+      const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(3000) });
       setSysStatus(res.ok ? 'ok' : 'error');
     } catch {
       setSysStatus('error');
@@ -38,37 +49,37 @@ function App() {
   ];
 
   return (
-    <div className="min-h-screen font-sans antialiased text-slate-900 dark:text-slate-50 bg-slate-50/50 dark:bg-slate-950/50">
-      <header className="sticky top-0 z-10 flex h-16 items-center border-b bg-background/80 px-6 backdrop-blur-lg">
-        <div className="flex items-center gap-2">
+    <div className="flex h-full min-h-0 w-full flex-col overflow-hidden font-sans antialiased text-slate-900 dark:text-slate-50 bg-slate-50 dark:bg-slate-950">
+      <header className="relative z-10 flex min-h-14 shrink-0 items-center gap-3 border-b bg-background px-4 sm:px-5">
+        <div className="flex shrink-0 items-center gap-2.5">
           <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
             <Zap className="h-4 w-4" />
           </div>
-          <h1 className="text-xl font-bold tracking-tight">DealForge AI</h1>
+          <h1 className="hidden text-base font-semibold tracking-tight sm:block">DealForge</h1>
         </div>
 
         {/* Navigation */}
-        <nav className="ml-8 flex items-center gap-1">
+        <nav className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto sm:ml-2">
           {NAV_ITEMS.map(item => {
             const Icon = item.icon;
             return (
               <button
                 key={item.id}
                 id={`nav-${item.id}`}
-                onClick={() => setPage(item.id)}
-                className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-all duration-200 ${page === item.id
+                onClick={() => navigateTo(item.id)}
+                className={`flex shrink-0 items-center gap-2 rounded-md px-2 py-2 text-sm font-medium transition-colors md:px-3 ${page === item.id
                   ? 'bg-primary/10 text-primary shadow-sm'
                   : 'text-muted-foreground hover:text-foreground hover:bg-slate-100 dark:hover:bg-slate-800'
                   }`}
               >
                 <Icon className="h-4 w-4" />
-                {item.label}
+                <span className="hidden md:inline">{item.label}</span>
               </button>
             );
           })}
         </nav>
 
-        <div className="ml-auto flex items-center space-x-4">
+        <div className="flex shrink-0 items-center gap-2">
           <div className="relative">
             <Button
               variant="outline"
@@ -85,36 +96,57 @@ function App() {
               ) : (
                 <Activity className="mr-2 h-4 w-4" />
               )}
-              {sysStatus === 'ok' ? 'Online' : sysStatus === 'error' ? 'Offline' : 'System Status'}
+              <span className="hidden sm:inline">{sysStatus === 'ok' ? 'Online' : sysStatus === 'error' ? 'Offline' : 'Backend'}</span>
             </Button>
           </div>
-          <Button size="sm" onClick={() => setPage('chat')} id="new-deal-btn">
-            <Briefcase className="mr-2 h-4 w-4" />
-            New Deal Analysis
+          <Button size="sm" onClick={() => { createConversation(); navigateTo('chat'); }} id="new-deal-btn">
+            <Briefcase className="h-4 w-4 sm:mr-2" />
+            <span className="hidden sm:inline">New analysis</span>
           </Button>
         </div>
       </header>
 
-      <main className="flex-1 p-6 md:p-8 pt-6 flex flex-col">
-        <div className={page === 'chat' ? 'flex-1 flex h-full' : 'hidden'}>
-          <ChatSidebar collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed(!sidebarCollapsed)} />
-          <div className="flex-1 flex flex-col">
-            <ChatWindow />
+      <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {visitedPages.has('chat') && (
+          <div className={page === 'chat' ? 'flex min-h-0 flex-1 overflow-hidden' : 'hidden'}>
+            <ChatSidebar collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed(!sidebarCollapsed)} />
+            <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+              <Suspense fallback={<div className="flex h-full items-center justify-center text-sm text-muted-foreground">Loading chat…</div>}>
+                <ChatWindow />
+              </Suspense>
+            </div>
           </div>
-        </div>
-        <div className={page === 'dashboard' ? 'flex-1' : 'hidden'}>
-          <Dashboard onNavigate={setPage} />
-        </div>
-        <div className={page === 'tasks' ? 'flex-1' : 'hidden'}>
-          <TaskBoardPage />
-        </div>
-        <div className={page === 'knowledge' ? 'flex-1' : 'hidden'}>
-          <RAGDashboard />
-        </div>
-        <div className={page === 'settings' ? 'flex-1' : 'hidden'}>
-          <SettingsPage />
-        </div>
+        )}
+        {visitedPages.has('dashboard') && (
+          <div className={page === 'dashboard' ? 'min-h-0 flex-1 overflow-auto p-4 sm:p-6' : 'hidden'}>
+            <Suspense fallback={<div className="p-6 text-sm text-muted-foreground">Loading dashboard…</div>}>
+              <Dashboard onNavigate={navigateTo} />
+            </Suspense>
+          </div>
+        )}
+        {visitedPages.has('tasks') && (
+          <div className={page === 'tasks' ? 'min-h-0 flex-1 overflow-auto p-4 sm:p-6' : 'hidden'}>
+            <Suspense fallback={<div className="p-6 text-sm text-muted-foreground">Loading tasks…</div>}>
+              <TaskBoardPage />
+            </Suspense>
+          </div>
+        )}
+        {visitedPages.has('knowledge') && (
+          <div className={page === 'knowledge' ? 'min-h-0 flex-1 overflow-auto p-4 sm:p-6' : 'hidden'}>
+            <Suspense fallback={<div className="p-6 text-sm text-muted-foreground">Loading knowledge…</div>}>
+              <RAGDashboard />
+            </Suspense>
+          </div>
+        )}
+        {visitedPages.has('settings') && (
+          <div className={page === 'settings' ? 'min-h-0 flex-1 overflow-auto p-4 sm:p-6' : 'hidden'}>
+            <Suspense fallback={<div className="p-6 text-sm text-muted-foreground">Loading settings…</div>}>
+              <SettingsPage />
+            </Suspense>
+          </div>
+        )}
       </main>
+      <Toaster richColors position="bottom-right" />
     </div>
   );
 }
