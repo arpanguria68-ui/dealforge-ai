@@ -12,6 +12,8 @@ import {
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { CodeBlock } from '@/components/chat/CodeBlock';
+import { StarterPrompts } from '@/components/chat/EmptyState';
 import { useDealForgeStore } from '@/lib/dealforge-store';
 import { API_BASE, withAdminAuth } from '@/lib/api-base';
 import { isDealAnalysisRequest } from '@/lib/chat-intent';
@@ -885,8 +887,26 @@ export function ChatWindow() {
     const fileInputRef = useRef<HTMLInputElement>(null);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+    // Follow new content only while the reader is at the bottom; otherwise show a
+    // "Jump to latest" button instead of yanking them away from what they're reading.
+    const [atBottom, setAtBottom] = useState(true);
+    const atBottomRef = useRef(true);
     const scrollToBottom = () => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    useEffect(() => { scrollToBottom(); }, [messages.length, followUps.length, phase]);
+    useEffect(() => {
+        const el = messagesEndRef.current;
+        if (!el || typeof IntersectionObserver === 'undefined') return;
+        const observer = new IntersectionObserver(([entry]) => {
+            atBottomRef.current = entry.isIntersecting;
+            setAtBottom(entry.isIntersecting);
+        }, { threshold: 0, rootMargin: '0px 0px 80px 0px' });
+        observer.observe(el);
+        return () => observer.disconnect();
+    }, []);
+    useEffect(() => {
+        const last = messages[messages.length - 1];
+        if (atBottomRef.current || last?.role === 'user') scrollToBottom();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [messages.length, followUps.length, phase]);
 
     const autoResize = useCallback(() => {
         const ta = textareaRef.current;
@@ -1695,12 +1715,11 @@ export function ChatWindow() {
                     p: ({ children }) => <p className="mb-2 leading-relaxed">{children}</p>,
                     strong: ({ children }) => <strong className="font-semibold text-white">{children}</strong>,
                     em: ({ children }) => <em className="italic text-white/70">{children}</em>,
+                    pre: ({ children }) => <>{children}</>,
                     code: ({ className, children, ...props }) => {
                         const isBlock = className?.includes('language-');
                         return isBlock ? (
-                            <pre className="bg-black/40 text-emerald-300 rounded-lg p-3 my-2 overflow-x-auto text-xs border border-white/5">
-                                <code className={className} {...props}>{children}</code>
-                            </pre>
+                            <CodeBlock className={className}>{children}</CodeBlock>
                         ) : (
                             <code className="bg-white/10 px-1.5 py-0.5 rounded text-xs font-mono text-cyan-300" {...props}>{children}</code>
                         );
@@ -2082,12 +2101,29 @@ export function ChatWindow() {
                 {/* Messages */}
                 <ScrollArea className="min-h-0 flex-1" type="always">
                     <div className="mx-auto w-full max-w-5xl space-y-5 px-3 py-5 sm:px-6 sm:py-6">
-                        {/* renderMessage only wires event handlers; refs are read in those handlers, not during render. */}
-                        {/* eslint-disable-next-line react-hooks/refs */}
-                        {messages.map(renderMessage)}
+                        <div role="log" aria-live="polite" aria-label="Conversation" className="space-y-5">
+                            {/* renderMessage only wires event handlers; refs are read in those handlers, not during render. */}
+                            {/* eslint-disable-next-line react-hooks/refs */}
+                            {messages.map(renderMessage)}
+                        </div>
+                        {!isProcessing && !messages.some(m => m.role === 'user') && (
+                            <StarterPrompts hasDeal={Boolean(activeDealId)} onPick={q => handleSend(q)} />
+                        )}
                         <div ref={messagesEndRef} className="h-1 w-full" />
                     </div>
                 </ScrollArea>
+                {!atBottom && messages.length > 0 && (
+                    <div className="pointer-events-none relative z-10 h-0">
+                        <button
+                            type="button"
+                            onClick={scrollToBottom}
+                            aria-label="Jump to latest message"
+                            className="pointer-events-auto absolute -top-12 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-white/15 bg-slate-900/95 px-3 py-1.5 text-xs text-white/80 shadow-lg backdrop-blur transition-colors hover:bg-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400"
+                        >
+                            <ChevronDown className="h-3.5 w-3.5" /> Jump to latest
+                        </button>
+                    </div>
+                )}
 
                 {approvalRequest && (
                     <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-amber-300/20 bg-amber-300/[0.06] px-4 py-3 sm:px-6" role="status">
@@ -2133,7 +2169,7 @@ export function ChatWindow() {
                             <span key={i} className="inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-lg bg-white/5 border border-white/10 text-white/60">
                                 <Paperclip className="h-3 w-3" />
                                 {f.name}
-                                <button onClick={() => setUploadedFiles(prev => prev.filter((_, j) => j !== i))} className="ml-1 text-white/30 hover:text-white/60">×</button>
+                                <button onClick={() => setUploadedFiles(prev => prev.filter((_, j) => j !== i))} aria-label={`Remove ${f.name}`} className="ml-1 text-white/30 hover:text-white/60">×</button>
                             </span>
                         ))}
                     </div>
@@ -2148,7 +2184,8 @@ export function ChatWindow() {
                             id="chat-input"
                             value={input}
                             onChange={e => setInput(e.target.value)}
-                            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
+                            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); handleSend(); } }}
+                            aria-label="Message DealForge"
                             placeholder={followUps.length > 0 && !isProcessing ? 'Ask a follow-up...' : 'Ask anything...'}
                             className="w-full min-h-[48px] max-h-[150px] resize-none bg-transparent px-4 py-3.5 pr-12 text-sm text-white placeholder:text-white/30 focus:outline-none"
                             rows={1}
@@ -2158,6 +2195,7 @@ export function ChatWindow() {
                         {/* Send button inside textarea */}
                         <button
                             onClick={() => handleSend()}
+                            aria-label={isProcessing ? 'Working' : 'Send message'}
                             disabled={isProcessing || (!input.trim() && uploadedFiles.length === 0)}
                             className="absolute right-3 bottom-3 w-8 h-8 rounded-lg flex items-center justify-center transition-all duration-200
                                 disabled:opacity-30 disabled:cursor-not-allowed
@@ -2187,6 +2225,7 @@ export function ChatWindow() {
                             />
                             <button
                                 onClick={() => fileInputRef.current?.click()}
+                                aria-label="Attach files"
                                 className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all duration-200 bg-white/5 hover:bg-white/10 border border-white/10 hover:border-white/20 text-white/50 hover:text-white/70"
                             >
                                 <Paperclip className="h-3.5 w-3.5" />
