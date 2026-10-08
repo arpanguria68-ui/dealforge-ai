@@ -262,9 +262,16 @@ class TemplateMergeRequest(BaseModel):
     template_path: str
     output_path: str
     data: Dict[str, Any]
-    final_score: Optional[float] = None
-    final_recommendation: Optional[str] = None
-    created_at: str
+
+
+def _confined_path(path: str, *, enforce: bool = True) -> str:
+    """Resolve a caller-supplied server path inside SERVER_PATH_ROOTS or 400."""
+    from app.core.path_guard import PathNotAllowed, resolve_within_roots
+
+    try:
+        return str(resolve_within_roots(path, enforce=enforce))
+    except PathNotAllowed as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 class AgentRunRequest(BaseModel):
@@ -755,7 +762,9 @@ async def generate_deal_report(
 
 
 @app.post("/api/v1/documents/merge")
-async def merge_document_template(request: TemplateMergeRequest):
+async def merge_document_template(
+    request: TemplateMergeRequest, _: bool = Depends(require_admin_token)
+):
     """
     Merge JSON data into a DOCX/XLSX/PPTX template using OfficeCLI.
 
@@ -771,20 +780,18 @@ async def merge_document_template(request: TemplateMergeRequest):
             detail="OfficeCLI not available. Install officecli binary.",
         )
 
-    result = await service.merge_template(
-        request.template_path,
-        request.output_path,
-        request.data,
-    )
+    template_path = _confined_path(request.template_path)
+    output_path = _confined_path(request.output_path)
+    result = await service.merge_template(template_path, output_path, request.data)
 
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Merge failed"))
 
-    return {"success": True, "output": request.output_path}
+    return {"success": True, "output": output_path}
 
 
 @app.get("/api/v1/documents/template/{template_path:path}/variables")
-async def get_template_vars(template_path: str):
+async def get_template_vars(template_path: str, _: bool = Depends(require_admin_token)):
     """Extract {{variable}} names from a template"""
     from app.core.reports.officecli_service import get_officecli_service
 
@@ -792,7 +799,7 @@ async def get_template_vars(template_path: str):
     if not service.is_available():
         raise HTTPException(status_code=503, detail="OfficeCLI not available")
 
-    variables = service.get_template_variables(template_path)
+    variables = service.get_template_variables(_confined_path(template_path))
     return {"variables": variables}
 
 
@@ -813,7 +820,9 @@ class BatchMergeRequest(BaseModel):
 
 
 @app.post("/api/v1/documents/batch")
-async def batch_merge_documents(request: BatchMergeRequest):
+async def batch_merge_documents(
+    request: BatchMergeRequest, _: bool = Depends(require_admin_token)
+):
     """
     Batch merge multiple templates in parallel or sequential.
 
@@ -825,6 +834,11 @@ async def batch_merge_documents(request: BatchMergeRequest):
     service = get_officecli_service()
     if not service.is_available():
         raise HTTPException(status_code=503, detail="OfficeCLI not available")
+
+    # Validate every path up front so a bad item rejects the whole batch.
+    for item in request.items:
+        item.template_path = _confined_path(item.template_path)
+        item.output_path = _confined_path(item.output_path)
 
     results = []
     if request.parallel:
@@ -1605,6 +1619,13 @@ async def documents_ingest_directory(
     background_tasks: __import__("fastapi").BackgroundTasks,
 ):
     """Ingest documents from a local directory in the background."""
+    # Server deployments confine imports to SERVER_PATH_ROOTS (otherwise any
+    # caller could index and read back arbitrary server files); local desktop
+    # mode keeps importing the user's own folders. See app/core/path_guard.py.
+    from app.core.path_guard import restriction_enabled
+
+    if restriction_enabled():
+        request.directory_path = _confined_path(request.directory_path)
     # We do NOT validate path.is_dir() here because the UI might send
     # a Windows path (e.g., C:\) while this backend runs in a Linux container.
     # The background task will attempt resolution and log any errors gracefully.
@@ -1625,27 +1646,38 @@ async def documents_ingest_directory(
 async def documents_ingest_url(request: URLIngestRequest):
     """Ingest content from a URL directly into the Knowledge Base."""
     try:
-        from app.core.tools.scraper_tool import WebScraperTool
+        # app.core.tools.scraper_tool never existed, so this endpoint always
+        # failed; use the router's scraper (blocks private/internal addresses).
+        from app.core.tools.tool_router import WebScraperTool
 
         scraper = WebScraperTool()
-        result = await scraper.execute(request.url)
+        result = await scraper.execute(request.url, max_chars=200_000)
         if not result.success:
             raise HTTPException(
                 status_code=400, detail=f"Scraper failed: {result.error}"
             )
+        text = (result.data or {}).get("text", "") if isinstance(result.data, dict) else str(result.data or "")
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="No extractable text at URL")
 
         client = get_pageindex_client()
-        metadata = {"original_filename": request.url, "source": "url"}
+        metadata = {
+            "original_filename": (result.data or {}).get("title") or request.url,
+            "source": "url",
+            "url": request.url,
+        }
         if request.deal_id:
             metadata["deal_id"] = request.deal_id
 
-        res = await client.ingest_text(result.data, metadata=metadata)
+        res = await client.ingest_text(text, metadata=metadata)
 
         return {
             "status": "indexed",
             "url": request.url,
             "index_id": getattr(res, "index_id", ""),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("url_ingest_failed", url=request.url, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
@@ -2664,7 +2696,9 @@ async def reorder_tasks(list_id: str, body: Dict[str, Any]):
 
 
 @app.post("/api/v1/knowledge/ingest")
-async def ingest_knowledge_base(body: Optional[Dict[str, Any]] = None):
+async def ingest_knowledge_base(
+    body: Optional[Dict[str, Any]] = None, _: bool = Depends(require_admin_token)
+):
     """Batch-ingest knowledge base documents into RAG."""
     from app.core.tasks.knowledge_ingestion import KnowledgeIngestionService
 
@@ -2675,7 +2709,7 @@ async def ingest_knowledge_base(body: Optional[Dict[str, Any]] = None):
 
     directory = body.get("directory")
     if directory:
-        result = await service.ingest_directory(directory)
+        result = await service.ingest_directory(_confined_path(directory))
     else:
         result = await service.ingest_all_knowledge_bases()
 
