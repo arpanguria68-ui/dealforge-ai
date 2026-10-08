@@ -42,3 +42,6 @@ temp_diff.txt
 backend/data/pageindex/documents/
 gemini.env
 tmp/
+
+# OfficeCLI binary auto-downloaded at runtime
+backend/data/officecli/officecli-linux-x64
