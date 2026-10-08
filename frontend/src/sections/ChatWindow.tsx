@@ -15,6 +15,9 @@ import remarkGfm from 'remark-gfm';
 import { useDealForgeStore } from '@/lib/dealforge-store';
 import { API_BASE, withAdminAuth } from '@/lib/api-base';
 
+// Stable fallback for stored messages without a timestamp (keeps rendering pure).
+const FALLBACK_TIMESTAMP = Date.now();
+
 // ─── Types ───
 
 interface Message {
@@ -707,8 +710,7 @@ export function ChatWindow() {
     const eventSourceRef = useRef<EventSource | null>(null);
 
     // Use ref to avoid stale closure issues
-    const addMessageRef = useRef(addMessage);
-    addMessageRef.current = addMessage;
+    const addMessageRef = useRef<(msg: Omit<Message, 'id' | 'timestamp'>) => void>(() => {});
 
     // SSE streaming connection (with exponential-backoff reconnect)
     const sseRetryRef = useRef(0);
@@ -850,11 +852,14 @@ export function ChatWindow() {
             )
         );
 
+        // Switching conversations resets all per-conversation state at once.
+        /* eslint-disable react-hooks/set-state-in-effect */
         setActiveDealId(dealId);
         setDealCompleted(completed);
         completedResultsRef.current = [];
         taskListRef.current = [];
         setFollowUps([]);
+        /* eslint-enable react-hooks/set-state-in-effect */
         disconnectSSE();
     }, [activeConv?.id, disconnectSSE]);
 
@@ -890,6 +895,10 @@ export function ChatWindow() {
         }
         return msgId;
     }
+
+    useEffect(() => {
+        addMessageRef.current = addMessage;
+    });
 
     function updateMessage(id: string, updates: Partial<Message>) {
         if (!convId) return;
@@ -1125,6 +1134,8 @@ export function ChatWindow() {
                 // The plan request remains authoritative; this snapshot only helps recover lost responses.
             }
 
+            // Runs inside an async event handler, not during render.
+            // eslint-disable-next-line react-hooks/purity
             const planRequestStartedAt = Date.now();
             let planResponse: PlanResponse | null = null;
             let planRes: Response | null = null;
@@ -1679,7 +1690,7 @@ export function ChatWindow() {
             ? msg.content
             : 'Saved message content is unavailable.';
         const agentName = typeof msg.agentName === 'string' ? msg.agentName : '';
-        const timestamp = msg.timestamp instanceof Date ? msg.timestamp : new Date(msg.timestamp || Date.now());
+        const timestamp = msg.timestamp instanceof Date ? msg.timestamp : new Date(msg.timestamp || FALLBACK_TIMESTAMP);
         const agentKey = agentName.toLowerCase().replace(/\s/g, '_') || 'system';
         const agentStyle = AGENT_STYLES[agentKey] || AGENT_STYLES.system;
         const AgentIcon = agentStyle.icon;
@@ -2029,6 +2040,8 @@ export function ChatWindow() {
                 {/* Messages */}
                 <ScrollArea className="min-h-0 flex-1" type="always">
                     <div className="mx-auto w-full max-w-5xl space-y-5 px-3 py-5 sm:px-6 sm:py-6">
+                        {/* renderMessage only wires event handlers; refs are read in those handlers, not during render. */}
+                        {/* eslint-disable-next-line react-hooks/refs */}
                         {messages.map(renderMessage)}
                         <div ref={messagesEndRef} className="h-1 w-full" />
                     </div>

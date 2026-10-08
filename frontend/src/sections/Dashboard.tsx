@@ -221,9 +221,12 @@ function DealDetailPanel({
     }, [deal.id]);
 
     useEffect(() => {
+        // Data fetching on mount/deal change; the fetchers set state when they resolve.
+        /* eslint-disable react-hooks/set-state-in-effect */
         fetchManifest();
         fetchAgentMessages();
         fetchEvidenceBrief();
+        /* eslint-enable react-hooks/set-state-in-effect */
     }, [fetchManifest, fetchAgentMessages, fetchEvidenceBrief]);
 
     const documentBrief = () => {
@@ -903,6 +906,7 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
     }, []);
 
     useEffect(() => {
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- initial load; the fetcher sets state when it resolves
         fetchMetrics();
         const interval = setInterval(fetchMetrics, 15000);
         return () => clearInterval(interval);
