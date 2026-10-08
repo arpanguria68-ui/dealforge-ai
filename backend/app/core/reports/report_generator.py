@@ -393,11 +393,11 @@ def generate_pptx(
         y_offset = 1.5
         for risk in risk_matrix[:4]: # Top 4
             r_title = risk.get("risk", "Unknown Risk")
-            r_sev = risk.get("severity", "Medium")
-            r_mit = risk.get("mitigation", "N/A")
-            r_evid = risk.get("evidence", "Analysis pending further diligence.")
-            
-            color = ACCENT_RED if r_sev.lower() == "high" else SECONDARY
+            r_sev = _severity_label(risk.get("severity", "Medium"))
+            r_mit = risk.get("mitigation") or "N/A"
+            r_evid = risk.get("evidence") or "Analysis pending further diligence."
+
+            color = ACCENT_RED if r_sev.lower() in ("high", "critical") else SECONDARY
             
             add_text_box(slide, Inches(0.5), Inches(y_offset), Inches(12), Inches(0.4), f"● {r_title} ({r_sev})", font_size=14, bold=True, color=color)
             add_text_box(slide, Inches(0.8), Inches(y_offset + 0.35), Inches(5.5), Inches(0.8), f"Mitigation: {r_mit}", font_size=11, color=BLACK)
@@ -902,9 +902,11 @@ def generate_excel(
         ws6.cell(row=2, column=1, value="No structured risk findings recorded")
     for r, risk in enumerate(risks, 2):
         name = risk.get("risk", risk.get("description", f"Risk {r-1}"))
-        cat = risk.get("category", "General")
+        cat = str(risk.get("category") or "General")
         sev = risk.get("severity", "Not rated")
-        mit = risk.get("mitigation", "")
+        if isinstance(sev, (int, float)) and not isinstance(sev, bool):
+            sev = _severity_label(sev)
+        mit = risk.get("mitigation") or ""
         if isinstance(mit, list):
             mit = ", ".join(mit)
             
@@ -1976,6 +1978,20 @@ def generate_docx(
     doc.save(buf)
     buf.seek(0)
     return buf.read()
+
+
+def _severity_label(value: Any) -> str:
+    """Agents report severity as words or numbers (1-5 or 1-10); render a label.
+
+    The deck generator called .lower() on it, so a numeric severity crashed
+    the PPTX and with it the whole legacy bundle.
+    """
+    if isinstance(value, bool) or value is None:
+        return "Not rated"
+    if isinstance(value, (int, float)):
+        score = float(value) * 2 if value <= 5 else float(value)
+        return "Critical" if score >= 9 else "High" if score >= 7 else "Medium" if score >= 4 else "Low"
+    return str(value)
 
 
 def _report_number(value: Any) -> str:

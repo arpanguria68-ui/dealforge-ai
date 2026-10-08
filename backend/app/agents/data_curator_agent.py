@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional, List
 import json
 from datetime import datetime
 
+from app.core.prompt_context import render_context
 from app.agents.base import BaseAgent, AgentOutput
 from app.core.json_helpers import extract_and_parse_json
 
@@ -91,7 +92,7 @@ RULES:
         prompt = f"TASK: {task}\n"
         prompt += f"TARGET COMPANY: {company_name}\n\n"
         prompt += "AGENT OUTPUTS TO SYNTHESIZE:\n"
-        prompt += json.dumps(agent_outputs, default=str, indent=2) + "\n\n"
+        prompt += render_context(agent_outputs, 12000, priority=()) + "\n\n"
 
         if memory:
             prompt += "CROSS-DEAL INSIGHTS (PRIOR DEALS MEMORY):\n"

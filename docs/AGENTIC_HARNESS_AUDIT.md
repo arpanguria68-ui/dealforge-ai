@@ -385,3 +385,69 @@ error to the model instead of crashing inside the tool.
   fixed 24K chars (≈6.9K tokens, more than an 8K model has free). Now it
   ranges from a 2K-char floor to the 24K-char ceiling, and the per-result
   share scales with the number of results.
+
+## 8. Adaptive document workflow
+
+### What the Reports Hub did before
+- **One fixed deliverable:** every request produced a "Due Diligence Report"
+  in all four formats, rendered one after another.
+- **Blueprint mostly ignored:** generators used only DOCX orientation and
+  density from it.
+- **ReportArchitect never called** in this path.
+- **Cross-agent risks lost:** the deterministic narrative always produced an
+  empty `risk_matrix`, so risks from legal, red-team and knowledge-graph
+  sources never reached the documents.
+- **Synthesis tasks disconnected from their inputs** in the chat flow (memo,
+  curator, reasoning, scoring, architect). They saw only whatever the client
+  sent in `agent_outputs`, and the memo agent's `agent_results` was never set.
+
+### Two bugs that blocked publishing
+- **Every Office file rejected:** OfficeCLI reports a clean document as
+  `{"success": true, "data": {"count": 0, "issues": []}}`. The endpoint
+  treated that non-empty dict as "issues", so whenever OfficeCLI was
+  installed (auto-download default) every DOCX, PPTX and XLSX was rejected
+  and the four-format bundle could never publish. Issues are now normalized,
+  and only error-level items block.
+- **Deck crash on numeric severity:** the PPTX generator called `.lower()` on
+  risk severity, so numeric severities (common from the risk agent) crashed
+  the deck and failed the whole bundle. The Excel generator also crashed on
+  a null category or mitigation.
+
+### New flow (`app/core/reports/document_workflow.py`)
+1. **Understand:** document type (`ic_memo`, `one_pager`, `risk_report`,
+   `financial_summary`, or `dd_report` for the full legacy pack), formats and
+   audience are inferred from a plain-language request. Explicit fields win,
+   and assumptions are reported.
+2. **Inventory:** each section maps to its feeding agents and coverage. A
+   single deduplicated risk register merges every agent's risk fields,
+   red-team flags and the knowledge graph, with severity normalized to /10.
+3. **Plan:** keeps evidenced sections. Missing required sections become
+   explicit gaps, with the owning agents and a question for the user.
+   ReportArchitect may reorder or trim within that allow-list, but can't add
+   sections or drop required ones.
+4. **Fill gaps** (`fill_gaps`, at most `max_gap_agents`): runs the owning
+   agents concurrently, then re-plans with their outputs.
+5. **Compose:** builds the document model from curated, cited data only
+   (no new model prose). Empty sections are never emitted; they're reported.
+6. **Render:** only the requested formats, concurrently (DOCX, PDF and XLSX
+   renderers; decks use the legacy generator), each structurally validated.
+7. **Review:** the bundle publishes as pending review, with the plan stored
+   in metadata. Approve and bundle download now check the bundle against its
+   planned formats.
+
+### API
+- `POST /deals/{id}/documents/plan` is a dry run: plan, coverage, gaps,
+  assumptions and questions.
+- `POST /deals/{id}/documents/generate` takes an optional body
+  (`request`, `doc_type`, `formats`, `audience`, `fill_gaps`,
+  `max_gap_agents`, `use_architect`). With no body it behaves exactly as
+  before, except the four formats now render concurrently.
+
+### Chat flow
+`execute-task` now passes each synthesis task its persisted dependency
+results (`agent_results` and `agent_outputs`) and the knowledge-graph
+findings.
+
+### UI
+The Reports Hub has a "What do you need?" request box, a Preview plan step
+and a "run agents to fill missing sections" toggle.

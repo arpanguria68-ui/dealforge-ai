@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Progress } from '@/components/ui/progress';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { Input } from '@/components/ui/input';
 import {
     BarChart as BarChartIcon, Activity, FileText, AlertTriangle, ChevronRight,
     Target, TrendingUp, DollarSign, Briefcase, RefreshCw,
@@ -45,6 +46,18 @@ interface DealDocumentManifest {
     release_status?: 'pending_review' | 'approved';
     review_status?: string;
     approved_by?: string;
+}
+
+interface DocumentPlanPreview {
+    doc_type: string;
+    title: string;
+    formats: string[];
+    audience: string;
+    sections: { key: string; title: string }[];
+    gaps: string[];
+    gap_agents: string[];
+    assumptions: string[];
+    questions: string[];
 }
 
 interface EvidenceBrief {
@@ -162,6 +175,11 @@ function DealDetailPanel({
     const [activeTab, setActiveTab] = useState<'details' | 'console'>('details');
     const [evidenceBrief, setEvidenceBrief] = useState<EvidenceBrief | null>(null);
     const [reportNotice, setReportNotice] = useState<{ tone: 'success' | 'warning' | 'error'; message: string } | null>(null);
+    // Adaptive brief: empty request keeps the legacy full pack (all four formats).
+    const [docRequest, setDocRequest] = useState('');
+    const [fillGaps, setFillGaps] = useState(false);
+    const [docPlan, setDocPlan] = useState<DocumentPlanPreview | null>(null);
+    const [isPlanning, setIsPlanning] = useState(false);
 
     const fetchManifest = useCallback(async () => {
         try {
@@ -208,13 +226,41 @@ function DealDetailPanel({
         fetchEvidenceBrief();
     }, [fetchManifest, fetchAgentMessages, fetchEvidenceBrief]);
 
+    const documentBrief = () => {
+        const request = docRequest.trim();
+        if (!request && !fillGaps) return undefined;
+        return { request, fill_gaps: fillGaps };
+    };
+
+    const handlePreviewPlan = async () => {
+        setIsPlanning(true);
+        setReportNotice(null);
+        try {
+            const res = await fetch(`${API_BASE}/api/v1/deals/${deal.id}/documents/plan`, withAdminAuth({
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(documentBrief() ?? {}),
+            }));
+            const result = await res.json() as { plan?: DocumentPlanPreview; detail?: string };
+            if (!res.ok || !result.plan) throw new Error(result.detail || `Planning failed (HTTP ${res.status}).`);
+            setDocPlan(result.plan);
+        } catch (err) {
+            setReportNotice({ tone: 'error', message: err instanceof Error ? err.message : 'Could not plan the document.' });
+        } finally {
+            setIsPlanning(false);
+        }
+    };
+
     const handleGenerate = async () => {
         setIsGenerating(true);
         setReportNotice(null);
         try {
+            const brief = documentBrief();
             const res = await fetch(
                 `${API_BASE}/api/v1/deals/${deal.id}/documents/generate`,
-                withAdminAuth({ method: 'POST' })
+                withAdminAuth(brief
+                    ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(brief) }
+                    : { method: 'POST' })
             );
             const result = await res.json() as {
                 status?: 'complete' | 'partial' | 'failed';
@@ -684,6 +730,57 @@ function DealDetailPanel({
                         </div>
                     )}
 
+                    <div className="space-y-2 rounded-lg border bg-background p-3">
+                        <label htmlFor="doc-request" className="text-xs font-medium">What do you need?</label>
+                        <Input
+                            id="doc-request"
+                            value={docRequest}
+                            onChange={event => { setDocRequest(event.target.value); setDocPlan(null); }}
+                            placeholder="e.g. IC memo for the board as PDF, one-pager, risk report in Excel"
+                            className="h-8 text-xs"
+                            maxLength={4000}
+                        />
+                        <div className="flex items-center justify-between gap-2">
+                            <label className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                                <input
+                                    type="checkbox"
+                                    checked={fillGaps}
+                                    onChange={event => { setFillGaps(event.target.checked); setDocPlan(null); }}
+                                />
+                                Run agents to fill missing sections
+                            </label>
+                            <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-7 text-xs"
+                                onClick={handlePreviewPlan}
+                                disabled={isPlanning || deal.status !== 'completed' && deal.status !== 'ready'}
+                            >
+                                {isPlanning ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+                                Preview plan
+                            </Button>
+                        </div>
+                        {docPlan && (
+                            <div className="space-y-1 border-t pt-2 text-[11px]">
+                                <p className="font-semibold">
+                                    {docPlan.title} · {docPlan.formats.map(f => f.toUpperCase()).join(', ')} · for {docPlan.audience}
+                                </p>
+                                <p className="text-muted-foreground">
+                                    Sections: {docPlan.sections.map(section => section.title).join(' → ')}
+                                </p>
+                                {docPlan.gaps.length > 0 && (
+                                    <p className="text-amber-700 dark:text-amber-400">
+                                        Missing evidence: {docPlan.gaps.join(', ')}
+                                        {docPlan.gap_agents.length > 0 ? ` (can run ${docPlan.gap_agents.join(', ')})` : ''}
+                                    </p>
+                                )}
+                                {[...docPlan.assumptions, ...docPlan.questions].map((note, index) => (
+                                    <p key={index} className="text-muted-foreground">• {note}</p>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+
                     {manifest.length === 0 ? (
                         <div className="rounded-xl border border-dashed p-6 text-center space-y-3 bg-background/50">
                             <div className="mx-auto w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center">
@@ -702,7 +799,7 @@ function DealDetailPanel({
                                 disabled={isGenerating || deal.status !== 'completed' && deal.status !== 'ready'}
                             >
                                 {isGenerating ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-                                {isGenerating ? 'Generating Artifacts...' : 'Generate All Reports'}
+                                {isGenerating ? 'Generating Artifacts...' : docRequest.trim() ? 'Generate Document' : 'Generate All Reports'}
                             </Button>
                         </div>
                     ) : (

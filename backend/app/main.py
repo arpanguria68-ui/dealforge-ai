@@ -7,6 +7,7 @@ from fastapi import (
     UploadFile,
     File,
     Request,
+    Body,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -63,6 +64,16 @@ REPORT_DOWNLOAD_HEADERS = {
     "X-Content-Type-Options": "nosniff",
 }
 REQUIRED_REPORT_FORMATS = {"docx", "pdf", "pptx", "xlsx"}
+
+
+def _expected_report_formats(documents: List[Dict[str, Any]]) -> set:
+    """Formats a bundle must contain: what it was planned with, else the legacy four."""
+    planned = {tuple(sorted(d.get("expected_formats") or [])) for d in documents}
+    if len(planned) == 1:
+        only = next(iter(planned))
+        if only:
+            return set(only)
+    return REQUIRED_REPORT_FORMATS
 
 
 def _explicit_public_ticker(text: str) -> Optional[str]:
@@ -955,8 +966,150 @@ def _require_approved_report(metadata: Optional[Dict[str, Any]]) -> None:
         )
 
 
+class DocumentGenerateRequest(BaseModel):
+    """Optional brief for an adaptive deliverable (omit for the legacy full pack)."""
+
+    request: str = Field("", max_length=4000, description="Plain-language ask, e.g. 'IC memo for the board as PDF'")
+    doc_type: Optional[str] = Field(None, description="dd_report | ic_memo | one_pager | risk_report | financial_summary")
+    formats: Optional[List[str]] = Field(None, description="Subset of docx, pdf, xlsx, pptx")
+    audience: Optional[str] = Field(None, max_length=120)
+    fill_gaps: bool = Field(False, description="Run the agents that own missing required sections")
+    max_gap_agents: int = Field(2, ge=0, le=4)
+    use_architect: bool = True
+
+    def is_adaptive(self) -> bool:
+        return bool(
+            self.request.strip() or (self.doc_type and self.doc_type != "dd_report")
+            or self.formats or self.fill_gaps or self.audience
+        )
+
+    def to_workflow_request(self):
+        from app.core.reports.document_workflow import DocumentRequest
+
+        return DocumentRequest(
+            request=self.request, doc_type=self.doc_type, formats=self.formats, audience=self.audience,
+            fill_gaps=self.fill_gaps, max_gap_agents=self.max_gap_agents, use_architect=self.use_architect,
+        )
+
+
+async def _load_report_inputs(deal_id: str):
+    """Deal + persisted task results (activity only enriches). Shared by plan/generate."""
+    redis_store = RedisStore.get_instance()
+    deal = await redis_store.get_deal(deal_id)
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    if deal.get("status") not in {"completed", "ready"}:
+        raise HTTPException(status_code=409, detail="Complete the analysis before generating deliverables.")
+    from app.core.tasks.task_manager import get_task_manager
+    from app.core.reports.document_planner import build_report_agent_results
+
+    task_lists = await get_task_manager().get_lists_for_deal(deal_id)
+    saved_tasks = [item for task_list in task_lists for item in task_list.items]
+    if task_lists and (
+        not any(item.status == "done" and isinstance(item.result, dict) for item in saved_tasks)
+        or any(item.status != "done" or not isinstance(item.result, dict) for item in saved_tasks)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Saved analysis still has unfinished or unpersisted tasks; finish or review the run before generating deliverables.",
+        )
+    activities = await redis_store.get_deal_activity(deal_id)
+    return deal, task_lists, activities, build_report_agent_results(task_lists, activities)
+
+
+@app.post("/api/v1/deals/{deal_id}/documents/plan")
+async def plan_deal_documents(
+    deal_id: str,
+    body: Optional[DocumentGenerateRequest] = Body(None),
+    _: bool = Depends(require_admin_token),
+):
+    """Outline first: the adaptive plan (type, formats, sections, coverage, gaps,
+    assumptions, questions) without generating or publishing anything."""
+    from app.agents.base import get_agent_registry
+    from app.core.reports.document_workflow import build_plan
+
+    deal, _, _, report_inputs = await _load_report_inputs(deal_id)
+    req = (body or DocumentGenerateRequest()).to_workflow_request()
+    plan, evidence, risks = await build_plan(req, deal, report_inputs, get_agent_registry())
+    return {
+        "deal_id": deal_id,
+        "plan": plan.as_dict(),
+        "risk_register_size": len(risks),
+        "evidence": {
+            "successful_analyses": evidence.get("successful_analysis_count", 0),
+            "sources": len(evidence.get("sources", [])),
+            "financial_data_points": len(evidence.get("data_points", [])),
+            "open_unknowns": len(evidence.get("unknowns", [])),
+        },
+    }
+
+
+async def _generate_adaptive_documents(deal_id: str, deal: Dict[str, Any], report_inputs, body: "DocumentGenerateRequest"):
+    import hashlib
+    import re as _re
+
+    from app.agents.base import get_agent_registry
+    from app.core.document_store import DocumentStore
+    from app.core.reports.document_workflow import run_document_workflow
+
+    outcome = await run_document_workflow(body.to_workflow_request(), deal, report_inputs, get_agent_registry())
+    plan, model = outcome["plan"], outcome["model"]
+    artifacts, errors = outcome["artifacts"], outcome["errors"]
+    safe_name = _re.sub(r"_+", "_", _re.sub(r"[^A-Za-z0-9]", "_", deal.get("target_company", "report"))).strip("_") or "report"
+    fingerprint = hashlib.sha256(json.dumps(
+        {"deal": deal, "plan": plan, "model": model}, sort_keys=True, default=str
+    ).encode("utf-8")).hexdigest()
+    metadata = {
+        "target_company": deal.get("target_company", "Unknown"),
+        "deal_name": deal.get("name", "Unknown"),
+        "agents_count": len(outcome["agent_results"]),
+        "safe_filename": f"{safe_name}_{plan['doc_type']}",
+        "report_version": str(uuid.uuid4()),
+        "analysis_fingerprint": fingerprint,
+        "release_status": "pending_review",
+        "review_status": model["review_status"],
+        "review_warnings": model["warnings"],
+        "doc_type": plan["doc_type"],
+        "document_title": plan["title"],
+        "audience": plan["audience"],
+        "expected_formats": plan["formats"],
+        "plan_sections": [s["key"] for s in plan["sections"]],
+    }
+    doc_store = DocumentStore.get_instance()
+    formats_generated = []
+    if artifacts and not errors and set(artifacts) == set(plan["formats"]):
+        try:
+            await doc_store.replace_documents(deal_id, artifacts, metadata)
+            formats_generated = list(artifacts)
+        except Exception as exc:
+            errors.append({"format": "bundle", "error": f"Bundle publication failed ({type(exc).__name__})."})
+    manifest = await doc_store.list_documents(deal_id)
+    return {
+        "deal_id": deal_id,
+        "status": "complete" if formats_generated else ("partial" if artifacts else "failed"),
+        "formats_generated": formats_generated,
+        "errors": errors,
+        "documents": manifest,
+        "plan": plan,
+        "gap_fill": outcome["gap_fill"],
+        "review_actions": outcome["review_actions"],
+        "coverage": {
+            "successful_analyses": outcome["evidence"].get("successful_analysis_count", 0),
+            "source_records": len(outcome["evidence"].get("sources", [])),
+            "financial_data_points": len(outcome["evidence"].get("data_points", [])),
+            "open_data_gaps": len(outcome["evidence"].get("unknowns", [])) + len(plan["gaps"]),
+            "human_review_required": model["review_status"] == "review_required" or bool(plan["gaps"]),
+            "release_status": "pending_review",
+        },
+    }
+
+
 @app.post("/api/v1/deals/{deal_id}/documents/generate")
-async def generate_deal_documents(deal_id: str, _: bool = Depends(require_admin_token)):
+async def generate_deal_documents(
+    deal_id: str,
+    body: Optional[DocumentGenerateRequest] = Body(None),
+    _: bool = Depends(require_admin_token),
+):
     """
     Generate & cache all report formats (DOCX, PPTX, Excel, PDF) for a deal.
 
@@ -973,30 +1126,24 @@ async def generate_deal_documents(deal_id: str, _: bool = Depends(require_admin_
 
     redis_store = RedisStore.get_instance()
     doc_store = DocumentStore.get_instance()
-    deal = await redis_store.get_deal(deal_id)
-    if not deal:
-        raise HTTPException(status_code=404, detail="Deal not found")
-    if deal.get("status") not in {"completed", "ready"}:
-        raise HTTPException(status_code=409, detail="Complete the analysis before generating deliverables.")
 
     import re
 
     # ── Step 1: Collect the persisted task results; activity is metadata only ──
-    from app.core.tasks.task_manager import get_task_manager
-    task_lists = await get_task_manager().get_lists_for_deal(deal_id)
-    saved_tasks = [item for task_list in task_lists for item in task_list.items]
-    if task_lists and (
-        not any(item.status == "done" and isinstance(item.result, dict) for item in saved_tasks)
-        or any(item.status != "done" or not isinstance(item.result, dict) for item in saved_tasks)
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="Saved analysis still has unfinished or unpersisted tasks; finish or review the run before generating deliverables.",
-        )
-    activities = await redis_store.get_deal_activity(deal_id)
+    deal, task_lists, activities, report_inputs = await _load_report_inputs(deal_id)
+
+    # Adaptive deliverable (type/format/audience/gap-filling from the brief).
+    requested_formats = None
+    if body is not None and body.is_adaptive():
+        from app.core.reports.document_workflow import interpret_request
+
+        intent = interpret_request(body.to_workflow_request())
+        if intent["doc_type"] != "dd_report":
+            return await _generate_adaptive_documents(deal_id, deal, report_inputs, body)
+        requested_formats = intent["formats"]
+
     from app.agents.base import get_agent_registry
-    from app.core.reports.document_planner import build_report_agent_results, prepare_document_payload
-    report_inputs = build_report_agent_results(task_lists, activities)
+    from app.core.reports.document_planner import prepare_document_payload
     agent_results, analyst_data, evidence_brief = await prepare_document_payload(
         get_agent_registry(), deal, report_inputs
     )
@@ -1079,11 +1226,15 @@ async def generate_deal_documents(deal_id: str, _: bool = Depends(require_admin_
         "pdf": generate_pdf,
         "docx": generate_docx,
     }
+    if requested_formats:
+        format_generators = {f: g for f, g in format_generators.items() if f in requested_formats} or format_generators
+    metadata["expected_formats"] = sorted(format_generators)
+    metadata["doc_type"] = "dd_report"
 
     from app.core.reports.report_guardrails import ReportGuardrails
     from starlette.concurrency import run_in_threadpool
 
-    for fmt, generator in format_generators.items():
+    async def _render_one(fmt, generator):
         try:
             content = await run_in_threadpool(
                 generator, deal, analyst_data, agent_results, provenance_records, deal_stage
@@ -1122,6 +1273,9 @@ async def generate_deal_documents(deal_id: str, _: bool = Depends(require_admin_
                 format=fmt,
                 error_type=type(e).__name__,
             )
+
+    # Formats are independent: render them concurrently (each in a worker thread).
+    await asyncio.gather(*(_render_one(fmt, generator) for fmt, generator in format_generators.items()))
 
     if not errors and len(pending_artifacts) == len(format_generators):
         try:
@@ -1172,7 +1326,7 @@ async def approve_deal_documents(
     formats = {document.get("format") for document in documents}
     if (
         None in versions or len(versions) != 1 or None in fingerprints
-        or len(fingerprints) != 1 or formats != REQUIRED_REPORT_FORMATS
+        or len(fingerprints) != 1 or formats != _expected_report_formats(documents)
     ):
         raise HTTPException(
             status_code=409,
@@ -1250,7 +1404,7 @@ async def download_deal_bundle(deal_id: str, _: bool = Depends(require_admin_tok
     formats = {document.get("format") for document in documents}
     if (
         len(versions) != 1 or None in versions or len(fingerprints) != 1
-        or None in fingerprints or formats != REQUIRED_REPORT_FORMATS
+        or None in fingerprints or formats != _expected_report_formats(documents)
     ):
         raise HTTPException(
             status_code=409,
@@ -3141,6 +3295,7 @@ async def chat_execute_task(request: Request):
         re.IGNORECASE,
     ))
 
+    upstream_results: List[Dict[str, Any]] = []
     if task_list_id and task_id:
         task_manager = get_task_manager()
         todo = await task_manager.get_todo_list(task_list_id)
@@ -3158,6 +3313,19 @@ async def chat_execute_task(request: Request):
                 status_code=409,
                 detail={"error": "dependencies_not_satisfied", "blocked_by": unmet_dependencies},
             )
+        # Hand synthesis tasks (memo, curator, reasoning, scoring, architect) the
+        # persisted results of the tasks they depend on. Previously they only
+        # saw whatever the client chose to send in agent_outputs, and the memo
+        # agent's agent_results was never set at all.
+        upstream_results = [
+            {
+                "agent_type": item.assigned_agent, "agent": item.assigned_agent,
+                "task_id": item.id, "task_title": item.title,
+                "success": True, "data": item.result,
+            }
+            for item in todo.items
+            if item.id in planned_task.depends_on and item.status == "done" and isinstance(item.result, dict)
+        ]
 
     # Prefer an explicitly supplied public ticker in the user/task text over
     # heuristic company-name extraction, which can select an unrelated phrase.
@@ -3220,16 +3388,30 @@ async def chat_execute_task(request: Request):
         if agent:
             if client is not None:
                 agent.llm = client
+            client_outputs = body.get("agent_outputs", {})
+            server_outputs = {r["agent_type"]: r["data"] for r in upstream_results}
             agent_context = {
                 "deal_id": deal_id,
                 "task_id": task_id,
                 "ticker": ticker,
                 "company_name": company_name,
                 "user_prompt": body.get("user_prompt", ""),
-                "agent_outputs": body.get("agent_outputs", {}),
+                # Persisted upstream results win over client-supplied copies.
+                "agent_outputs": {**(client_outputs if isinstance(client_outputs, dict) else {}), **server_outputs},
+                "agent_results": upstream_results,
                 "routed_provider": provider,
                 "local_only": local_only,
             }
+            if deal_id and upstream_results:
+                try:
+                    from app.core.knowledge_graph.graph_store import render_graph_context
+                    from app.core.knowledge_graph.service import get_knowledge_graph
+
+                    graph_block = render_graph_context(await get_knowledge_graph().deal_summary(deal_id))
+                    if graph_block:
+                        agent_context["knowledge_graph_context"] = graph_block
+                except Exception as exc:
+                    logger.debug("execute_task_graph_context_unavailable", error=str(exc))
             agent._current_context = agent_context
             if input_only or resolved_type == "financial_analyst":
                 execution = agent.run(task_description, context=agent_context)
