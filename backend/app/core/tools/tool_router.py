@@ -4,8 +4,10 @@ from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 import json
+import os
 import time
 import asyncio
+import inspect
 import ipaddress
 import socket
 from urllib.parse import urljoin, urlparse
@@ -1003,7 +1005,49 @@ class ToolRouter:
 
     def register_tool(self, tool: BaseTool):
         self.tools[tool.name] = tool
-        self.logger.info("Registered tool", tool_name=tool.name)
+        # Every agent builds its own router, so per-tool info logs were ~40
+        # lines per agent instantiation.
+        self.logger.debug("Registered tool", tool_name=tool.name)
+
+    @staticmethod
+    def _tool_timeout(tool: BaseTool) -> float:
+        """Per-tool wall-clock budget: tool attribute, then TOOL_TIMEOUT_SECONDS, then 90s."""
+        explicit = getattr(tool, "timeout_seconds", None)
+        if explicit:
+            return float(explicit)
+        try:
+            return float(os.environ.get("TOOL_TIMEOUT_SECONDS", "90"))
+        except ValueError:
+            return 90.0
+
+    @staticmethod
+    def _validate_params(tool: BaseTool, params: Dict[str, Any]) -> Optional[str]:
+        """Check required arguments and drop unknown ones the tool cannot accept.
+
+        Returns an error message the model can act on, or None when valid.
+        """
+        try:
+            schema = tool.get_parameters_schema() or {}
+        except Exception:
+            return None
+        missing = [
+            name for name in schema.get("required", []) or []
+            if params.get(name) in (None, "")
+        ]
+        if missing:
+            return (
+                f"Missing required argument(s) for '{tool.name}': {', '.join(missing)}. "
+                f"Expected parameters: {sorted((schema.get('properties') or {}).keys())}"
+            )
+        try:
+            sig = inspect.signature(tool.execute)
+        except (TypeError, ValueError):
+            return None
+        if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            unknown = [k for k in params if k not in sig.parameters]
+            for key in unknown:
+                params.pop(key, None)
+        return None
 
     def register_default_tools(self, pageindex_client=None):
         """Register all tools"""
@@ -1356,34 +1400,49 @@ class ToolRouter:
     async def execute(self, tool_name: str, params: Any) -> ToolResult:
         if tool_name not in self.tools:
             return ToolResult(
-                success=False, data=None, error=f"Tool '{tool_name}' not found"
+                success=False,
+                data=None,
+                error=f"Tool '{tool_name}' not found. Available: {sorted(self.tools)[:40]}",
             )
 
-        # Ensure params is a dict (LLMs sometimes send a JSON string)
+        # Ensure params is a dict (LLMs sometimes send a JSON string or null)
+        if params is None:
+            params = {}
         if isinstance(params, str):
             try:
-                params = json.loads(params)
+                params = json.loads(params) if params.strip() else {}
             except json.JSONDecodeError:
                 return ToolResult(
                     success=False,
                     data=None,
-                    error=f"Invalid JSON in tool arguments: {params}",
+                    error=f"Invalid JSON in tool arguments: {params[:500]}",
                 )
+        if not isinstance(params, dict):
+            return ToolResult(
+                success=False,
+                data=None,
+                error=f"Tool arguments must be a JSON object, got {type(params).__name__}",
+            )
+        params = dict(params)
 
         tool = self.tools[tool_name]
+        validation_error = self._validate_params(tool, params)
+        if validation_error:
+            return ToolResult(success=False, data=None, error=validation_error)
+
         pctx = getattr(self, "_provenance_context", {}) or {}
         deal_id = pctx.get("deal_id")
-        
+
         # ── Caching Logic (Area 4) ──
         cacheable_tools = ["web_search", "document_search", "sec_filings"]
         cache_key_info = None
-        
+
         if deal_id and tool_name in cacheable_tools:
             try:
                 from app.core.redis_store import RedisStore
                 store = RedisStore.get_instance()
                 # For caching, we use the query param as the primary key
-                query = params.get("query") or params.get("company_name") or json.dumps(params)
+                query = params.get("query") or params.get("company_name") or json.dumps(params, sort_keys=True, default=str)
                 cached_result = await store.get_cached_search(deal_id, tool_name, query)
                 if cached_result:
                     self.logger.info("tool_cache_hit", tool_name=tool_name, deal_id=deal_id)
@@ -1392,11 +1451,25 @@ class ToolRouter:
             except Exception as e:
                 self.logger.warning("cache_check_failed", error=str(e))
 
+        started = time.monotonic()
+        timeout = self._tool_timeout(tool)
         try:
             self.logger.info(
                 "Executing tool", tool_name=tool_name, params_keys=list(params.keys())
             )
-            result = await tool.execute(**params)
+            if inspect.iscoroutinefunction(tool.execute):
+                result = await asyncio.wait_for(tool.execute(**params), timeout=timeout)
+            else:
+                # Sync tools (e.g. pandas/financedatabase) must not block the loop.
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(tool.execute, **params), timeout=timeout
+                )
+                if inspect.isawaitable(result):
+                    result = await asyncio.wait_for(result, timeout=timeout)
+            if not isinstance(result, ToolResult):
+                result = ToolResult(success=True, data=result)
+            if result.execution_time_ms is None:
+                result.execution_time_ms = round((time.monotonic() - started) * 1000, 1)
             self.logger.info(
                 "Tool execution complete",
                 tool_name=tool_name,
@@ -1432,11 +1505,33 @@ class ToolRouter:
                     self.logger.warning("provenance_capture_failed", error=str(e))
 
             return result
+        except asyncio.TimeoutError:
+            self.logger.error("Tool execution timed out", tool_name=tool_name, timeout_s=timeout)
+            return ToolResult(
+                success=False,
+                data=None,
+                error=f"Tool '{tool_name}' timed out after {timeout:.0f}s",
+                execution_time_ms=round((time.monotonic() - started) * 1000, 1),
+            )
+        except TypeError as e:
+            # Usually a bad argument shape from the model; make it actionable.
+            self.logger.error("Tool argument error", tool_name=tool_name, error=str(e))
+            return ToolResult(
+                success=False,
+                data=None,
+                error=f"Invalid arguments for '{tool_name}': {e}",
+                execution_time_ms=round((time.monotonic() - started) * 1000, 1),
+            )
         except Exception as e:
             self.logger.error(
                 "Tool execution failed", tool_name=tool_name, error=str(e)
             )
-            return ToolResult(success=False, data=None, error=str(e))
+            return ToolResult(
+                success=False,
+                data=None,
+                error=str(e),
+                execution_time_ms=round((time.monotonic() - started) * 1000, 1),
+            )
 
     def set_provenance_context(
         self, deal_id: str, agent_name: str, execution_round: int = 1
@@ -1455,16 +1550,27 @@ class ToolRouter:
     async def execute_function_calls(
         self, function_calls: List[Dict], allowed_tools: Optional[List[str]] = None
     ) -> List[ToolResult]:
-        results = []
-        for call in function_calls:
+        """Execute a round of model-requested calls concurrently, preserving order.
+
+        Calls in one round are independent by construction (the model issued
+        them together), so they run in parallel; concurrency is bounded by
+        TOOL_MAX_CONCURRENCY (default 4) to respect upstream API rate limits.
+        """
+        try:
+            limit = max(1, int(os.environ.get("TOOL_MAX_CONCURRENCY", "4")))
+        except ValueError:
+            limit = 4
+        sem = asyncio.Semaphore(limit)
+
+        async def _run(call: Dict) -> ToolResult:
             name = call.get("name", "")
             if allowed_tools is not None and name not in allowed_tools:
-                results.append(ToolResult(
+                return ToolResult(
                     success=False,
                     data=None,
                     error=f"Tool '{name}' was not selected for this task.",
-                ))
-                continue
-            result = await self.execute(name, call.get("args", {}))
-            results.append(result)
-        return results
+                )
+            async with sem:
+                return await self.execute(name, call.get("args", {}))
+
+        return list(await asyncio.gather(*(_run(call) for call in function_calls)))

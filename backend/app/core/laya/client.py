@@ -28,6 +28,17 @@ Config (env, all optional):
   LAYA_LMSTUDIO_URL=...        LM Studio base URL override (default: settings lmstudio_base_url)
   LAYA_LMSTUDIO_MODEL=...      LM Studio model override (default: settings lmstudio_model)
   LAYA_LMSTUDIO_TIMEOUT=120    per-call timeout for lmstudio mode (local gen is slow)
+  LAYA_CACHE_TTL_SECONDS=300   decision cache TTL (0 disables caching)
+  LAYA_CACHE_MAX_ENTRIES=2048  decision cache size (LRU eviction)
+  LAYA_BREAKER_THRESHOLD=3     consecutive backend failures before the breaker opens
+  LAYA_BREAKER_COOLDOWN_SECONDS=30  how long an open breaker short-circuits calls
+
+Hot-path protections (the same brief/task/output is classified by the
+planner, project manager, graph nodes, model router and confidence gate in
+one run): identical decisions are served from a TTL cache, concurrent
+identical requests share one in-flight call, and a per-backend circuit
+breaker stops a dead remote/LM Studio endpoint from charging its full
+timeout on every graph step.
 
 Backends:
 - local: in-process Laya checkpoints (needs ``pip install laya`` + torch).
@@ -40,9 +51,12 @@ Backends:
 """
 
 import asyncio
+import copy
+import hashlib
 import json
 import os
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -93,8 +107,21 @@ def laya_configured() -> bool:
     return _laya_setting("mode", _env("LAYA_MODE", "auto")).lower() != "off"
 
 
+def _int_setting(attr: str, default: int) -> int:
+    try:
+        return int(float(_laya_setting(attr, _env(f"LAYA_{attr.upper()}", str(default))) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+class _BackendUnavailable(Exception):
+    """Transport-level failure (counts against the circuit breaker)."""
+
+
 class LayaDecisionClient:
     """Singleton-friendly fail-soft client. Use get_laya_client()."""
+
+    _LMSTUDIO_DISCOVERY_TTL = 60.0
 
     def __init__(self) -> None:
         self._router: Any = None
@@ -102,6 +129,19 @@ class LayaDecisionClient:
         self._local_available: Optional[bool] = None
         self._preload_attempted: bool = False
         self._lock = asyncio.Lock()
+        # Decision cache: key -> (expires_at, answers)
+        self._cache: "OrderedDict[str, tuple]" = OrderedDict()
+        self._inflight: Dict[str, asyncio.Future] = {}
+        # Circuit breaker per backend: {"failures": int, "open_until": float}
+        self._breakers: Dict[str, Dict[str, float]] = {}
+        self._http_client: Any = None
+        self._http_loop: Any = None
+        self._lmstudio_discovery: Optional[tuple] = None  # (expires_at, result)
+        self._metrics: Dict[str, float] = {
+            "calls": 0, "cache_hits": 0, "inflight_joins": 0, "backend_calls": 0,
+            "failures": 0, "abstentions": 0, "breaker_short_circuits": 0,
+            "latency_ms_total": 0.0,
+        }
 
     # ── backend probing ──────────────────────────────────────────────
     def _mode(self) -> str:
@@ -183,6 +223,94 @@ class LayaDecisionClient:
                 return None
         return self._router
 
+    # ── cache / breaker / pooled HTTP ────────────────────────────────
+    def _cache_key(self, backend: str, state: Any, questions: Dict[str, Any], model: Optional[str]) -> str:
+        blob = json.dumps(
+            {"b": backend, "m": model or "", "s": state, "q": questions},
+            sort_keys=True, default=str,
+        )
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def _cache_get(self, key: str) -> Optional[Dict[str, Any]]:
+        item = self._cache.get(key)
+        if item is None:
+            return None
+        expires_at, answers = item
+        if expires_at < time.monotonic():
+            self._cache.pop(key, None)
+            return None
+        self._cache.move_to_end(key)
+        return copy.deepcopy(answers)
+
+    def _cache_put(self, key: str, answers: Optional[Dict[str, Any]]) -> None:
+        ttl = _int_setting("cache_ttl_seconds", 300)
+        if ttl <= 0 or not answers:
+            return
+        self._cache[key] = (time.monotonic() + ttl, copy.deepcopy(answers))
+        self._cache.move_to_end(key)
+        max_entries = max(1, _int_setting("cache_max_entries", 2048))
+        while len(self._cache) > max_entries:
+            self._cache.popitem(last=False)
+
+    def clear_cache(self) -> None:
+        self._cache.clear()
+        self._lmstudio_discovery = None
+
+    def _breaker_open(self, backend: str) -> bool:
+        br = self._breakers.get(backend)
+        return bool(br and br.get("open_until", 0.0) > time.monotonic())
+
+    def _record_success(self, backend: str) -> None:
+        self._breakers.pop(backend, None)
+
+    def _record_failure(self, backend: str, error: Exception) -> None:
+        self._metrics["failures"] += 1
+        br = self._breakers.setdefault(backend, {"failures": 0, "open_until": 0.0})
+        br["failures"] += 1
+        if br["failures"] >= max(1, _int_setting("breaker_threshold", 3)):
+            cooldown = max(1, _int_setting("breaker_cooldown_seconds", 30))
+            br["open_until"] = time.monotonic() + cooldown
+            # Half-open after cooldown: the next call probes; one more failure re-opens.
+            br["failures"] = max(0, br["failures"] - 1)
+            logger.warning("laya_breaker_open", backend=backend, cooldown_s=cooldown, error=str(error)[:200])
+        else:
+            logger.warning("laya_predict_failed", backend=backend, error=str(error)[:200])
+
+    def _http(self) -> Any:
+        """Pooled AsyncClient bound to the running loop (keep-alive across calls)."""
+        import httpx
+
+        loop = asyncio.get_running_loop()
+        if self._http_client is None or self._http_loop is not loop or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(
+                limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+            )
+            self._http_loop = loop
+        return self._http_client
+
+    async def aclose(self) -> None:
+        if self._http_client is not None:
+            try:
+                await self._http_client.aclose()
+            except Exception:
+                pass
+            self._http_client = None
+
+    def stats(self) -> Dict[str, Any]:
+        """Operational counters for the Settings/status endpoint."""
+        m = dict(self._metrics)
+        backend_calls = m.get("backend_calls") or 0
+        m["avg_backend_latency_ms"] = round(m.pop("latency_ms_total") / backend_calls, 1) if backend_calls else None
+        m["cache_entries"] = len(self._cache)
+        m["cache_hit_rate"] = round(m["cache_hits"] / m["calls"], 4) if m["calls"] else None
+        now = time.monotonic()
+        m["breakers"] = {
+            b: {"failures": int(v.get("failures", 0)),
+                "open_for_s": round(max(0.0, v.get("open_until", 0.0) - now), 1)}
+            for b, v in self._breakers.items()
+        }
+        return m
+
     # ── core predict ─────────────────────────────────────────────────
     async def apredict(
         self,
@@ -192,27 +320,77 @@ class LayaDecisionClient:
         model: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Raw Laya predict; returns answers dict or None on any failure."""
+        """Raw Laya predict; returns answers dict or None on any failure.
+
+        Identical (backend, model, state, questions) requests are cached and
+        coalesced; a failing backend is short-circuited by the breaker.
+        """
         if not laya_configured() or not questions:
             return None
         backend = self.backend
+        if backend not in ("local", "remote", "lmstudio"):
+            return None
+        self._metrics["calls"] += 1
+        resolved_model = self._model(model)
+        key = self._cache_key(backend, state, questions, resolved_model)
+        cached = self._cache_get(key)
+        if cached is not None:
+            self._metrics["cache_hits"] += 1
+            return cached
+        pending = self._inflight.get(key)
+        if pending is not None:
+            self._metrics["inflight_joins"] += 1
+            try:
+                result = await asyncio.shield(pending)
+            except Exception:
+                return None
+            return copy.deepcopy(result) if result else None
+        if self._breaker_open(backend):
+            self._metrics["breaker_short_circuits"] += 1
+            return None
+
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._inflight[key] = future
+        answers: Optional[Dict[str, Any]] = None
+        t0 = time.monotonic()
         try:
-            if backend == "local":
-                router = await self._get_router()
-                if router is None:
-                    return None
-                kw: Dict[str, Any] = {}
-                resolved_model = self._model(model)
-                if resolved_model:
-                    kw["model"] = resolved_model
-                res = await asyncio.to_thread(router.predict, state, questions, **kw)
-                return (res or {}).get("answers")
-            if backend == "remote":
-                return await self._predict_remote(state, questions, timeout_seconds)
-            if backend == "lmstudio":
-                return await self._predict_lmstudio(state, questions, timeout_seconds)
+            self._metrics["backend_calls"] += 1
+            answers = await self._dispatch(backend, state, questions, resolved_model, timeout_seconds)
+            self._record_success(backend)
+            if answers:
+                self._cache_put(key, answers)
+            else:
+                self._metrics["abstentions"] += 1
         except Exception as e:
-            logger.warning("laya_predict_failed", backend=backend, error=str(e))
+            self._record_failure(backend, e)
+            answers = None
+        finally:
+            self._metrics["latency_ms_total"] += (time.monotonic() - t0) * 1000
+            self._inflight.pop(key, None)
+            if not future.done():
+                future.set_result(answers)
+        return copy.deepcopy(answers) if answers else None
+
+    async def _dispatch(
+        self,
+        backend: str,
+        state: Any,
+        questions: Dict[str, Any],
+        model: Optional[str],
+        timeout_seconds: Optional[float],
+    ) -> Optional[Dict[str, Any]]:
+        """Single backend call. Raises on transport failure, None on abstention."""
+        if backend == "local":
+            router = await self._get_router()
+            if router is None:
+                raise _BackendUnavailable("local laya router unavailable")
+            kw: Dict[str, Any] = {"model": model} if model else {}
+            res = await asyncio.to_thread(router.predict, state, questions, **kw)
+            return (res or {}).get("answers")
+        if backend == "remote":
+            return await self._predict_remote(state, questions, timeout_seconds)
+        if backend == "lmstudio":
+            return await self._predict_lmstudio(state, questions, timeout_seconds)
         return None
 
     async def _predict_remote(
@@ -221,22 +399,21 @@ class LayaDecisionClient:
         questions: Dict[str, Any],
         timeout_seconds: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
-        import httpx
-
         base = self._remote_url()
         if not base:
-            return None
+            raise _BackendUnavailable("LAYA_BASE_URL not configured")
         payload = {"state": state if isinstance(state, dict) else {"body": str(state)}, "questions": questions}
         headers = {}
         api_key = self._api_key()
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        timeout = self._timeout(timeout_seconds)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(f"{base}{self._remote_path()}", json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("answers") or data
+        resp = await self._http().post(
+            f"{base}{self._remote_path()}", json=payload, headers=headers,
+            timeout=self._timeout(timeout_seconds),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("answers") or data
 
     async def apredict_batch(
         self,
@@ -244,76 +421,104 @@ class LayaDecisionClient:
         *,
         batch_size: int = 32,
     ) -> List[Optional[Dict[str, Any]]]:
-        """Batched predict preserving input order; None per failed item."""
+        """Batched predict preserving input order; None per failed item.
+
+        Cached items are served locally; only misses reach the backend.
+        """
         if not laya_configured() or not requests:
             return [None] * len(requests)
         backend = self.backend
+        if backend not in ("local", "remote", "lmstudio"):
+            return [None] * len(requests)
+        if self._breaker_open(backend):
+            self._metrics["breaker_short_circuits"] += 1
+            return [None] * len(requests)
+
+        resolved_model = self._model()
+        out: List[Optional[Dict[str, Any]]] = [None] * len(requests)
+        keys: List[str] = []
+        misses: List[int] = []
+        for i, req in enumerate(requests):
+            key = self._cache_key(backend, req.get("state"), req.get("questions", {}), resolved_model)
+            keys.append(key)
+            self._metrics["calls"] += 1
+            hit = self._cache_get(key)
+            if hit is not None:
+                self._metrics["cache_hits"] += 1
+                out[i] = hit
+            else:
+                misses.append(i)
+        if not misses:
+            return out
+
+        pending = [requests[i] for i in misses]
+        t0 = time.monotonic()
+        self._metrics["backend_calls"] += 1
         try:
-            if backend == "local":
-                router = await self._get_router()
-                if router is None:
-                    return [None] * len(requests)
-                if hasattr(router, "predict_batch"):
-                    res = await asyncio.to_thread(router.predict_batch, requests, batch_size=batch_size)
-                    out: List[Optional[Dict[str, Any]]] = []
-                    for r in res or []:
-                        out.append((r or {}).get("answers") if isinstance(r, dict) else None)
-                    return out
-                # older laya: loop predict in worker threads, bounded concurrency
-                sem = asyncio.Semaphore(4)
-
-                async def _one(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-                    async with sem:
-                        try:
-                            r = await asyncio.to_thread(
-                                router.predict, req.get("state"), req.get("questions", {}))
-                            return (r or {}).get("answers")
-                        except Exception:
-                            return None
-
-                return list(await asyncio.gather(*[_one(r) for r in requests]))
-            if backend == "remote":
-                import httpx
-
-                base = self._remote_url()
-                api_key = self._api_key()
-                headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-                timeout = self._timeout()
-                sem = asyncio.Semaphore(8)
-
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    async def _post(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-                        async with sem:
-                            try:
-                                state = req.get("state")
-                                payload = {
-                                    "state": state if isinstance(state, dict) else {"body": str(state)},
-                                    "questions": req.get("questions", {}),
-                                }
-                                resp = await client.post(f"{base}{self._remote_path()}", json=payload, headers=headers)
-                                resp.raise_for_status()
-                                data = resp.json()
-                                return data.get("answers") or data
-                            except Exception:
-                                return None
-
-                    return list(await asyncio.gather(*[_post(r) for r in requests]))
-            if backend == "lmstudio":
-                # Local chat model: sequential-ish (sem 2) — small servers
-                # serialize anyway, and this keeps VRAM pressure predictable.
-                sem = asyncio.Semaphore(2)
-
-                async def _decide(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-                    async with sem:
-                        try:
-                            return await self._predict_lmstudio(
-                                req.get("state"), req.get("questions", {}))
-                        except Exception:
-                            return None
-
-                return list(await asyncio.gather(*[_decide(r) for r in requests]))
+            results = await self._dispatch_batch(backend, pending, batch_size)
         except Exception as e:
-            logger.warning("laya_batch_failed", backend=backend, error=str(e))
+            self._record_failure(backend, e)
+            return out
+        finally:
+            self._metrics["latency_ms_total"] += (time.monotonic() - t0) * 1000
+        if any(r for r in results):
+            self._record_success(backend)
+        elif results:
+            # Every item failed: treat as a backend failure for the breaker.
+            self._record_failure(backend, _BackendUnavailable("all batch items failed"))
+        for idx, answers in zip(misses, results):
+            out[idx] = answers
+            if answers:
+                self._cache_put(keys[idx], answers)
+        return out
+
+    async def _dispatch_batch(
+        self, backend: str, requests: List[Dict[str, Any]], batch_size: int,
+    ) -> List[Optional[Dict[str, Any]]]:
+        if backend == "local":
+            router = await self._get_router()
+            if router is None:
+                raise _BackendUnavailable("local laya router unavailable")
+            if hasattr(router, "predict_batch"):
+                res = await asyncio.to_thread(router.predict_batch, requests, batch_size=batch_size)
+                return [(r or {}).get("answers") if isinstance(r, dict) else None for r in (res or [])] + \
+                    [None] * max(0, len(requests) - len(res or []))
+            # older laya: loop predict in worker threads, bounded concurrency
+            sem = asyncio.Semaphore(4)
+
+            async def _one(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                async with sem:
+                    try:
+                        r = await asyncio.to_thread(router.predict, req.get("state"), req.get("questions", {}))
+                        return (r or {}).get("answers")
+                    except Exception:
+                        return None
+
+            return list(await asyncio.gather(*[_one(r) for r in requests]))
+        if backend == "remote":
+            sem = asyncio.Semaphore(8)
+
+            async def _post(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                async with sem:
+                    try:
+                        return await self._predict_remote(req.get("state"), req.get("questions", {}))
+                    except Exception:
+                        return None
+
+            return list(await asyncio.gather(*[_post(r) for r in requests]))
+        if backend == "lmstudio":
+            # Local chat model: sem 2 — small servers serialize anyway, and
+            # this keeps VRAM pressure predictable.
+            sem = asyncio.Semaphore(2)
+
+            async def _decide(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                async with sem:
+                    try:
+                        return await self._predict_lmstudio(req.get("state"), req.get("questions", {}))
+                    except Exception:
+                        return None
+
+            return list(await asyncio.gather(*[_decide(r) for r in requests]))
         return [None] * len(requests)
 
     # ── LM Studio backend (typed decisions via constrained JSON) ────
@@ -393,18 +598,25 @@ class LayaDecisionClient:
         base, configured_model = self._lmstudio_endpoint()
         laya_override = _laya_setting("lmstudio_model", _env("LAYA_LMSTUDIO_MODEL", "")).strip()
         global_model = self._global_lmstudio_model()
+        # Model discovery is cached briefly: without it every decision paid an
+        # extra /api/v1/models round trip before the actual completion.
+        signature = (base, configured_model, laya_override, global_model)
+        cached = self._lmstudio_discovery
+        if cached and cached[0] > time.monotonic() and cached[1] == signature:
+            return cached[2]
         root = base[:-3] if base.endswith("/v1") else base
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                response = await client.get(f"{root}/api/v1/models")
-                response.raise_for_status()
-                payload = response.json()
+            response = await self._http().get(f"{root}/api/v1/models", timeout=3.0)
+            response.raise_for_status()
+            payload = response.json()
             models = payload.get("models", []) if isinstance(payload, dict) else []
             selected, source, loaded = self._select_lmstudio_model(
                 models, laya_override, global_model
             )
-            return base, selected or configured_model, source, loaded
-        except Exception as exc:
+            result = (base, selected or configured_model, source, loaded)
+            self._lmstudio_discovery = (time.monotonic() + self._LMSTUDIO_DISCOVERY_TTL, signature, result)
+            return result
+        except (httpx.HTTPError, ValueError) as exc:
             logger.debug("laya_lmstudio_model_discovery_failed", error_type=type(exc).__name__)
             return base, configured_model, "configured_fallback", []
 
@@ -557,31 +769,38 @@ class LayaDecisionClient:
                 }}},
             {},
         ]
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            content = ""
-            for extra in variants:
-                try:
-                    resp = await client.post(
-                        f"{base}/chat/completions",
-                        json={**base_payload, **extra})
-                    resp.raise_for_status()
-                    data = resp.json()
-                    msg = (data.get("choices") or [{}])[0].get("message") or {}
-                    content = msg.get("content", "") or ""
-                    if not content.strip():
-                        # Reasoning models (e.g. bonsai) put the answer in
-                        # reasoning_content; the conclusion is at the end.
-                        content = str(msg.get("reasoning_content", "") or "")[-2000:]
-                    break
-                except Exception as e:
-                    logger.warning("laya_lmstudio_variant_failed",
-                                   variant=list(extra) or ["unconstrained"],
-                                   error=str(e)[:150])
-                    continue
-            answers = self._normalize_lmstudio_answers(content, questions)
-            if answers:
-                logger.info("laya_lmstudio_decided", n=len(answers), model=model, model_source=model_source)
-            return answers
+        client = self._http()
+        content = ""
+        last_error: Optional[Exception] = None
+        for extra in variants:
+            try:
+                resp = await client.post(
+                    f"{base}/chat/completions",
+                    json={**base_payload, **extra}, timeout=timeout)
+                resp.raise_for_status()
+                data = resp.json()
+                msg = (data.get("choices") or [{}])[0].get("message") or {}
+                content = msg.get("content", "") or ""
+                if not content.strip():
+                    # Reasoning models (e.g. bonsai) put the answer in
+                    # reasoning_content; the conclusion is at the end.
+                    content = str(msg.get("reasoning_content", "") or "")[-2000:]
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                logger.warning("laya_lmstudio_variant_failed",
+                               variant=list(extra) or ["unconstrained"],
+                               error=str(e)[:150])
+                if isinstance(e, httpx.TransportError):
+                    break  # server unreachable: the next variant cannot succeed
+                continue
+        if last_error is not None:
+            raise _BackendUnavailable(f"LM Studio decision call failed: {last_error}")
+        answers = self._normalize_lmstudio_answers(content, questions)
+        if answers:
+            logger.info("laya_lmstudio_decided", n=len(answers), model=model, model_source=model_source)
+        return answers
 
     # ── typed helpers ────────────────────────────────────────────────
     @staticmethod
@@ -620,9 +839,12 @@ class LayaDecisionClient:
             val = float(a.get("noul"))
         except (TypeError, ValueError):
             return None
+        # P(yes)=0.1 is a confident "no": default confidence is the
+        # distance from a coin flip, not P(yes) itself.
+        default_conf = max(val, 1.0 - val)
         return LayaResult(
             answer=val,
-            confidence=float(a.get("answer_confidence", val) or 0.0),
+            confidence=float(a.get("answer_confidence", default_conf) or 0.0),
             raw=a,
         )
 

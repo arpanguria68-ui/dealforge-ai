@@ -263,11 +263,15 @@ class BaseAgent(ABC):
                 )
 
         # Step 3: Retrieve context per branch
-        branch_contexts = {}
-        for branch in issue_tree.sub_branches:
-            branch_contexts[branch.id] = await self.retrieve_context(
-                branch.hypothesis, top_k=3
-            )
+        # Branch retrievals are independent; run them concurrently.
+        branch_results = await asyncio.gather(*(
+            self.retrieve_context(branch.hypothesis, top_k=3)
+            for branch in issue_tree.sub_branches
+        ))
+        branch_contexts = {
+            branch.id: result
+            for branch, result in zip(issue_tree.sub_branches, branch_results)
+        }
 
         # Step 4: Execute the core run() with enriched context
         enriched_context = {
@@ -566,8 +570,13 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
         # ── Multi-round tool calling loop (up to max_tool_rounds) ──
         accumulated_tool_results = []
         all_function_calls = []
+        # Identical (tool, args) requests are answered from this memo instead
+        # of re-executing, which models often do when they re-plan a round.
+        call_memo: Dict[str, Dict[str, Any]] = {}
         current_prompt = prompt
         response = {}
+        # True while the latest round executed tools the model has not yet seen.
+        pending_tool_results = False
 
         for round_num in range(1, max_tool_rounds + 1):
             # Route through LLM Gateway (rate limit, cache, fallback)
@@ -605,7 +614,8 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
 
             # Check if tool calls were requested
             if not response.get("function_calls"):
-                break  # No more tool calls needed — exit loop
+                pending_tool_results = False
+                break  # Model produced its final answer — exit loop
 
             self.logger.info(
                 "Tool calls detected",
@@ -613,25 +623,43 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
                 calls=[c["name"] for c in response["function_calls"]],
             )
 
-            # Execute tools
-            tool_results = await self.tools.execute_function_calls(
-                response["function_calls"],
+            calls = response["function_calls"]
+            memo_keys = [self._tool_call_key(c) for c in calls]
+            fresh, fresh_keys = [], []
+            for call, key in zip(calls, memo_keys):
+                if key not in call_memo and key not in fresh_keys:
+                    fresh.append(call)
+                    fresh_keys.append(key)
+            fresh_results = await self.tools.execute_function_calls(
+                fresh,
                 allowed_tools=allowed_tool_names,
-            )
-
-            round_results = []
-            for i, r in enumerate(tool_results):
-                round_results.append({
-                    "name": response["function_calls"][i]["name"],
+            ) if fresh else []
+            for call, key, r in zip(fresh, fresh_keys, fresh_results):
+                call_memo[key] = {
+                    "name": call.get("name", ""),
                     "success": r.success,
                     "data": r.data,
-                    "error": r.error
-                })
+                    "error": r.error,
+                }
+            round_results = []
+            reported = set()
+            for key in memo_keys:
+                entry = dict(call_memo[key])
+                if key not in fresh_keys or key in reported:
+                    entry["note"] = "duplicate request; reused earlier result"
+                reported.add(key)
+                round_results.append(entry)
             accumulated_tool_results.extend(round_results)
-            all_function_calls.extend(response["function_calls"])
+            all_function_calls.extend(calls)
+            pending_tool_results = True
+
+            if not fresh:
+                # The model only repeated earlier calls: it has all the data
+                # it is going to get, so stop looping and synthesize.
+                break
 
             # Build follow-up prompt with accumulated results
-            tool_context = json.dumps(accumulated_tool_results, indent=2)
+            tool_context = self._format_tool_results(accumulated_tool_results)
             current_prompt = (
                 f"{prompt}\n\n--- TOOL EXECUTION RESULTS (Round {round_num}) ---\n"
                 f"{tool_context}\n\n"
@@ -639,9 +667,12 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
                 f"or provide your final comprehensive analysis in the requested JSON format."
             )
 
-        # If we did tool calls, do a final synthesis through the gateway
-        if accumulated_tool_results:
-            tool_context = json.dumps(accumulated_tool_results, indent=2)
+        # A final synthesis call is needed only when the loop stopped with
+        # tool results the model has not answered yet (round budget exhausted
+        # or duplicate-only round). When the model already returned a final
+        # answer after seeing the results, a second call is pure waste.
+        if accumulated_tool_results and pending_tool_results:
+            tool_context = self._format_tool_results(accumulated_tool_results)
             final_prompt = (
                 f"{prompt}\n\n--- ALL TOOL RESULTS ---\n{tool_context}\n\n"
                 f"Based on all these results, provide your final comprehensive analysis "
@@ -662,11 +693,46 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
                     f"{final_response.get('content') or 'No usable response'}"
                 )
             response["content"] = final_response.get("content", "")
+            response["provider_used"] = final_response.get("provider_used", provider)
+        if accumulated_tool_results:
             response["tool_results"] = accumulated_tool_results
             response["function_calls"] = all_function_calls
-            response["provider_used"] = final_response.get("provider_used", provider)
+            # Alias kept for agents that read the older key.
+            response["tool_calls"] = all_function_calls
 
         return response
+
+    @staticmethod
+    def _tool_call_key(call: Dict[str, Any]) -> str:
+        args = call.get("args", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (TypeError, ValueError):
+                pass
+        return json.dumps([call.get("name", ""), args], sort_keys=True, default=str)
+
+    # Per-result and total character budgets for tool output fed back to the
+    # model; raw filings/search payloads otherwise overflow the context window.
+    _TOOL_RESULT_CHAR_LIMIT = 6000
+    _TOOL_CONTEXT_CHAR_LIMIT = 24000
+
+    @classmethod
+    def _format_tool_results(cls, results: List[Dict[str, Any]]) -> str:
+        rendered = []
+        for item in results:
+            text = json.dumps(item, default=str)
+            if len(text) > cls._TOOL_RESULT_CHAR_LIMIT:
+                text = (
+                    text[: cls._TOOL_RESULT_CHAR_LIMIT]
+                    + f'... [truncated {len(text) - cls._TOOL_RESULT_CHAR_LIMIT} chars]'
+                )
+            rendered.append(text)
+        joined = "[\n" + ",\n".join(rendered) + "\n]"
+        if len(joined) > cls._TOOL_CONTEXT_CHAR_LIMIT:
+            # Keep the most recent results: they reflect the model's latest plan.
+            joined = "[... earlier tool results truncated ...]\n" + joined[-cls._TOOL_CONTEXT_CHAR_LIMIT:]
+        return joined
 
     # ═══════════════════════════════════════════════════════════
     #  Stage-Aware Prompt Injection (QA Flow 1 & 5)

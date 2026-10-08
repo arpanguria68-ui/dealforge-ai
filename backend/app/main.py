@@ -167,6 +167,9 @@ async def async_lifespan(app: FastAPI):
     logger.info("Shutting down DealForge AI")
     await close_db()
     await RedisStore.get_instance().close()
+    from app.core.laya.client import get_laya_client
+
+    await get_laya_client().aclose()
 
 
 def get_orchestrator_instance():
@@ -3981,6 +3984,7 @@ async def laya_status(_: bool = Depends(require_admin_token)):
         "lmstudio": lmstudio,
         "local": {"installed": client._local_importable()},
         "remote": {"url": client._remote_url()},
+        "runtime": client.stats(),
     }
 
 

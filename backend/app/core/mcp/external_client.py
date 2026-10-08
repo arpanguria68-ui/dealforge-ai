@@ -100,9 +100,46 @@ async def _session(server: dict[str, Any]):
             yield session
 
 
+# server-config hash -> (expires_at, tools). Agents call discover_tools() at
+# the start of every tool loop; without this each call re-opened a session to
+# every configured server (up to 10s each when one is down).
+_DISCOVERY_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_DISCOVERY_FAILURE_TTL = 15.0
+
+
+def _discovery_ttl() -> float:
+    try:
+        return max(0.0, float(os.getenv("MCP_DISCOVERY_TTL_SECONDS", "60")))
+    except ValueError:
+        return 60.0
+
+
+def clear_discovery_cache() -> None:
+    _DISCOVERY_CACHE.clear()
+
+
 async def discover_tools() -> list[dict[str, Any]]:
-    """Return only read-only tools from servers reachable at discovery time."""
+    """Return only read-only tools from servers reachable at discovery time.
+
+    Results are cached per server configuration (MCP_DISCOVERY_TTL_SECONDS,
+    default 60s); an unreachable server is re-probed after 15s.
+    """
+    import hashlib
+    import time
+
     async def discover_server(server: dict[str, Any]) -> list[dict[str, Any]]:
+        key = hashlib.sha256(json.dumps(server, sort_keys=True, default=str).encode()).hexdigest()
+        cached = _DISCOVERY_CACHE.get(key)
+        if cached and cached[0] > time.monotonic():
+            return cached[1]
+        found = await _discover_server_uncached(server)
+        ttl = _discovery_ttl() if found is not None else _DISCOVERY_FAILURE_TTL
+        result = found or []
+        if ttl > 0:
+            _DISCOVERY_CACHE[key] = (time.monotonic() + ttl, result)
+        return result
+
+    async def _discover_server_uncached(server: dict[str, Any]) -> list[dict[str, Any]] | None:
         try:
             async with asyncio.timeout(10):
                 async for session in _session(server):
@@ -129,7 +166,7 @@ async def discover_tools() -> list[dict[str, Any]]:
                     return found
         except Exception as exc:
             logger.warning("mcp_tool_discovery_failed", server=server["id"], error=str(exc))
-        return []
+        return None
 
     responses = await asyncio.gather(*(discover_server(server) for server in configured_servers()))
     found = [tool for response in responses for tool in response]
