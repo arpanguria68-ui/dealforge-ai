@@ -32,6 +32,8 @@ Config (env, all optional):
   LAYA_CACHE_MAX_ENTRIES=2048  decision cache size (LRU eviction)
   LAYA_BREAKER_THRESHOLD=3     consecutive backend failures before the breaker opens
   LAYA_BREAKER_COOLDOWN_SECONDS=30  how long an open breaker short-circuits calls
+  LAYA_WARMUP=true             at app startup, load the local Router/checkpoints in
+                               the background so the first request doesn't pay it
 
 Hot-path protections (the same brief/task/output is classified by the
 planner, project manager, graph nodes, model router and confidence gate in
@@ -300,7 +302,8 @@ class LayaDecisionClient:
         """Operational counters for the Settings/status endpoint."""
         m = dict(self._metrics)
         backend_calls = m.get("backend_calls") or 0
-        m["avg_backend_latency_ms"] = round(m.pop("latency_ms_total") / backend_calls, 1) if backend_calls else None
+        latency_total = m.pop("latency_ms_total", 0.0)
+        m["avg_backend_latency_ms"] = round(latency_total / backend_calls, 1) if backend_calls else None
         m["cache_entries"] = len(self._cache)
         m["cache_hit_rate"] = round(m["cache_hits"] / m["calls"], 4) if m["calls"] else None
         now = time.monotonic()
@@ -310,6 +313,24 @@ class LayaDecisionClient:
             for b, v in self._breakers.items()
         }
         return m
+
+    async def warmup(self) -> bool:
+        """Load the backend before the first real request (best-effort).
+
+        The first local decision builds the Router and downloads checkpoints
+        (~1 min observed), which otherwise lands on a user request.
+        """
+        if _laya_setting("warmup", _env("LAYA_WARMUP", "true")).lower() in ("0", "false", "no", "off"):
+            return False
+        if self.backend not in ("local", "remote"):
+            return False
+        started = time.monotonic()
+        answers = await self.apredict(
+            {"body": "warmup"}, {"warmup": {"type": "noul", "instructions": "Is this a warmup request?"}},
+        )
+        logger.info("laya_warmup_done", backend=self.backend, ok=bool(answers),
+                    ms=int((time.monotonic() - started) * 1000))
+        return bool(answers)
 
     # ── core predict ─────────────────────────────────────────────────
     async def apredict(

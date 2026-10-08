@@ -129,18 +129,75 @@ Tool labelling (see section 2):
   plus a `method_note` instructing `[ESTIMATED]` citation.
 - `churn_monte_carlo` is now seeded, so the same inputs give the same output.
 
-Still open, needing data sources or product decisions rather than code fixes:
-- Replacing the heuristic tools with real data (security scanners, ESG data
-  providers, an LLM-extraction pipeline).
-- Retraining `filing_due_diligence` on observed filings.
-- The two committed Windows OfficeCLI binaries (~66 MB) in
-  `backend/data/officecli/`. Deleting them won't shrink git history.
+### Text-reading tools: grounded extraction (`core/tools/grounded_extraction.py`)
+
+Five tools that read free text now use LLM extraction instead of keyword
+matching: `cyber_vuln_scanner`, `privacy_auditor`,
+`carbon_footprint_extractor`, `supply_chain_risk_flagger` and
+`ai_stack_scanner`.
+
+- **Quote-verified findings:** every extracted finding must carry a verbatim
+  quote. Quotes are checked against the input (normalizing whitespace, case
+  and typographic punctuation), and unverifiable findings are dropped. Carbon
+  figures must also appear inside their own quote. The model can classify and
+  normalize what the document says, but can't add facts.
+- **Better reading:** negation is handled ("no breaches in five years" is no
+  longer a breach). Carbon figures are unit-normalized (t/kt/Mt CO2e), and
+  the latest reported year per scope is used.
+- **Privacy:** safeguards (SCCs, DPF) are reported separately from issues.
+- **Stack scanner:** component names are canonicalized for the defensibility
+  scorer.
+- **Rule-based parts unchanged:** scores, severities and remediation costs
+  are still deterministic rules.
+- **Labelling:** results carry `data_quality: "extracted"` (schema prefix
+  `[EXTRACTED]`). With no LLM, or with `TOOL_LLM_EXTRACTION=false`, they fall
+  back to the keyword rules and say `data_quality: "heuristic"`.
+- **Fallback bugs fixed:**
+  - Supply-chain severity used `max()` on strings, so "High" plus cobalt
+    became "Medium".
+  - The carbon regex read the "2" in "scope 1 and scope 2…" as scope 1.
+- **`esg_scorer`:** no longer emits a "simulated MSCI rating". It returns
+  `indicative_rating_band` with `rating_basis` stating it's DealForge's own
+  rule-based score.
+
+Still `heuristic` (rule-based scoring over structured inputs):
+`model_defensibility_scorer`, `ai_value_quantifier`, `esg_scorer`.
+
+Still open, needing data or a decision rather than code:
+- Retraining `filing_due_diligence` on observed filings (still
+  `synthetic_model`).
+- Real scanner/ESG-provider feeds, if wanted on top of document extraction.
+
+### Build verification
+
+- **OfficeCLI binaries:** the committed Windows binaries (~66 MB, including
+  an `.exe.old`) are no longer tracked. OfficeCLI auto-downloads per platform
+  (`OFFICECLI_AUTO_DOWNLOAD`), and `backend/data/officecli/` is ignored.
+  Git history still contains them.
+- **Backend:** fresh `pip install -r requirements.txt` on Python 3.13 failed
+  at startup because SQLAlchemy's asyncio extra (`greenlet`) wasn't
+  requested. It's now `sqlalchemy[asyncio]`. After the fix, uvicorn starts
+  and `/health`, `/api/v1/laya/status` and
+  `/api/v1/deals/{id}/knowledge-graph` respond.
+- **Frontend:** `npm run build` failed from a clean checkout because
+  `.gitignore`'s `*.json` rule had excluded `tsconfig.app.json` and
+  `tsconfig.node.json`, which `tsconfig.json` references. Both are restored
+  (Vite React-TS defaults, strict) and whitelisted. `tsc -b && vite build`
+  passes.
+- **Laya:** the first local decision builds the Router and downloads
+  checkpoints (~54 s observed), and that cost landed on a user request. App
+  startup now warms the backend in a background task (`LAYA_WARMUP`, default
+  on; skipped for LM Studio). The sandbox blocks the checkpoint download
+  (403), so a live decision couldn't be verified here. The failure handling
+  (None results, breaker opening after 3 failures) was verified live.
+- **Docker:** no daemon in the build sandbox, so the images themselves were
+  not built.
 
 Strongest agents: `financial_analyst` (grounded assessment, Laya output gate,
 deterministic validation), `project_manager` (Laya triage with safety floors),
 `red_team` (deterministic, no LLM), `treasury_agent`.
-Weakest: `ai_tech_diligence`, `esg_agent`, `integration_planner_agent`. Their
-tools are the stubs listed above.
+Weakest: `integration_planner_agent` (its tools are templates). `ai_tech_diligence`
+and `esg_agent` now get quote-verified extraction from their text tools.
 
 ## 4. New configuration
 

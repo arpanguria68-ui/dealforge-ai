@@ -148,6 +148,11 @@ async def async_lifespan(app: FastAPI):
     # Initialize Redis Store
     RedisStore.get_instance()
 
+    # Warm the Laya decision backend off the request path (checkpoint load).
+    from app.core.laya.client import get_laya_client
+
+    app.state.laya_warmup = asyncio.create_task(get_laya_client().warmup())
+
     # ── Initialize OfficeCLI (if auto-download enabled) ──
     if settings.OFFICECLI_AUTO_DOWNLOAD:
         try:
@@ -169,6 +174,9 @@ async def async_lifespan(app: FastAPI):
     await RedisStore.get_instance().close()
     from app.core.laya.client import get_laya_client
 
+    warmup = getattr(app.state, "laya_warmup", None)
+    if warmup is not None and not warmup.done():
+        warmup.cancel()
     await get_laya_client().aclose()
 
 

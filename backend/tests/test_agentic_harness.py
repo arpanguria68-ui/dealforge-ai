@@ -465,20 +465,25 @@ async def test_compliance_agent_requires_cited_evidence_per_status(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_heuristic_tools_are_labelled_to_the_model_and_in_results(registry):
-    heuristic = {
-        "ai_stack_scanner", "model_defensibility_scorer", "ai_value_quantifier",
-        "carbon_footprint_extractor", "supply_chain_risk_flagger", "esg_scorer",
+    heuristic = {"model_defensibility_scorer", "ai_value_quantifier", "esg_scorer"}
+    extracted = {
+        "ai_stack_scanner", "carbon_footprint_extractor", "supply_chain_risk_flagger",
         "cyber_vuln_scanner", "privacy_auditor",
     }
     for name in heuristic:
         assert registry.tools[name].get_schema()["function"]["description"].startswith("[HEURISTIC]")
+    for name in extracted:
+        assert registry.tools[name].get_schema()["function"]["description"].startswith("[EXTRACTED]")
     assert registry.tools["filing_due_diligence"].output_quality == "synthetic_model"
     assert registry.tools["web_search"].output_quality == "data"
     assert not registry.tools["web_search"].get_schema()["function"]["description"].startswith("[")
 
+    # No LLM in tests (conftest): extraction tools fall back and say so.
     result = await registry.execute("cyber_vuln_scanner", {"security_text": "We suffered a ransomware breach."})
     assert result.success
     assert result.data["data_quality"] == "heuristic" and "[ESTIMATED]" in result.data["method_note"]
+    scored = await registry.execute("esg_scorer", {"total_emissions": 5, "supply_chain_severity": "low"})
+    assert scored.data["data_quality"] == "heuristic" and "MSCI" not in str(scored.data.get("indicative_rating_band"))
 
 
 @pytest.mark.asyncio
@@ -499,3 +504,23 @@ def test_default_tools_are_shared_but_document_search_is_per_agent():
     assert a.tools["document_search"] is not b.tools["document_search"]
     a.tools.pop("web_search")
     assert "web_search" in b.tools, "per-router dicts stay independent"
+
+
+@pytest.mark.asyncio
+async def test_laya_warmup_is_opt_out_and_skips_non_model_backends(remote_laya, monkeypatch):
+    calls = []
+
+    async def fake_remote(state, questions, timeout_seconds=None):
+        calls.append(state)
+        return {"warmup": {"noul": 0.9}}
+
+    monkeypatch.setattr(remote_laya, "_predict_remote", fake_remote)
+    monkeypatch.setenv("LAYA_WARMUP", "true")
+    assert await remote_laya.warmup() is True and len(calls) == 1
+
+    monkeypatch.setenv("LAYA_WARMUP", "false")
+    assert await remote_laya.warmup() is False and len(calls) == 1
+
+    monkeypatch.setenv("LAYA_WARMUP", "true")
+    monkeypatch.setenv("LAYA_MODE", "lmstudio")
+    assert await remote_laya.warmup() is False, "LM Studio decisions are chat calls; nothing to preload"

@@ -25,6 +25,9 @@ ofas_outputs/
 *.json
 !package.json
 !tsconfig.json
+# Frontend build configs referenced by tsconfig.json (build fails without them)
+!frontend/tsconfig.app.json
+!frontend/tsconfig.node.json
 
 # IDE
 .vscode/
@@ -43,8 +46,8 @@ backend/data/pageindex/documents/
 gemini.env
 tmp/
 
-# OfficeCLI binary auto-downloaded at runtime
-backend/data/officecli/officecli-linux-x64
+# OfficeCLI binaries are auto-downloaded at runtime (OFFICECLI_AUTO_DOWNLOAD)
+backend/data/officecli/
 
 # Embedded deal knowledge graph (SQLite)
 backend/data/knowledge_graph.db*

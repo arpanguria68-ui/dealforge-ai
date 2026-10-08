@@ -5,7 +5,7 @@ websockets
 python-socketio
 
 # Database
-sqlalchemy
+sqlalchemy[asyncio]
 asyncpg
 aiosqlite
 alembic

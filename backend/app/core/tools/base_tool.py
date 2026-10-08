@@ -16,6 +16,9 @@ class ToolResult:
 # the model (description prefix) and stamped on the result so agents and
 # reports don't present it as sourced analysis.
 OUTPUT_QUALITY_NOTES = {
+    "extracted": "LLM extraction: every finding carries a verbatim quote verified against the "
+                 "supplied text; scores, severities and cost figures are rule-based estimates. "
+                 "Falls back to keyword rules (data_quality='heuristic') when no LLM is available.",
     "heuristic": "Heuristic keyword/rule screen over the supplied text, not a sourced assessment. "
                  "Treat results as leads to verify; cite as [ESTIMATED].",
     "synthetic_model": "Model trained on synthetic data, not on observed filings. "
@@ -27,8 +30,8 @@ OUTPUT_QUALITY_NOTES = {
 class BaseTool(ABC):
     """Base class for all tools"""
 
-    # "data" (sourced or deterministic on real inputs) | "heuristic" |
-    # "synthetic_model" | "template"; see OUTPUT_QUALITY_NOTES.
+    # "data" (sourced or deterministic on real inputs) | "extracted" |
+    # "heuristic" | "synthetic_model" | "template"; see OUTPUT_QUALITY_NOTES.
     output_quality: str = "data"
 
     def __init__(self, name: str, description: str):
