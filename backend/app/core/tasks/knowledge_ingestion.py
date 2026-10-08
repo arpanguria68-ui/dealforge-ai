@@ -34,10 +34,9 @@ def _cap(text: str, file_path: str) -> str:
     return text[:MAX_INGEST_CHARS] + f"\n[TRUNCATED: {len(text) - MAX_INGEST_CHARS} chars not indexed]"
 
 # Default knowledge base paths
-DEFAULT_KNOWLEDGE_DIRS = [
-    r"F:\code project\Kimi_Agent_DealForge AI PRD\Knowledge managerment\Excel knowledge",
-    r"F:\code project\Kimi_Agent_DealForge AI PRD\Knowledge managerment\Finance knowledge base",
-]
+from app.core.paths import knowledge_dirs
+
+DEFAULT_KNOWLEDGE_DIRS = knowledge_dirs()
 
 
 class KnowledgeIngestionService:

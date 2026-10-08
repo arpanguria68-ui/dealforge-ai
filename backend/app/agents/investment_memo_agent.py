@@ -126,6 +126,7 @@ RULES:
                 "sections": self._extract_sections(content),
                 "risk_register": register,
             }
+            analysis.update(await self._build_memo_files(context))
 
             elapsed = (datetime.utcnow() - start).total_seconds() * 1000
             return AgentOutput(
@@ -142,6 +143,43 @@ RULES:
             return AgentOutput(
                 success=False, data={"error": str(e)}, reasoning=str(e), confidence=0.0
             )
+
+    async def _build_memo_files(self, context: Dict) -> Dict[str, Any]:
+        """Produce the memo as real DOCX/PDF files via the build_document tool.
+
+        The LLM prose above is a draft; the deliverable files are built by
+        Python document libraries from the recorded agent results, so their
+        figures and risks come from evidence rather than generated text.
+        """
+        agent_results = [
+            {"agent_type": r.get("agent_type") or r.get("agent"), "success": r.get("success", True), "data": r.get("data")}
+            for r in context.get("agent_results", []) if isinstance(r, dict) and isinstance(r.get("data"), dict)
+        ]
+        if not agent_results:
+            return {"files": {}, "file_status": "skipped: no recorded agent results to build from"}
+        deal = {
+            "id": context.get("deal_id"),
+            "name": context.get("deal_name") or context.get("company_name"),
+            "target_company": context.get("company_name") or context.get("target_company"),
+            "industry": context.get("industry"),
+        }
+        try:
+            result = await self.tools.execute("build_document", {
+                "request": "IC memo", "doc_type": "ic_memo", "formats": ["docx", "pdf"],
+                "deal": deal, "agent_results": agent_results,
+            })
+        except Exception as exc:
+            self.logger.warning("memo_files_not_built", error=str(exc))
+            return {"files": {}, "file_status": f"failed: {type(exc).__name__}"}
+        if not result.success or not isinstance(result.data, dict):
+            self.logger.warning("memo_files_not_built", error=result.error)
+            return {"files": {}, "file_status": f"failed: {result.error}"}
+        return {
+            "files": result.data.get("files_base64", {}),
+            "file_status": "built",
+            "file_sections": result.data.get("sections", []),
+            "file_review_status": result.data.get("review_status"),
+        }
 
     def _generate_charts(self, context: Dict) -> Dict[str, str]:
         """Generate infographic charts from analysis data."""

@@ -469,3 +469,20 @@ and a "run agents to fill missing sections" toggle.
   nothing is re-run. The chat shows the plan, asks for approval, and calls
   `/documents/generate` with the original request. `force_analysis: true`
   opts out.
+
+## 9. Documents and decks are built by code, never by LLM text
+
+| Path | Before | Now |
+|---|---|---|
+| Artifact validation | ZIP members / PDF header bytes only; a package holding `<root/>` passed | `ReportGuardrails.deep_validate` re-opens every file with python-docx / python-pptx / openpyxl / pypdf and requires real content |
+| `generate_report` tool | returned unvalidated bytes | validates before returning; a broken file is a tool failure |
+| Compiler agent | files existed only if the LLM chose to call `generate_report` | calls the tool itself for any requested format the model skipped (`built_by` records which) |
+| Investment memo agent | Markdown prose only, no file | builds DOCX + PDF through the new `build_document` tool from recorded agent results |
+| `GenerateICMemoTool` | without fpdf2, or on a DOCX error, wrote a `.md` file and reported success | DOCX fallback via python-docx; otherwise a real failure |
+| IC memo / deal deck / meeting memo tools | wrote files unchecked | re-open and validate the written file |
+| Output and knowledge paths | hard-coded `F:\code project\...` (on Linux a junk relative folder; templates never found) | `app/core/paths.py`: `OFAS_OUTPUT_DIR`, `KNOWLEDGE_BASE_DIRS`, `EXCEL_TEMPLATE_DIR`, defaulting to the repo / `DATA_DIR` |
+
+`build_document` is a new agent tool (reporting family). It's granted to
+`investment_memo_agent`, `compiler_agent` and `report_architect`, and wraps
+the adaptive workflow renderers. `tests/test_document_build_tools.py`
+exercises every document- and deck-producing path and re-opens each output.

@@ -801,6 +801,17 @@ class ReportGenerationTool(BaseTool):
                     success=False, data=None, error=f"Unsupported format: {format}"
                 )
 
+            if hasattr(file_bytes, "getvalue"):
+                file_bytes = file_bytes.getvalue()
+            from app.core.reports.report_guardrails import ReportGuardrails
+
+            validation = ReportGuardrails.validate_artifact(ext, file_bytes)
+            if not validation.get("valid"):
+                return ToolResult(
+                    success=False, data=None,
+                    error=f"Generated {ext.upper()} failed validation: {'; '.join(validation.get('issues', []))}",
+                )
+
             # Return base64 encoded bytes so it can be passed via JSON safely
             encoded = base64.b64encode(file_bytes).decode("utf-8")
 
@@ -811,6 +822,8 @@ class ReportGenerationTool(BaseTool):
                     "file_extension": ext,
                     "file_bytes_base64": encoded,
                     "size_bytes": len(file_bytes),
+                    "validation": validation.get("stats", {}),
+                    "built_with": "python report generators",
                 },
             )
         except Exception as e:
@@ -927,7 +940,7 @@ AGENT_TOOL_MAP: Dict[str, List[str]] = {
         "financial_calculator",
         "finance_analysis",
     ],
-    "report_architect": ["document_search", "generate_report"],
+    "report_architect": ["document_search", "generate_report", "build_document"],
     "project_manager": ["web_search", "company_data", "startup_intelligence"],
     "dcf_lbo_architect": [
         "financial_calculator",
@@ -964,10 +977,12 @@ AGENT_TOOL_MAP: Dict[str, List[str]] = {
         "generate_report",
         "generate_meeting_memo",
         "generate_ic_memo",
+        "build_document",
     ],
     "compiler_agent": [
         "generate_report",
         "generate_meeting_memo",
+        "build_document",
     ],
     "treasury_agent": ["financial_calculator", "web_search"],
     "fpa_forecasting_agent": ["financial_calculator", "market_data", "web_search"],
@@ -1279,6 +1294,14 @@ class ToolRouter:
         except ImportError:
             self.logger.warning("FilingDueDiligenceTool import failed")
 
+        # Adaptive deliverables built with Python document libraries.
+        try:
+            from app.core.tools.document_tools import BuildDocumentTool
+
+            self.register_tool(BuildDocumentTool())
+        except ImportError:
+            self.logger.warning("BuildDocumentTool import failed")
+
         # Phase 4 — Reporting tools
         try:
             from app.core.tools.reporting_tools import (
@@ -1333,7 +1356,7 @@ class ToolRouter:
             "supply_chain_risk_flagger", "esg_scorer",
         ],
         "reporting": [
-            "generate_report", "generate_ic_memo", "generate_deal_deck",
+            "build_document", "generate_report", "generate_ic_memo", "generate_deal_deck",
             "generate_meeting_memo",
         ],
         "integration": [

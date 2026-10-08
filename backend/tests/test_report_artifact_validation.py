@@ -31,19 +31,54 @@ def test_source_only_retrieval_confidence_is_not_misrepresented_as_calibrated():
 def test_ooxml_artifact_validation_requires_expected_parts(fmt, member):
     from app.core.reports.report_guardrails import ReportGuardrails
 
+    # An envelope with the right part names but no real content used to pass;
+    # artifacts are now re-opened with their own library.
     out = BytesIO()
     with ZipFile(out, "w", ZIP_DEFLATED) as archive:
         archive.writestr("[Content_Types].xml", "<Types/>")
         archive.writestr(member, "<root/>")
 
-    assert ReportGuardrails.validate_artifact(fmt, out.getvalue())["valid"] is True
+    assert ReportGuardrails.validate_artifact(fmt, out.getvalue())["valid"] is False
     assert ReportGuardrails.validate_artifact(fmt, b"not a document")["valid"] is False
+    assert ReportGuardrails.validate_artifact(fmt, _real_artifact(fmt))["valid"] is True
+
+
+def _real_artifact(fmt):
+    if fmt == "docx":
+        from docx import Document
+
+        doc = Document()
+        doc.add_paragraph("Real content")
+        buf = BytesIO()
+        doc.save(buf)
+    elif fmt == "xlsx":
+        from openpyxl import Workbook
+
+        wb = Workbook()
+        wb.active["A1"] = "Real content"
+        buf = BytesIO()
+        wb.save(buf)
+    else:
+        from pptx import Presentation
+
+        prs = Presentation()
+        prs.slides.add_slide(prs.slide_layouts[6])
+        buf = BytesIO()
+        prs.save(buf)
+    return buf.getvalue()
 
 
 def test_pdf_validation_requires_header_and_eof_marker():
     from app.core.reports.report_guardrails import ReportGuardrails
 
-    assert ReportGuardrails.validate_artifact("pdf", b"%PDF-1.7\nbody\n%%EOF\n")["valid"] is True
+    from reportlab.pdfgen import canvas
+
+    buf = BytesIO()
+    page = canvas.Canvas(buf)
+    page.drawString(72, 720, "Real content")
+    page.save()
+    assert ReportGuardrails.validate_artifact("pdf", buf.getvalue())["valid"] is True
+    assert ReportGuardrails.validate_artifact("pdf", b"%PDF-1.7\nbody\n%%EOF\n")["valid"] is False, "fake envelope"
     assert ReportGuardrails.validate_artifact("pdf", b"not a pdf")["valid"] is False
 
 

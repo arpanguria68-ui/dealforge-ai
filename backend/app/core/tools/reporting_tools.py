@@ -18,9 +18,30 @@ from app.core.tools.tool_router import BaseTool, ToolResult
 
 logger = structlog.get_logger()
 
-OUTPUT_DIR = Path(
-    r"F:\code project\Kimi_Agent_DealForge AI PRD\dealforge-ai\backend\ofas_outputs"
-)
+def _validated(result: "ToolResult", path_key: str, fmt: str) -> "ToolResult":
+    """Re-open the written file with its library; a broken file is a failure."""
+    if not result.success or not isinstance(result.data, dict):
+        return result
+    from app.core.reports.report_guardrails import ReportGuardrails
+
+    path = result.data.get(path_key)
+    try:
+        with open(path, "rb") as handle:
+            content = handle.read()
+    except OSError as exc:
+        return ToolResult(success=False, data=None, error=f"Generated file unreadable: {exc}")
+    check = ReportGuardrails.validate_artifact(fmt, content)
+    if not check.get("valid"):
+        return ToolResult(success=False, data=None,
+                          error=f"Generated {fmt.upper()} failed validation: {'; '.join(check.get('issues', []))}")
+    result.data["validation"] = check.get("stats", {})
+    result.data["built_with"] = "python document libraries"
+    return result
+
+
+from app.core.paths import output_dir
+
+OUTPUT_DIR = output_dir()
 
 
 # ═══════════════════════════════════════════════
@@ -313,7 +334,7 @@ class GenerateICMemoTool(BaseTool):
             output_path = OUTPUT_DIR / filename
             pdf.output(str(output_path))
 
-            return ToolResult(
+            return _validated(ToolResult(
                 success=True,
                 data={
                     "memo_path": str(output_path),
@@ -323,68 +344,16 @@ class GenerateICMemoTool(BaseTool):
                     "citation_count": len(citations),
                     "pages": pdf.page_no(),
                 },
-            )
+            ), "memo_path", "pdf")
 
         except ImportError:
-            # Fallback: generate markdown memo
-            return self._generate_markdown_memo(
-                ticker, deal_name, sections, exhibits, citations
-            )
+            # PDF library missing: build a real DOCX with python-docx instead of
+            # passing a Markdown text file off as the memo.
+            logger.warning("fpdf2 unavailable; building IC memo as DOCX")
+            return self._generate_docx_memo(ticker, deal_name, sections, exhibits, citations)
         except Exception as e:
             logger.error("IC memo generation failed", error=str(e))
             return ToolResult(success=False, data=None, error=str(e))
-
-    def _generate_markdown_memo(
-        self, ticker, deal_name, sections, exhibits, citations
-    ) -> ToolResult:
-        """Fallback: generate markdown memo when fpdf2 is not installed"""
-        lines = [
-            f"# {deal_name} — Investment Committee Memorandum",
-            f"**Ticker:** {ticker}",
-            f"**Date:** {datetime.utcnow().strftime('%B %d, %Y')}",
-            f"**Prepared by:** OFAS Multi-Agent System",
-            "",
-        ]
-
-        section_order = [
-            ("executive_summary", "Executive Summary"),
-            ("investment_thesis", "Investment Thesis"),
-            ("financial_analysis", "Financial Analysis"),
-            ("valuation", "Valuation"),
-            ("risks", "Risk Assessment"),
-            ("recommendation", "Recommendation"),
-        ]
-
-        for key, title in section_order:
-            content = sections.get(key)
-            if content:
-                lines.append(f"## {title}")
-                lines.append(content)
-                lines.append("")
-
-        if citations:
-            lines.append("## Source Citations")
-            for cit in citations:
-                lines.append(
-                    f"- [{cit.get('id', '?')}] {cit.get('source', '')} (chunk: {cit.get('chunk_id', 'N/A')})"
-                )
-
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        filename = f"{ticker}_IC_Memo_{timestamp}.md"
-        output_path = OUTPUT_DIR / filename
-
-        with open(str(output_path), "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-
-        return ToolResult(
-            success=True,
-            data={
-                "memo_path": str(output_path),
-                "format": "markdown",
-                "note": "fpdf2 not installed — generated markdown instead. Install: pip install fpdf2",
-            },
-        )
 
     def _generate_docx_memo(
         self, ticker, deal_name, sections, exhibits, citations
@@ -482,7 +451,7 @@ class GenerateICMemoTool(BaseTool):
             output_path = OUTPUT_DIR / filename
             doc.save(str(output_path))
 
-            return ToolResult(
+            return _validated(ToolResult(
                 success=True,
                 data={
                     "memo_path": str(output_path),
@@ -490,12 +459,10 @@ class GenerateICMemoTool(BaseTool):
                     "format": "docx",
                     "pages": "N/A",
                 },
-            )
+            ), "memo_path", "docx")
         except Exception as e:
             logger.error("IC memo DOCX generation failed", error=str(e))
-            return self._generate_markdown_memo(
-                ticker, deal_name, sections, exhibits, citations
-            )
+            return ToolResult(success=False, data=None, error=f"IC memo DOCX generation failed: {e}")
 
 
 # ═══════════════════════════════════════════════
@@ -571,7 +538,7 @@ class GenerateDealDeckTool(BaseTool):
                     else pptx_bytes
                 )
 
-            return ToolResult(
+            return _validated(ToolResult(
                 success=True,
                 data={
                     "deck_path": str(output_path),
@@ -579,7 +546,7 @@ class GenerateDealDeckTool(BaseTool):
                     "format": "pptx",
                     "agent_sections": len(agent_results),
                 },
-            )
+            ), "deck_path", "pptx")
 
         except ImportError:
             return ToolResult(
@@ -722,7 +689,7 @@ class GenerateMeetingMemoTool(BaseTool):
             with open(str(output_path), "wb") as f:
                 f.write(memo_bytes)
 
-            return ToolResult(
+            return _validated(ToolResult(
                 success=True,
                 data={
                     "memo_path": str(output_path),
@@ -734,7 +701,7 @@ class GenerateMeetingMemoTool(BaseTool):
                     "decision_count": len(decisions),
                     "action_item_count": len(action_items),
                 },
-            )
+            ), "memo_path", ext)
 
         except ImportError as e:
             return ToolResult(
