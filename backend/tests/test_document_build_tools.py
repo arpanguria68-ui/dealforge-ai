@@ -180,3 +180,12 @@ def test_fake_documents_are_rejected():
         z.writestr("word/document.xml", "<root/>")
     assert not ReportGuardrails.validate_artifact("docx", buf.getvalue())["valid"]
     assert not ReportGuardrails.validate_artifact("pdf", b"%PDF-1.4\n# Markdown memo\n%%EOF")["valid"]
+
+
+def test_agents_with_file_tools_are_told_to_build_files():
+    from app.agents.base import BaseAgent
+
+    guidance = BaseAgent._deliverable_guidance(["web_search", "generate_report", "build_document"])
+    assert "`build_document`" in guidance and "Never present" in guidance
+    assert "`generate_ic_memo`" in BaseAgent._deliverable_guidance(["generate_ic_memo"])
+    assert BaseAgent._deliverable_guidance(["web_search", "financial_calculator"]) == ""

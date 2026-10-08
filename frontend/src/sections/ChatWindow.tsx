@@ -1139,6 +1139,7 @@ export function ChatWindow() {
                         user_answers: userAnswers,
                         focus_mode: focusMode, sources: activeSources,
                         local_only: /\b(?:local[- ]only|lm\s*studio\s+only|no\s+(?:cloud|remote)\s+(?:llm|models?))\b/i.test(currentPrompt),
+                        force_analysis: /\b(?:re-?run|fresh\s+analysis|re-?analy[sz]e|from\s+scratch)\b/i.test(currentPrompt),
                     }),
                 });
                 if (planRes.ok) planResponse = await planRes.json() as PlanResponse;
@@ -1184,7 +1185,9 @@ export function ChatWindow() {
                 const documentPlanMessage = `📄 **Document Plan — ${documentPlan.title}**\n\n` +
                     `> **💭 Reasoning:** ${planResponse?.reasoning || 'Built from the saved analysis.'}\n\n` +
                     `**Formats:** ${documentPlan.formats.map(f => f.toUpperCase()).join(', ')} · **Audience:** ${documentPlan.audience}\n\n` +
-                    `${sectionList}\n\n${gapLine}${notes ? `${notes}\n\n` : ''}---\nAwaiting your approval to generate.`;
+                    `${sectionList}\n\n${gapLine}${notes ? `${notes}\n\n` : ''}` +
+                    `_Built from the saved analysis. To re-run the agents first, ask again with "fresh analysis"._\n\n` +
+                    `---\nAwaiting your approval to generate.`;
                 updateMessage(thinkingPlanId, { content: documentPlanMessage, status: 'done' });
                 setPhase('awaiting_approval');
                 const approvedDocument = await new Promise<boolean>(resolve => {

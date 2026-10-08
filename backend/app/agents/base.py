@@ -551,6 +551,9 @@ class BaseAgent(ABC):
         kg_context = ctx.get("knowledge_graph_context")
         if kg_context:
             system_prompt = (system_prompt or "") + "\n\n" + kg_context
+        deliverable_guidance = self._deliverable_guidance(allowed_tool_names)
+        if deliverable_guidance:
+            system_prompt = (system_prompt or "") + "\n\n" + deliverable_guidance
 
         # Keep the task-level Laya decision for every call in this tool loop.
         # Route on the real request size (system + prompt + tool schemas +
@@ -806,6 +809,24 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
     @classmethod
     def _estimate_tokens(cls, text: str) -> int:
         return max(1, int(len(text or "") / cls._CHARS_PER_TOKEN))
+
+    _FILE_BUILDING_TOOLS = ("build_document", "generate_report", "generate_ic_memo",
+                            "generate_deal_deck", "generate_meeting_memo")
+
+    @classmethod
+    def _deliverable_guidance(cls, tool_names: List[str]) -> str:
+        """Tell the model that deliverables are files built by tools, not prose."""
+        available = [name for name in cls._FILE_BUILDING_TOOLS if name in (tool_names or [])]
+        if not available:
+            return ""
+        preferred = "build_document" if "build_document" in available else available[0]
+        return (
+            "DELIVERABLES: Any document, memo, report, spreadsheet or deck the user should "
+            f"receive must be produced by calling a file-building tool ({', '.join(available)}); "
+            f"prefer `{preferred}`. Pass the upstream agent results as evidence. Never present "
+            "Markdown or prose as the deliverable file, and never claim a file exists unless a "
+            "tool returned it."
+        )
 
     @classmethod
     def _tool_context_budget(cls, provider: str, model: Optional[str], request_tokens: int) -> int:
