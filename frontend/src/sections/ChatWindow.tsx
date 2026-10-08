@@ -1030,22 +1030,29 @@ export function ChatWindow() {
                     role: 'assistant', agentName: 'DealForge AI',
                     content: 'Thinking...', status: 'thinking',
                 });
-                const response = await fetch(`${API_BASE}/api/v1/chat/respond`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        prompt: userText,
-                        local_only: /\b(?:local[- ]only|lm\s*studio\s+only|no\s+(?:cloud|remote)\s+(?:llm|models?))\b/i.test(userText),
-                    }),
-                });
-                const result = await response.json();
-                if (!response.ok) throw new Error(result.detail || `Chat response failed (HTTP ${response.status})`);
-                updateMessage(responseId, {
-                    content: result.response,
-                    status: 'done',
-                    provider: result.provider,
-                    metadata: { model: result.model, route_tier: result.route_tier },
-                });
+                try {
+                    const response = await fetch(`${API_BASE}/api/v1/chat/respond`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            prompt: userText,
+                            local_only: /\b(?:local[- ]only|lm\s*studio\s+only|no\s+(?:cloud|remote)\s+(?:llm|models?))\b/i.test(userText),
+                        }),
+                    });
+                    const result = await response.json();
+                    if (!response.ok) throw new Error(result.detail || `Chat response failed (HTTP ${response.status})`);
+                    updateMessage(responseId, {
+                        content: result.response,
+                        status: 'done',
+                        provider: result.provider,
+                        metadata: { model: result.model, route_tier: result.route_tier },
+                    });
+                } catch (error) {
+                    const detail = error instanceof Error ? error.message : 'Direct chat request failed';
+                    updateMessage(responseId, { content: `⚠️ ${detail}`, status: 'error' });
+                    setPhase('idle');
+                    return;
+                }
                 setPhase('idle');
                 return;
             } else {
