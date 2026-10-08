@@ -305,3 +305,48 @@ Now:
   filters document retrieval. It's now backed by a `ContextVar`, so each
   asyncio task (each agent run) sees its own context. There's a regression
   test that fails on the old code.
+
+## 6. Data truncation, API I/O and tool arguments
+
+**Prompt context:** 14 agents and the debate engine used
+`json.dumps(context)[:2000]`.
+- The cut left invalid JSON and kept whichever keys came first.
+- With a realistic orchestrator context, the deal brief, Laya annotations,
+  an object repr and the knowledge-graph block (already in the system
+  prompt) filled the window. `fact_base` and `financial_data`, the numbers
+  the agent was asked to analyse, were dropped.
+- `app/core/prompt_context.render_context` now emits deal facts first,
+  excludes runtime objects and blocks delivered elsewhere, truncates long
+  values with explicit markers (valid JSON throughout), and lists
+  `_omitted_for_length` keys.
+
+**Ingestion:** knowledge-base parsing silently capped documents.
+- The old limits were 10–15K chars per document, 2K per PDF page, 30 PDF
+  pages, and 50 rows × 20 columns per sheet.
+- Content is chunked downstream anyway, so the caps are now safety limits
+  only: `INGEST_MAX_CHARS` 2M, `INGEST_MAX_PDF_PAGES` 1000,
+  `INGEST_MAX_SHEET_ROWS` 5000, `INGEST_MAX_SHEET_COLS` 100.
+- Any truncation is marked in the text and logged.
+
+**Retrieval:** search returned the first 2000 chars of a matching node. With
+pageindex section trees, that often wasn't the matched passage. It now
+returns the 2000-char window with the most query-term hits.
+
+**Uploads:** files were read whole into memory with no size or type check.
+- They now stream to disk with `UPLOAD_MAX_MB` (default 50) and an extension
+  allow-list (`UPLOAD_ALLOWED_EXTENSIONS`).
+- Bulk uploads are capped at `UPLOAD_MAX_FILES` (default 50).
+- Errors are 413, 415 and 400 (empty file); bulk uploads report them per
+  file.
+
+**JSON bodies:** a middleware rejects JSON bodies over `API_MAX_JSON_MB`
+(default 5) with 413.
+
+**Activity log:** the global feed stored full agent payloads, 1000 events
+deep (including base64 report files). It now stores a slim copy. The
+per-deal log keeps full events for report generation.
+
+**Tool arguments:** primitive types are coerced per the tool's JSON schema
+(`"1,000"` → 1000, `"true"` → True, JSON-string arrays and objects are
+parsed) and `enum` is enforced. Uncoercible values return an actionable
+error to the model instead of crashing inside the tool.

@@ -22,6 +22,7 @@ import structlog
 
 from app.agents.base import BaseAgent, AgentOutput, get_agent_registry
 from app.orchestrator.state import DealState, update_state
+from app.core.prompt_context import render_context
 
 logger = structlog.get_logger()
 
@@ -400,7 +401,7 @@ You MUST generate at least 2 challenges. For each challenge, output JSON:
             summary = f"""
 AGENT: {agent}
 CONCLUSION: {conclusion}
-KEY FINDINGS: {json.dumps(output.get('key_findings', []))[:500]}
+KEY FINDINGS: {render_context({'key_findings': output.get('key_findings', [])}, 1500, priority=())}
 """
             agent_summaries.append(summary)
         
@@ -532,7 +533,7 @@ CHALLENGES TO ADDRESS:
 {challenge_texts}
 
 YOUR ORIGINAL OUTPUT:
-{json.dumps(agent_output, indent=2)[:2000]}
+{render_context(agent_output, 4000, priority=())}
 
 Your task is to RESPOND to these challenges. You can:
 1. DEFEND: Provide evidence supporting your original conclusion

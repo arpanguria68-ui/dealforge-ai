@@ -15,6 +15,7 @@ import re
 from datetime import datetime
 
 from app.agents.base import BaseAgent, AgentOutput
+from app.core.prompt_context import render_context
 
 
 class ComplianceQAAgent(BaseAgent):
@@ -314,7 +315,7 @@ OUTPUT: Respond with a comprehensive JSON containing your audit findings."""
         prompt = f"TASK: Cyber/Regulatory Audit - {task}\n\n"
         if context:
             safe_ctx = {k: v for k, v in context.items() if k != "action"}
-            prompt += f"CONTEXT: {json.dumps(safe_ctx, default=str)[:2000]}\n\n"
+            prompt += f"CONTEXT: {render_context(safe_ctx)}\n\n"
 
         prompt += """Respond with JSON:
 {

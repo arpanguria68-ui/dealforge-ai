@@ -206,6 +206,24 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
+# Request body size guard for JSON APIs (uploads have their own limit above).
+API_MAX_JSON_BYTES = int(float(os.getenv("API_MAX_JSON_MB", "5")) * 1024 * 1024)
+
+
+@app.middleware("http")
+async def limit_json_body_size(request: Request, call_next):
+    content_type = request.headers.get("content-type", "")
+    length = request.headers.get("content-length")
+    if "application/json" in content_type and length and length.isdigit() and int(length) > API_MAX_JSON_BYTES:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=413,
+            content={"detail": f"Request body exceeds {API_MAX_JSON_BYTES // (1024 * 1024)} MB"},
+        )
+    return await call_next(request)
+
+
 # Security
 security = HTTPBearer(auto_error=False)
 
@@ -1466,6 +1484,55 @@ async def documents_query(body: _QueryBody):
         raise HTTPException(status_code=500, detail="Knowledge search failed. Check service logs for a redacted diagnostic.")
 
 
+# ── Upload limits ────────────────────────────────────────────────
+# Uploads were read whole into memory with no size or type check.
+UPLOAD_MAX_BYTES = int(float(os.getenv("UPLOAD_MAX_MB", "50")) * 1024 * 1024)
+UPLOAD_MAX_FILES = int(os.getenv("UPLOAD_MAX_FILES", "50"))
+UPLOAD_ALLOWED_EXTENSIONS = {
+    e.strip().lower() for e in os.getenv(
+        "UPLOAD_ALLOWED_EXTENSIONS",
+        ".pdf,.docx,.doc,.txt,.md,.markdown,.csv,.json,.html,.htm,.xlsx,.xlsm,.xls,.pptx",
+    ).split(",") if e.strip()
+}
+
+
+async def _save_upload_to_temp(file: UploadFile) -> str:
+    """Stream an upload to a temp file, enforcing type and size limits (415/413)."""
+    import tempfile
+
+    suffix = os.path.splitext(file.filename or "")[1].lower()
+    if suffix not in UPLOAD_ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type '{suffix or '(none)'}'. Allowed: {sorted(UPLOAD_ALLOWED_EXTENSIONS)}",
+        )
+    written = 0
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > UPLOAD_MAX_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File exceeds the {UPLOAD_MAX_BYTES // (1024 * 1024)} MB upload limit",
+                )
+            tmp.write(chunk)
+        if written == 0:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+        tmp.close()
+        return tmp.name
+    except BaseException:
+        tmp.close()
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        raise
+
+
 @app.post("/api/v1/documents/upload")
 async def documents_upload(file: UploadFile = File(...), deal_id: Optional[str] = None):
     """Upload and index a document into the Knowledge Base."""
@@ -1473,11 +1540,7 @@ async def documents_upload(file: UploadFile = File(...), deal_id: Optional[str] 
 
     tmp_path: Optional[str] = None
     try:
-        suffix = os.path.splitext(file.filename or ".txt")[1]
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            content = await file.read()
-            tmp.write(content)
-            tmp_path = tmp.name
+        tmp_path = await _save_upload_to_temp(file)
 
         client = get_pageindex_client()
         metadata = {"original_filename": file.filename}
@@ -1493,6 +1556,8 @@ async def documents_upload(file: UploadFile = File(...), deal_id: Optional[str] 
             "total_pages": getattr(result, "total_pages", 0),
             "total_chunks": getattr(result, "total_chunks", 0),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -1510,17 +1575,17 @@ async def documents_upload_bulk(
     """Bulk upload and index multiple documents into the Knowledge Base."""
     import tempfile, os
 
+    if len(files) > UPLOAD_MAX_FILES:
+        raise HTTPException(
+            status_code=413, detail=f"At most {UPLOAD_MAX_FILES} files per bulk upload"
+        )
     client = get_pageindex_client()
     results = []
 
     for file in files:
         tmp_path: Optional[str] = None
         try:
-            suffix = os.path.splitext(file.filename or ".txt")[1]
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                content = await file.read()
-                tmp.write(content)
-                tmp_path = tmp.name
+            tmp_path = await _save_upload_to_temp(file)
 
             metadata = {"original_filename": file.filename}
             if deal_id:
@@ -1536,11 +1601,13 @@ async def documents_upload_bulk(
                 }
             )
         except Exception as e:
+            # Per-file failures (incl. 413/415) are reported, not fatal to the batch.
+            error = e.detail if isinstance(e, HTTPException) else str(e)
             logger.error(
-                "bulk_upload_file_failed", filename=file.filename, error=str(e)
+                "bulk_upload_file_failed", filename=file.filename, error=str(error)
             )
             results.append(
-                {"filename": file.filename, "status": "failed", "error": str(e)}
+                {"filename": file.filename, "status": "failed", "error": str(error)}
             )
         finally:
             if tmp_path:
@@ -1925,12 +1992,8 @@ async def upload_document(deal_id: str, file: UploadFile = File(...)):
 
     import tempfile
 
-    # Save file safely to a temporary file
-    suffix = os.path.splitext(file.filename or ".txt")[1]
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        content = await file.read()
-        tmp.write(content)
-        temp_path = tmp.name
+    # Save file safely to a temporary file (type/size limits enforced)
+    temp_path = await _save_upload_to_temp(file)
 
     # Index with PageIndex
     pageindex = get_pageindex_client()

@@ -20,6 +20,20 @@ SEARCH_CACHE_TTL = settings.SEARCH_CACHE_TTL
 MAX_ACTIVITY_PER_DEAL = 500
 
 
+# Data keys the dashboard reads from global activity events.
+_GLOBAL_DATA_KEYS = ("confidence_basis", "synthesis_status")
+
+
+def _slim_event(evt: dict) -> dict:
+    slim = {k: v for k, v in evt.items() if k not in ("data", "result")}
+    data = evt.get("data")
+    if isinstance(data, dict):
+        slim["data"] = {k: data[k] for k in _GLOBAL_DATA_KEYS if k in data}
+    if isinstance(slim.get("reasoning"), str) and len(slim["reasoning"]) > 500:
+        slim["reasoning"] = slim["reasoning"][:500] + "…"
+    return slim
+
+
 class RedisStore:
     _instance: Optional["RedisStore"] = None
 
@@ -83,8 +97,11 @@ class RedisStore:
             await self.client.ltrim(key, -MAX_ACTIVITY_PER_DEAL, -1)
             await self.client.expire(key, ACTIVITY_TTL)
 
-        # Keep global activity log (recent 1000 events)
-        await self.client.rpush("global_activity", json.dumps(evt))
+        # Keep global activity log (recent 1000 events). It only feeds the
+        # dashboard feed, so store a slim copy: full agent payloads (up to the
+        # API body limit each) x 1000 entries could bloat Redis by gigabytes.
+        # The per-deal log above keeps the full event for report generation.
+        await self.client.rpush("global_activity", json.dumps(_slim_event(evt)))
         await self.client.ltrim("global_activity", -1000, -1)
 
     async def get_deal_activity(self, deal_id: str) -> List[dict]:

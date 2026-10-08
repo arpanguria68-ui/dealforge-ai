@@ -17,6 +17,7 @@ from datetime import datetime
 
 from app.agents.base import BaseAgent, AgentOutput
 from app.core.tasks.task_manager import get_task_manager, AGENT_CAPABILITIES
+from app.core.prompt_context import render_context
 
 # Default task templates for common deal analysis scenarios
 DEAL_ANALYSIS_TEMPLATE = [
@@ -752,7 +753,7 @@ Return ONLY the JSON array, no other text."""
 TASK: {task}
 
 USER ANSWERS TO CLARIFYING QUESTIONS:
-{json.dumps(answers, default=str)[:2000]}
+{render_context(answers, 4000, priority=())}
 
 PROVIDED DATA/FILES: {json.dumps(list(provided_data.keys())) if provided_data else "None uploaded yet"}
 
@@ -931,7 +932,7 @@ If missing, use "Target Company" and "" respectively.
 Given the following deal analysis request, create a structured task list.
 
 DEAL REQUEST: {task}
-CONTEXT: {json.dumps(context, default=str)[:2000]}
+CONTEXT: {render_context(context)}
 
 Return a JSON array of tasks. Each task object must have:
 - "title": concise task name

@@ -9,6 +9,7 @@ import json
 from datetime import datetime
 
 from app.agents.base import BaseAgent, AgentOutput
+from app.core.prompt_context import render_context
 
 
 class TreasuryCashAgent(BaseAgent):
@@ -36,7 +37,7 @@ ANALYSIS AREAS:
 Always present a clear 13-week cash forecast with confidence bands."""
 
             prompt = (
-                f"TASK: {task}\n\nCONTEXT: {json.dumps(context, default=str)[:2000]}"
+                f"TASK: {task}\n\nCONTEXT: {render_context(context)}"
             )
 
             result = await self.generate_with_tools(prompt, system_prompt=system_prompt)
@@ -123,7 +124,7 @@ CAPABILITIES:
 Always present 3 scenarios with probability weights."""
 
             prompt = (
-                f"TASK: {task}\n\nCONTEXT: {json.dumps(context, default=str)[:2000]}"
+                f"TASK: {task}\n\nCONTEXT: {render_context(context)}"
             )
             result = await self.generate_with_tools(prompt, system_prompt=system_prompt)
             content = result.get("content", "")
@@ -178,7 +179,7 @@ ANALYSIS AREAS:
 Flag any material tax risks or planning opportunities."""
 
             prompt = (
-                f"TASK: {task}\n\nCONTEXT: {json.dumps(context, default=str)[:2000]}"
+                f"TASK: {task}\n\nCONTEXT: {render_context(context)}"
             )
             result = await self.generate_with_tools(prompt, system_prompt=system_prompt)
             content = result.get("content", "")

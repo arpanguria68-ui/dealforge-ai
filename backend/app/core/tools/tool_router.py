@@ -1024,6 +1024,60 @@ class ToolRouter:
             return 90.0
 
     @staticmethod
+    def _coerce_param_types(schema: Dict[str, Any], params: Dict[str, Any]) -> Optional[str]:
+        """Coerce JSON-schema primitive types in place; return an error for mismatches.
+
+        Models (local ones especially) often send "12" for integers, "true"
+        for booleans, or a JSON string for an array/object; those are
+        coerced. Values that can't be coerced become an actionable error
+        instead of a crash inside the tool.
+        """
+        props = schema.get("properties") or {}
+        problems = []
+        for name, value in list(params.items()):
+            spec = props.get(name) or {}
+            expected = spec.get("type")
+            if value is None or not isinstance(expected, str):
+                continue
+            try:
+                if expected == "integer" and not isinstance(value, bool):
+                    if isinstance(value, str):
+                        value = float(value.replace(",", "").strip())
+                    if isinstance(value, float) and value.is_integer():
+                        value = int(value)
+                    if not isinstance(value, int):
+                        raise ValueError
+                elif expected == "number" and not isinstance(value, bool):
+                    if isinstance(value, str):
+                        value = float(value.replace(",", "").strip())
+                    if not isinstance(value, (int, float)):
+                        raise ValueError
+                elif expected == "boolean":
+                    if isinstance(value, str) and value.strip().lower() in ("true", "false", "1", "0", "yes", "no"):
+                        value = value.strip().lower() in ("true", "1", "yes")
+                    if not isinstance(value, bool):
+                        raise ValueError
+                elif expected in ("array", "object"):
+                    if isinstance(value, str):
+                        value = json.loads(value)
+                    if expected == "array" and not isinstance(value, list):
+                        raise ValueError
+                    if expected == "object" and not isinstance(value, dict):
+                        raise ValueError
+                elif expected == "string" and not isinstance(value, str):
+                    if isinstance(value, (dict, list)):
+                        raise ValueError
+                    value = str(value)
+                enum = spec.get("enum")
+                if enum and value not in enum:
+                    problems.append(f"{name} must be one of {enum}")
+                    continue
+                params[name] = value
+            except (ValueError, TypeError, json.JSONDecodeError):
+                problems.append(f"{name} must be {expected} (got {type(value).__name__})")
+        return "; ".join(problems) or None
+
+    @staticmethod
     def _validate_params(tool: BaseTool, params: Dict[str, Any]) -> Optional[str]:
         """Check required arguments and drop unknown ones the tool cannot accept.
 
@@ -1033,6 +1087,9 @@ class ToolRouter:
             schema = tool.get_parameters_schema() or {}
         except Exception:
             return None
+        type_error = ToolRouter._coerce_param_types(schema, params)
+        if type_error:
+            return f"Invalid arguments for '{tool.name}': {type_error}"
         missing = [
             name for name in schema.get("required", []) or []
             if params.get(name) in (None, "")

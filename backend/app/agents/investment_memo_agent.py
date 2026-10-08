@@ -10,6 +10,7 @@ import json
 from datetime import datetime
 
 from app.agents.base import BaseAgent, AgentOutput
+from app.core.prompt_context import render_context
 
 # Context keys that are runtime objects or duplicated elsewhere in the prompt.
 _CONTEXT_EXCLUDE = {"agent_results", "kb_graph", "knowledge_graph_context", "risk_data"}
@@ -90,7 +91,7 @@ RULES:
                 prompt += "AGENT FINDINGS:\n"
                 for r in agent_results[:10]:
                     agent_name = r.get("agent", "unknown")
-                    data = json.dumps(r.get("data", {}), default=str)[:500]
+                    data = render_context(r.get("data", {}), 1500, priority=())
                     prompt += f"\n--- {agent_name} ---\n{data}\n"
 
             # Cross-agent risks from the deal knowledge graph feed section 6.
@@ -107,7 +108,7 @@ RULES:
                 context.setdefault("risk_data", register)
 
             if context:
-                prompt += f"\nDEAL CONTEXT: {json.dumps({k: v for k, v in context.items() if k not in _CONTEXT_EXCLUDE}, default=str)[:1500]}\n"
+                prompt += f"\nDEAL CONTEXT: {render_context(context, 4000, exclude=_CONTEXT_EXCLUDE)}\n"
 
             prompt += (
                 "\nDraft a complete investment memo following the structure above."

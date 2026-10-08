@@ -14,6 +14,7 @@ import json
 from datetime import datetime
 
 from app.agents.base import BaseAgent, AgentOutput
+from app.core.prompt_context import render_context
 
 
 class CommercialDueDiligenceAgent(BaseAgent):
@@ -120,7 +121,7 @@ OUTPUT: Respond with structured JSON containing your assessment and source_citat
             prompt = f"TASK: {task}\n\n"
             if context:
                 safe_ctx = {k: v for k, v in context.items() if k != "action"}
-                prompt += f"CONTEXT: {json.dumps(safe_ctx, default=str)[:2000]}\n\n"
+                prompt += f"CONTEXT: {render_context(safe_ctx)}\n\n"
 
             if memory_context:
                 prompt += "RELEVANT DOCUMENTS (cite these when referencing data):\n"
