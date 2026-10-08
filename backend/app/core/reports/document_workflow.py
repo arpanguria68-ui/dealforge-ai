@@ -38,7 +38,7 @@ import structlog
 logger = structlog.get_logger(__name__)
 
 SUPPORTED_FORMATS = ("docx", "pdf", "xlsx", "pptx")
-ADAPTIVE_RENDERERS = ("docx", "pdf", "xlsx")  # pptx uses the legacy deck generator
+ADAPTIVE_RENDERERS = ("docx", "pdf", "xlsx", "pptx")
 
 SECTION_TITLES = {
     "snapshot": "Deal Snapshot",
@@ -88,6 +88,12 @@ DOC_TYPES: Dict[str, Dict[str, Any]] = {
         "required": ["risk_assessment"],
         "optional": ["executive_summary", "diligence_gaps", "next_steps", "sources_methodology"],
     },
+    "board_deck": {
+        "title": "Board Deck", "formats": ["pptx", "pdf"],
+        "audience": "Board of Directors", "density": "compact", "item_limit": 6,
+        "required": ["executive_summary", "risk_assessment"],
+        "optional": ["snapshot", "investment_thesis", "financial_metrics", "valuation", "diligence_gaps", "next_steps"],
+    },
     "financial_summary": {
         "title": "Financial Summary", "formats": ["docx", "xlsx"],
         "audience": "Deal Team", "density": "standard",
@@ -100,8 +106,9 @@ _TYPE_KEYWORDS = [
     ("one_pager", ("one pager", "one-pager", "onepager", "teaser", "snapshot", "single page", "1-pager", "tear sheet")),
     ("risk_report", ("risk report", "risk register", "risk assessment", "red flag", "risk memo")),
     ("financial_summary", ("financial summary", "financials pack", "financial pack", "financial overview", "model summary")),
-    ("ic_memo", ("ic memo", "investment memo", "investment committee", "investment memorandum", "memo")),
     ("dd_report", ("due diligence report", "dd report", "full report", "complete report", "full pack", "all formats")),
+    ("board_deck", ("board deck", "deck", "slides", "presentation", "powerpoint", "pptx")),
+    ("ic_memo", ("ic memo", "investment memo", "investment committee", "investment memorandum", "memo")),
 ]
 _FORMAT_KEYWORDS = [
     ("pptx", ("deck", "slides", "powerpoint", "pptx", "presentation")),
@@ -175,8 +182,8 @@ def interpret_request(req: DocumentRequest) -> Dict[str, Any]:
         if text.strip() == "":
             doc_type = "dd_report"  # no request: legacy full pack (backwards compatible)
         elif "pptx" in (requested_formats or text_formats):
-            doc_type = "dd_report"
-            assumptions.append("A deck was requested; using the full diligence pack layout.")
+            doc_type = "board_deck"
+            assumptions.append("A deck was requested; using the board deck layout.")
         else:
             doc_type = "ic_memo"
             assumptions.append(
@@ -197,6 +204,18 @@ def interpret_request(req: DocumentRequest) -> Dict[str, Any]:
         audience = spec["audience"]
     return {"doc_type": doc_type, "formats": formats, "audience": audience,
             "assumptions": assumptions, "questions": questions}
+
+
+_DOC_VERBS = ("create", "generate", "prepare", "draft", "write", "make", "build", "produce",
+              "export", "give me", "send me", "put together", "compile", "i need", "need a")
+_DOC_NOUNS = ("memo", "report", "one-pager", "one pager", "onepager", "teaser", "deck", "slides",
+              "presentation", "tear sheet", "pdf", "word doc", "docx", "spreadsheet", "excel", "deliverable")
+
+
+def detect_document_request(text: str) -> bool:
+    """True when a chat message asks for a deliverable (verb + document noun)."""
+    lower = f" {(text or '').lower()} "
+    return any(v in lower for v in _DOC_VERBS) and any(n in lower for n in _DOC_NOUNS)
 
 
 # ── 2. Inventory ───────────────────────────────────────────────────────
@@ -355,6 +374,10 @@ def plan_document(
             sections.append(key)
     if gaps and "diligence_gaps" not in sections:
         sections.append("diligence_gaps")
+    # Narrative order (snapshot → summary → thesis → numbers → risks → gaps →
+    # next steps → sources); ReportArchitect may still reorder within it.
+    canonical = list(SECTION_TITLES)
+    sections.sort(key=canonical.index)
     gap_agents = list(dict.fromkeys(a for g in gaps for a in SECTION_AGENTS.get(g, [])))
     questions = list(intent["questions"])
     if gaps:
@@ -451,7 +474,10 @@ def _fmt_value(value: Any) -> str:
     if isinstance(value, (int, float)):
         if abs(value) >= 1_000_000:
             return f"{value:,.0f}"
-        return f"{value:,.2f}".rstrip("0").rstrip(".")
+        if abs(value) >= 1 or value == 0:
+            return f"{value:,.2f}".rstrip("0").rstrip(".")
+        # Rates and ratios (WACC 0.095) must not be rounded to 0.1.
+        return f"{value:.4g}"
     return str(value)
 
 
@@ -664,7 +690,80 @@ def render_xlsx(model: Dict[str, Any]) -> bytes:
     return buf.getvalue()
 
 
-RENDERERS = {"docx": render_docx, "pdf": render_pdf, "xlsx": render_xlsx}
+def render_pptx(model: Dict[str, Any]) -> bytes:
+    """One slide per section; long tables continue on extra slides."""
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.util import Inches, Pt
+
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+    blank = prs.slide_layouts[6]
+    navy = RGBColor(0x1F, 0x3A, 0x5F)
+
+    def text_box(slide, left, top, width, height, text, size=14, bold=False, color=None):
+        frame = slide.shapes.add_textbox(left, top, width, height).text_frame
+        frame.word_wrap = True
+        para = frame.paragraphs[0]
+        para.text = str(text)
+        para.font.size, para.font.bold = Pt(size), bold
+        if color is not None:
+            para.font.color.rgb = color
+        return frame
+
+    def new_slide(title):
+        slide = prs.slides.add_slide(blank)
+        text_box(slide, Inches(0.5), Inches(0.3), Inches(12.3), Inches(0.8), title, size=26, bold=True, color=navy)
+        return slide
+
+    title = prs.slides.add_slide(blank)
+    text_box(title, Inches(0.8), Inches(2.4), Inches(11.7), Inches(1.2), model["title"], size=40, bold=True, color=navy)
+    text_box(title, Inches(0.8), Inches(3.6), Inches(11.7), Inches(0.6),
+             f"{model['subtitle']} | Prepared for: {model['audience']}", size=18)
+    if model["review_status"] != "ready_for_review" or model["warnings"]:
+        text_box(title, Inches(0.8), Inches(5.6), Inches(11.7), Inches(1.2),
+                 "Review required before distribution. " + ("; ".join(model["warnings"][:3]) or "Verify against sources."),
+                 size=12, color=RGBColor(0x9C, 0x00, 0x06))
+
+    rows_per_slide = 8
+    for sec in model["sections"]:
+        slide = new_slide(sec["title"])
+        top = Inches(1.3)
+        for block in sec["blocks"]:
+            if block["type"] in ("paragraph", "bullets"):
+                lines = ([f"{block['label']}: {block['text']}" if block.get("label") else block["text"]]
+                         if block["type"] == "paragraph" else [f"• {item}" for item in block["items"]])
+                frame = text_box(slide, Inches(0.6), top, Inches(12.1), Inches(0.5), lines[0], size=14)
+                for line in lines[1:8]:
+                    para = frame.add_paragraph()
+                    para.text, para.font.size = line, Pt(14)
+                top += Inches(0.45 * min(len(lines), 8) + 0.2)
+            elif block["type"] == "table":
+                chunks = [block["rows"][i:i + rows_per_slide] for i in range(0, len(block["rows"]), rows_per_slide)] or [[]]
+                for index, chunk in enumerate(chunks):
+                    if index:
+                        slide, top = new_slide(f"{sec['title']} (continued)"), Inches(1.3)
+                    shape = slide.shapes.add_table(len(chunk) + 1, len(block["columns"]), Inches(0.5), top,
+                                                   Inches(12.3), Inches(0.4 * (len(chunk) + 1)))
+                    table = shape.table
+                    for col, name in enumerate(block["columns"]):
+                        table.cell(0, col).text = str(name)
+                    for r, row in enumerate(chunk, start=1):
+                        for col, value in enumerate(row):
+                            table.cell(r, col).text = str(value)[:180]
+                    for r in range(len(chunk) + 1):
+                        for col in range(len(block["columns"])):
+                            for para in table.cell(r, col).text_frame.paragraphs:
+                                para.font.size = Pt(11)
+                    top += Inches(0.4 * (len(chunk) + 1) + 0.3)
+            if top > Inches(6.6):
+                slide, top = new_slide(f"{sec['title']} (continued)"), Inches(1.3)
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+RENDERERS = {"docx": render_docx, "pdf": render_pdf, "xlsx": render_xlsx, "pptx": render_pptx}
 
 
 async def render_formats(model: Dict[str, Any], formats: List[str]) -> Tuple[Dict[str, bytes], List[Dict[str, str]]]:
@@ -732,23 +831,6 @@ async def run_document_workflow(
         for r in risks[:20]
     ]
     artifacts, errors = await render_formats(model, plan.formats)
-    if "pptx" in plan.formats:
-        # Decks reuse the established evidence-safe deck generator.
-        from starlette.concurrency import run_in_threadpool
-
-        from app.core.reports.report_generator import generate_pptx
-        from app.core.reports.report_guardrails import ReportGuardrails
-
-        try:
-            analyst_data["_report_blueprint"] = {"sections": plan.sections, "density": plan.density}
-            content = await run_in_threadpool(generate_pptx, deal, analyst_data, results, [], deal.get("current_stage", "deep_dive"))
-            if ReportGuardrails.validate_artifact("pptx", content).get("valid"):
-                artifacts["pptx"] = content
-            else:
-                errors.append({"format": "pptx", "error": "Generated artifact failed structural validation."})
-        except Exception as exc:
-            errors.append({"format": "pptx", "error": f"Generation failed ({type(exc).__name__})."})
-
     review_actions = []
     if plan.gaps:
         review_actions.append("Resolve or accept the listed diligence gaps before distribution.")

@@ -736,7 +736,7 @@ function DealDetailPanel({
                             id="doc-request"
                             value={docRequest}
                             onChange={event => { setDocRequest(event.target.value); setDocPlan(null); }}
-                            placeholder="e.g. IC memo for the board as PDF, one-pager, risk report in Excel"
+                            placeholder="e.g. IC memo for the board as PDF, board deck, one-pager, risk report in Excel"
                             className="h-8 text-xs"
                             maxLength={4000}
                         />

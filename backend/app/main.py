@@ -3193,6 +3193,34 @@ async def chat_plan(request: Request):
         return {"error": "invalid_prompt", "details": guard}
 
     deal_id = body.get("deal_id", "unknown")
+
+    # A deliverable request on an already-analysed deal is served from the
+    # saved results: plan the document instead of re-running every agent.
+    from app.core.reports.document_workflow import DocumentRequest, build_plan, detect_document_request
+
+    if deal_id and deal_id != "unknown" and detect_document_request(prompt) and not body.get("force_analysis"):
+        try:
+            from app.agents.base import get_agent_registry
+
+            deal, _, _, report_inputs = await _load_report_inputs(deal_id)
+            plan, evidence, _ = await build_plan(
+                DocumentRequest(request=prompt), deal, report_inputs, get_agent_registry()
+            )
+            if evidence.get("successful_analysis_count", 0):
+                return {
+                    "success": True,
+                    "mode": "document",
+                    "reasoning": (
+                        f"The analysis for this deal is complete, so the {plan.title.lower()} can be built "
+                        "from the saved results without re-running agents."
+                    ),
+                    "data": {"document_plan": plan.as_dict(), "document_request": {"request": prompt}},
+                }
+        except HTTPException:
+            pass  # analysis not finished (or no deal): plan the analysis as usual
+        except Exception as exc:
+            logger.warning("chat_document_plan_failed", deal_id=deal_id, error=str(exc))
+
     company_name = body.get("company_name", "Target Company")
     ticker = _explicit_public_ticker(prompt)
     if str(company_name or "").strip().lower() in {"", "target company", "the target", "unknown"}:

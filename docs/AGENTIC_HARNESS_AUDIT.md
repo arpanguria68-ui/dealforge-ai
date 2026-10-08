@@ -451,3 +451,21 @@ findings.
 ### UI
 The Reports Hub has a "What do you need?" request box, a Preview plan step
 and a "run agents to fill missing sections" toggle.
+
+### Follow-up: decks and chat routing
+- **Adaptive board deck (`board_deck`):** a python-pptx renderer makes one
+  slide per planned section, splits long tables onto continuation slides,
+  and carries the review banner on the title slide. "Deck", "slides" and
+  "presentation" requests use it; "full report" still uses the legacy
+  four-format pack.
+- **Section order:** planned sections follow a fixed narrative order
+  (snapshot → summary → thesis → numbers → risks → gaps → next steps →
+  sources). ReportArchitect may still reorder within it.
+- **Value precision:** documents keep small values exact. WACC 0.095 had
+  been rounded to 0.1 by 2-decimal formatting.
+- **Chat routing:** `/chat/plan` detects deliverable requests (an action
+  verb plus a document noun). If the deal's analysis is complete, it returns
+  a document plan (`mode: "document"`) instead of a multi-agent task plan, so
+  nothing is re-run. The chat shows the plan, asks for approval, and calls
+  `/documents/generate` with the original request. `force_analysis: true`
+  opts out.

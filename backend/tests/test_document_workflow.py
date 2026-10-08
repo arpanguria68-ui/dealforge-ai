@@ -54,7 +54,8 @@ def _no_graph(monkeypatch):
     ("Prepare an IC memo for the board as PDF", "ic_memo", ["pdf"], "Board of Directors"),
     ("Need a one-pager teaser", "one_pager", ["docx", "pdf"], "Deal Team"),
     ("risk register in excel", "risk_report", ["xlsx"], "Risk Committee"),
-    ("build the slides", "dd_report", ["pptx"], "Investment Committee"),
+    ("build the slides", "board_deck", ["pptx"], "Board of Directors"),
+    ("full report as slides", "dd_report", ["pptx"], "Investment Committee"),
     ("", "dd_report", ["docx", "pdf", "pptx", "xlsx"], "Investment Committee"),
 ])
 def test_request_interpretation(text, doc_type, formats, audience):
@@ -258,7 +259,7 @@ def test_legacy_pack_honours_requested_formats(api, monkeypatch):
             return []
 
     monkeypatch.setattr(provenance, "get_provenance_collector", lambda: _Prov())
-    res = client.post("/api/v1/deals/deal-doc/documents/generate", json={"request": "build the slides"})
+    res = client.post("/api/v1/deals/deal-doc/documents/generate", json={"request": "full report as slides"})
     body = res.json()
     assert res.status_code == 200 and body["status"] == "complete", body
     artifacts, metadata = store.published
@@ -281,3 +282,41 @@ def test_numeric_risk_severity_renders_in_legacy_generators():
     from app.core.reports.report_generator import _severity_label
 
     assert [_severity_label(v) for v in (3, 5, 8, 10, "High", None)] == ["Medium", "Critical", "High", "Critical", "High", "Not rated"]
+
+
+@pytest.mark.asyncio
+async def test_board_deck_renders_one_slide_per_section_and_splits_long_tables():
+    from pptx import Presentation
+
+    many_risks = {"agent_type": "risk_assessor", "success": True, "data": {"risks": [
+        {"risk": f"Risk {i}", "severity": i % 10 + 1, "category": "Ops"} for i in range(20)]}}
+    out = await dw.run_document_workflow(
+        dw.DocumentRequest(request="board deck", use_architect=False), DEAL, [FIN_RESULT, many_risks], None)
+    assert set(out["artifacts"]) == {"pptx"} and not out["errors"], "a deck request means PPTX"
+    prs = Presentation(io.BytesIO(out["artifacts"]["pptx"]))
+    titles = [next((sh.text_frame.text for sh in slide.shapes if sh.has_text_frame), "") for slide in prs.slides]
+    assert titles[0] == "Board Deck"
+    assert "Risk Assessment" in titles and "Risk Assessment (continued)" in titles
+    assert "Executive Summary" in titles
+
+
+def test_chat_document_detection():
+    assert dw.detect_document_request("Please prepare an IC memo for the board")
+    assert dw.detect_document_request("make me a one-pager")
+    assert not dw.detect_document_request("Analyze Acme's revenue growth and margins")
+    assert not dw.detect_document_request("what are the key risks?")
+
+
+def test_chat_plan_serves_document_requests_from_saved_analysis(api):
+    client, store = api
+    res = client.post("/api/v1/chat/plan", json={"prompt": "Prepare an IC memo for the board", "deal_id": "deal-doc"})
+    body = res.json()
+    assert res.status_code == 200 and body["mode"] == "document"
+    assert body["data"]["document_plan"]["doc_type"] == "ic_memo"
+    assert "todo_list" not in body["data"], "no agent re-run planned"
+    assert store.published is None, "planning never generates"
+
+
+def test_values_keep_precision_in_documents():
+    assert [dw._fmt_value(v) for v in (0.095, 0.0412, 950.0, 12.345, 1_250_000.4, 0, 3)] == \
+        ["0.095", "0.0412", "950", "12.35", "1,250,000", "0", "3"]
