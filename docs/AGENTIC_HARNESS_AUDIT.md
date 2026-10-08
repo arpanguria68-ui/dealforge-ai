@@ -182,3 +182,27 @@ Now:
   previous run left behind (provider choice, the `deal_id` used to filter
   document retrieval).
 - Every graph read and write fails soft; a graph error never fails an agent.
+
+### Graph risks in the IC memo and compiled reports
+
+- `knowledge_graph.service.risk_register(deal_id)` returns the deal's top
+  current risks across all agents and the red team, ranked by severity,
+  bounded, and fail-soft.
+- **Investment memo agent:** the register is added to the prompt as a
+  labelled "cross-agent risk register" that feeds the Risk Assessment
+  section and the "Key risks" bullets. It also drives the risk-heatmap chart
+  flag and is returned as `risk_register` in the memo output. Runtime objects
+  (`kb_graph`) are no longer dumped into the memo's deal context.
+- **Report compiler (orchestrator `compiler` node):** `deal_state` carries the
+  register. The compiler is told to surface it in Key Takeaways and pass it to
+  `generate_report` as `analyst_data.risk_matrix`, which the PPTX/Excel/DOCX
+  generators already render.
+- **Bug fixed:** the compiler read generated files from
+  `tool_results[i]["result"]`, a key `generate_with_tools` never produces. It
+  therefore always reported zero generated formats (confidence 0.0) even when
+  `generate_report` succeeded.
+- Deliberately **not** wired into the Reports Hub evidence pipeline
+  (`document_planner`): that path only admits cited, curated evidence, and
+  graph risks are agent-recorded findings, not sources. The report architect
+  only plans sections from a capability inventory, so it needs no graph
+  content.

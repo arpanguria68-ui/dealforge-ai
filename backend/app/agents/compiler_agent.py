@@ -72,9 +72,12 @@ class ReportCompilerAgent(BaseAgent):
             if "tool_results" in response:
                 for res in response["tool_results"]:
                     if res.get("name") == "generate_report":
-                        output = res.get("result", {})
+                        # generate_with_tools records {name, success, data, error};
+                        # older code nested it under "result", which never existed,
+                        # so generated files were always dropped.
+                        output = res.get("result") or res
                         if output.get("success"):
-                            data = output.get("data", {})
+                            data = output.get("data") or {}
                             ext = data.get("file_extension")
                             if ext:
                                 generated_files[ext] = data.get("file_bytes_base64")
@@ -117,11 +120,21 @@ class ReportCompilerAgent(BaseAgent):
             "agents_completed": agents_run,
         }
 
+        from app.core.knowledge_graph.service import format_risk_register
+
+        risk_block = format_risk_register(deal_state.get("risk_register") or [])
+        risk_section = (
+            f"\n{risk_block}\nReflect the highest-severity items in the Key Takeaways "
+            "and pass them to `generate_report` inside `analyst_data.risk_matrix` "
+            "(fields: risk, severity, category, mitigation).\n"
+            if risk_block else ""
+        )
+
         return f"""Task: {task}
 
 Requested Formats: {formats}
 Deal Context Summary: {json.dumps(deal_info, indent=2)}
-
+{risk_section}
 --- AGENT ANALYSIS RESULTS ---
 {json.dumps(agent_results, indent=2)}
 

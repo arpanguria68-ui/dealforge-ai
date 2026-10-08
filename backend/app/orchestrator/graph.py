@@ -47,7 +47,7 @@ from app.agents.advanced_financial_modeler import AdvancedFinancialModelerAgent
 from app.agents.ingestion_agent import IngestionAgent
 from app.core.halugate import HaluGateEngine, HaluGateSeverity
 
-from app.core.knowledge_graph.service import get_knowledge_graph
+from app.core.knowledge_graph.service import get_knowledge_graph, risk_register
 
 from app.orchestrator.planner import AgentSelectionPlanner
 from app.orchestrator.screening_config import ScreeningTaskMap
@@ -1474,6 +1474,7 @@ Return the tasks in JSON format:
                         "target_company": deal_info.get("target_company"),
                         "final_score": state.get("final_score"),
                         "agents_run": [r["agent_type"] for r in agent_results],
+                        "risk_register": await risk_register(state["deal_id"]),
                     },
                 }
 

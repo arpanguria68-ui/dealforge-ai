@@ -11,6 +11,9 @@ from datetime import datetime
 
 from app.agents.base import BaseAgent, AgentOutput
 
+# Context keys that are runtime objects or duplicated elsewhere in the prompt.
+_CONTEXT_EXCLUDE = {"agent_results", "kb_graph", "knowledge_graph_context", "risk_data"}
+
 
 class InvestmentMemoAgent(BaseAgent):
     """
@@ -90,8 +93,21 @@ RULES:
                     data = json.dumps(r.get("data", {}), default=str)[:500]
                     prompt += f"\n--- {agent_name} ---\n{data}\n"
 
+            # Cross-agent risks from the deal knowledge graph feed section 6.
+            from app.core.knowledge_graph.service import format_risk_register, risk_register
+
+            register = await risk_register(context.get("deal_id"))
+            if register:
+                prompt += "\n" + format_risk_register(register) + "\n"
+                prompt += (
+                    "Use this register to populate the RISK ASSESSMENT section and the "
+                    "'Key risks' bullets; keep severities as given and note which agent "
+                    "area each risk came from.\n"
+                )
+                context.setdefault("risk_data", register)
+
             if context:
-                prompt += f"\nDEAL CONTEXT: {json.dumps({k: v for k, v in context.items() if k != 'agent_results'}, default=str)[:1500]}\n"
+                prompt += f"\nDEAL CONTEXT: {json.dumps({k: v for k, v in context.items() if k not in _CONTEXT_EXCLUDE}, default=str)[:1500]}\n"
 
             prompt += (
                 "\nDraft a complete investment memo following the structure above."
@@ -107,6 +123,7 @@ RULES:
                 "memo": content,
                 "charts": charts,
                 "sections": self._extract_sections(content),
+                "risk_register": register,
             }
 
             elapsed = (datetime.utcnow() - start).total_seconds() * 1000

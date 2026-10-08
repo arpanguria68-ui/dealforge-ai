@@ -275,3 +275,117 @@ async def test_tool_loop_puts_graph_context_in_system_prompt(monkeypatch):
 
     await agent.generate_with_tools("assess", system_prompt="base")
     assert seen["system"].startswith("base") and "## Prior findings X" in seen["system"]
+
+
+# ── Downstream consumers: IC memo and report compiler ──
+
+
+@pytest.fixture
+def kg_service(store, monkeypatch):
+    from app.core.knowledge_graph import service
+
+    monkeypatch.setattr(service, "_graph", store)
+    return store
+
+
+@pytest.mark.asyncio
+async def test_risk_register_is_ranked_bounded_and_fail_soft(kg_service, monkeypatch):
+    from app.core.knowledge_graph import service
+
+    await kg_service.add_risk("d1", "Low", 2, "Ops")
+    await kg_service.add_risk("d1", "High", 9, "Legal", "x" * 1000)
+    reg = await service.risk_register("d1", limit=5)
+    assert [r["name"] for r in reg] == ["High", "Low"]
+    assert len(reg[0]["description"]) == 300
+    assert await service.risk_register(None) == []
+    assert "not as cited sources" in service.format_risk_register(reg)
+    assert service.format_risk_register([]) == ""
+
+    class _Broken:
+        async def get_risks(self, deal_id):
+            raise RuntimeError("locked")
+
+    monkeypatch.setattr(service, "_graph", _Broken())
+    assert await service.risk_register("d1") == []
+
+
+def _bare(agent_cls, name):
+    from types import SimpleNamespace
+
+    agent = agent_cls.__new__(agent_cls)
+    agent.name = name
+    agent.logger = SimpleNamespace(info=lambda *a, **k: None, error=lambda *a, **k: None,
+                                   warning=lambda *a, **k: None)
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_investment_memo_uses_graph_risk_register(kg_service, monkeypatch):
+    from app.agents.investment_memo_agent import InvestmentMemoAgent
+
+    await kg_service.add_risk("deal-m", "Customer concentration", 8, "Commercial", "Top client 40%")
+    agent = _bare(InvestmentMemoAgent, "investment_memo_agent")
+    seen = {}
+
+    async def fake_generate(prompt, system_prompt=None):
+        seen["prompt"] = prompt
+        return {"content": "# Risk Assessment\nCustomer concentration"}
+
+    monkeypatch.setattr(agent, "generate_with_tools", fake_generate)
+    out = await agent.run("Draft IC memo", {"deal_id": "deal-m", "kb_graph": object()})
+
+    assert out.success
+    assert "CROSS-AGENT RISK REGISTER" in seen["prompt"]
+    assert "Customer concentration (severity 8/10, Commercial): Top client 40%" in seen["prompt"]
+    assert "kb_graph" not in seen["prompt"]
+    assert out.data["risk_register"][0]["name"] == "Customer concentration"
+    assert out.data["charts"].get("risk_heatmap") == "generated"
+
+
+@pytest.mark.asyncio
+async def test_investment_memo_without_graph_risks_is_unchanged(kg_service, monkeypatch):
+    from app.agents.investment_memo_agent import InvestmentMemoAgent
+
+    agent = _bare(InvestmentMemoAgent, "investment_memo_agent")
+    seen = {}
+
+    async def fake_generate(prompt, system_prompt=None):
+        seen["prompt"] = prompt
+        return {"content": "memo"}
+
+    monkeypatch.setattr(agent, "generate_with_tools", fake_generate)
+    out = await agent.run("Draft IC memo", {"deal_id": "empty"})
+    assert out.success and out.data["risk_register"] == []
+    assert "RISK REGISTER" not in seen["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_compiler_prompt_includes_register_and_collects_generated_files(monkeypatch):
+    from app.agents.compiler_agent import ReportCompilerAgent as CompilerAgent
+
+    agent = _bare(CompilerAgent, "compiler_agent")
+    agent.llm = object()
+    seen = {}
+
+    async def fake_generate(prompt, system_prompt=None):
+        seen["prompt"] = prompt
+        return {
+            "content": '{"reasoning": "done"}',
+            "tool_results": [{
+                "name": "generate_report", "success": True, "error": None,
+                "data": {"file_extension": "pptx", "file_bytes_base64": "UEs="},
+            }],
+        }
+
+    monkeypatch.setattr(agent, "generate_with_tools", fake_generate)
+    out = await agent.run("Compile", {
+        "formats": ["pptx"],
+        "deal_state": {"deal_name": "Acme", "risk_register": [
+            {"name": "Litigation", "severity": 7, "category": "Legal", "description": ""},
+        ]},
+    })
+
+    assert "Litigation (severity 7/10, Legal)" in seen["prompt"]
+    assert "analyst_data.risk_matrix" in seen["prompt"]
+    assert out.data["generated_formats"] == ["pptx"]
+    assert out.confidence == 1.0
