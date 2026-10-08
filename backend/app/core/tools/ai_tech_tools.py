@@ -8,19 +8,23 @@ and quantify AI-driven revenue uplift.
 from typing import Dict, Any, Optional
 import structlog
 from app.core.tools.tool_router import BaseTool, ToolResult
+from app.core.tools.grounded_extraction import EXTRACTED_NOTE, HEURISTIC_NOTE, extract_grounded, pick
 
 logger = structlog.get_logger(__name__)
 
 
 class AIStackScannerTool(BaseTool):
-    """Parses technical documents or repos to map out an AI/ML tech stack."""
+    """Extracts a quote-backed AI/ML tech stack map from technical text."""
+
+    output_quality = "extracted"
 
     def __init__(self):
         super().__init__(
             name="ai_stack_scanner",
             description=(
-                "Scans technical documents or text summaries to extract an AI/ML stack, "
-                "identify dependencies, model types, and assess stack age."
+                "Reads technical documents or text summaries and extracts the AI/ML stack "
+                "(models, frameworks, cloud, databases, RAG components), each component "
+                "backed by a verbatim quote."
             ),
         )
 
@@ -36,37 +40,67 @@ class AIStackScannerTool(BaseTool):
             "required": ["tech_summary_text"],
         }
 
+    COMPONENT_TYPES = ("model", "framework", "infrastructure", "database", "rag", "other")
+    # Canonical names the downstream defensibility scorer keys on.
+    CANONICAL = {
+        "pytorch": "PyTorch", "torch": "PyTorch", "tensorflow": "TensorFlow",
+        "aws": "AWS", "amazon web services": "AWS", "gcp": "GCP", "google cloud": "GCP",
+        "azure": "Azure", "postgres": "PostgreSQL", "postgresql": "PostgreSQL",
+        "mongodb": "MongoDB", "mongo": "MongoDB", "pinecone": "Vector DB",
+        "milvus": "Vector DB", "chroma": "Vector DB", "weaviate": "Vector DB", "pgvector": "Vector DB",
+    }
+
     async def execute(self, tech_summary_text: str = "", **kwargs) -> ToolResult:
-        text = tech_summary_text.lower()
+        items = await extract_grounded(
+            "ai_stack_scanner",
+            tech_summary_text,
+            "List the technology components the text says the company uses (models, ML "
+            "frameworks, cloud/infrastructure, databases, retrieval/RAG components).",
+            {
+                "component_type": "one of " + "|".join(self.COMPONENT_TYPES),
+                "name": "component name as written",
+            },
+            max_items=40,
+        )
+        if items is None:
+            scorecard = self._keyword_scorecard(tech_summary_text)
+            scorecard.update(data_quality="heuristic", method_note=HEURISTIC_NOTE)
+            return ToolResult(success=True, data=scorecard)
 
-        # Simplified mock logic for identifying stack components from text
-        models = []
-        if "llama" in text:
-            models.append("Llama")
-        if "gpt" in text:
-            models.append("GPT-based")
-        if "pytorch" in text:
-            models.append("PyTorch")
-        if "tensorflow" in text:
-            models.append("TensorFlow")
+        buckets: Dict[str, list] = {t: [] for t in self.COMPONENT_TYPES}
+        components = []
+        for i in items:
+            kind = pick(i.get("component_type"), self.COMPONENT_TYPES, "other")
+            raw = str(i.get("name") or "").strip()[:80]
+            if not raw:
+                continue
+            name = self.CANONICAL.get(raw.lower(), raw)
+            if name not in buckets[kind]:
+                buckets[kind].append(name)
+            components.append({"type": kind, "name": name, "quote": i["quote"]})
+        models = buckets["model"] + buckets["framework"]
+        scorecard = {
+            "models_and_frameworks": models or ["Unknown / Custom Models"],
+            "infrastructure": buckets["infrastructure"] or ["Unknown / On-Prem"],
+            "databases": buckets["database"] or ["Unknown Database"],
+            "has_rag_components": bool(buckets["rag"]) or "Vector DB" in buckets["database"],
+            "overall_stack_age_assessment": "Modern" if models else "Legacy / Unclear",
+            "components": components,
+            "data_quality": "extracted",
+            "method_note": EXTRACTED_NOTE,
+        }
+        return ToolResult(success=True, data=scorecard)
 
-        infra = []
-        if "aws" in text:
-            infra.append("AWS")
-        if "gcp" in text:
-            infra.append("GCP")
-        if "azure" in text:
-            infra.append("Azure")
-
-        db = []
-        if "postgres" in text:
-            db.append("PostgreSQL")
-        if "mongo" in text:
-            db.append("MongoDB")
+    @staticmethod
+    def _keyword_scorecard(tech_summary_text: str) -> Dict[str, Any]:
+        text = (tech_summary_text or "").lower()
+        models = [label for key, label in (("llama", "Llama"), ("gpt", "GPT-based"),
+                                           ("pytorch", "PyTorch"), ("tensorflow", "TensorFlow")) if key in text]
+        infra = [label for key, label in (("aws", "AWS"), ("gcp", "GCP"), ("azure", "Azure")) if key in text]
+        db = [label for key, label in (("postgres", "PostgreSQL"), ("mongo", "MongoDB")) if key in text]
         if "pinecone" in text or "milvus" in text or "chroma" in text:
             db.append("Vector DB")
-
-        scorecard = {
+        return {
             "models_and_frameworks": models or ["Unknown / Custom Models"],
             "infrastructure": infra or ["Unknown / On-Prem"],
             "databases": db or ["Unknown Database"],
@@ -74,11 +108,11 @@ class AIStackScannerTool(BaseTool):
             "overall_stack_age_assessment": "Modern" if models else "Legacy / Unclear",
         }
 
-        return ToolResult(success=True, data=scorecard)
-
 
 class ModelDefensibilityScorerTool(BaseTool):
     """Scores IP protection, scalability, and obsolescence risk."""
+
+    output_quality = "heuristic"
 
     def __init__(self):
         super().__init__(
@@ -146,6 +180,8 @@ class ModelDefensibilityScorerTool(BaseTool):
 
 class AIValueQuantifierTool(BaseTool):
     """Estimates AI-driven revenue uplift potential."""
+
+    output_quality = "heuristic"
 
     def __init__(self):
         super().__init__(

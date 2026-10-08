@@ -16,11 +16,27 @@ import structlog
 
 logger = structlog.get_logger()
 
+# Parsed documents are chunked downstream, so these limits only guard against
+# pathological files. They used to be 10-15K chars total (2K per PDF page, 50
+# rows x 20 cols per sheet), which silently indexed only the first few pages
+# of a CIM or a corner of a financial model.
+MAX_INGEST_CHARS = int(os.getenv("INGEST_MAX_CHARS", "2000000"))
+MAX_PDF_PAGES = int(os.getenv("INGEST_MAX_PDF_PAGES", "1000"))
+MAX_SHEET_ROWS = int(os.getenv("INGEST_MAX_SHEET_ROWS", "5000"))
+MAX_SHEET_COLS = int(os.getenv("INGEST_MAX_SHEET_COLS", "100"))
+
+
+def _cap(text: str, file_path: str) -> str:
+    """Apply the safety cap visibly: marker in the text plus a warning log."""
+    if len(text) <= MAX_INGEST_CHARS:
+        return text
+    logger.warning("ingest_text_truncated", file=file_path, chars=len(text), indexed=MAX_INGEST_CHARS)
+    return text[:MAX_INGEST_CHARS] + f"\n[TRUNCATED: {len(text) - MAX_INGEST_CHARS} chars not indexed]"
+
 # Default knowledge base paths
-DEFAULT_KNOWLEDGE_DIRS = [
-    r"F:\code project\Kimi_Agent_DealForge AI PRD\Knowledge managerment\Excel knowledge",
-    r"F:\code project\Kimi_Agent_DealForge AI PRD\Knowledge managerment\Finance knowledge base",
-]
+from app.core.paths import knowledge_dirs
+
+DEFAULT_KNOWLEDGE_DIRS = knowledge_dirs()
 
 
 class KnowledgeIngestionService:
@@ -53,9 +69,9 @@ class KnowledgeIngestionService:
                 parts.append(f"\n=== SHEET: {sheet_name} ===")
 
                 rows_seen = 0
-                for row in ws.iter_rows(max_row=50, values_only=False):  # First 50 rows
+                for row in ws.iter_rows(max_row=MAX_SHEET_ROWS, values_only=False):
                     cell_values = []
-                    for cell in row[:20]:  # First 20 columns
+                    for cell in row[:MAX_SHEET_COLS]:
                         if cell.value is not None:
                             cell_values.append(str(cell.value))
                     if cell_values:
@@ -65,7 +81,7 @@ class KnowledgeIngestionService:
                     parts.append("(empty sheet)")
 
             wb.close()
-            return "\n".join(parts)[:10000]  # Cap at 10K chars
+            return _cap("\n".join(parts), file_path)
 
         except Exception as e:
             logger.warning("excel_parse_error", file=file_path, error=str(e))
@@ -83,15 +99,17 @@ class KnowledgeIngestionService:
             parts.append(f"Pages: {len(doc)}\n")
 
             for i, page in enumerate(doc):
-                if i >= 30:  # Cap at 30 pages
-                    parts.append(f"\n... ({len(doc) - 30} more pages)")
+                if i >= MAX_PDF_PAGES:
+                    parts.append(f"\n[TRUNCATED: {len(doc) - MAX_PDF_PAGES} more pages not indexed]")
+                    logger.warning("ingest_pdf_pages_truncated", file=file_path,
+                                   pages=len(doc), indexed=MAX_PDF_PAGES)
                     break
                 text = page.get_text()
                 if text.strip():
-                    parts.append(f"\n--- Page {i+1} ---\n{text[:2000]}")
+                    parts.append(f"\n--- Page {i+1} ---\n{text}")
 
             doc.close()
-            return "\n".join(parts)[:15000]
+            return _cap("\n".join(parts), file_path)
 
         except Exception as e:
             logger.warning("pdf_parse_error", file=file_path, error=str(e))
@@ -120,7 +138,7 @@ class KnowledgeIngestionService:
                     parts.append(f"\n--- Slide {i+1} ---")
                     parts.append("\n".join(texts[:20]))
 
-            return "\n".join(parts)[:10000]
+            return _cap("\n".join(parts), file_path)
 
         except Exception as e:
             logger.warning("pptx_parse_error", file=file_path, error=str(e))

@@ -322,11 +322,12 @@ class DebateModeratorAgent(BaseAgent):
 
             execution_time = (datetime.now() - start_time).total_seconds() * 1000
 
+            debate_data = {**synthesis_data, "requires_revision": requires_revision}
             return AgentOutput(
                 success=True,
-                data={**synthesis_data, "requires_revision": requires_revision},
+                data=debate_data,
                 reasoning=synthesis_data.get("reasoning", ""),
-                confidence=0.75,
+                confidence=self._evidence_confidence(0.75, None, debate_data if synthesis_data else {}),
                 execution_time_ms=execution_time,
             )
 

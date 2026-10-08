@@ -16,7 +16,9 @@ class ReportGuardrails:
             return {"valid": False, "issues": ["Artifact is empty or not binary data."]}
         if fmt == "pdf":
             valid = content.startswith(b"%PDF-") and b"%%EOF" in content[-2048:]
-            return {"valid": valid, "issues": [] if valid else ["PDF header or trailer is missing."]}
+            if not valid:
+                return {"valid": False, "issues": ["PDF header or trailer is missing."]}
+            return ReportGuardrails.deep_validate(fmt, content)
 
         required_members = {
             "docx": "word/document.xml",
@@ -36,7 +38,57 @@ class ReportGuardrails:
                     return {"valid": False, "issues": [f"OOXML member is corrupt: {broken_member}."]}
         except (OSError, zipfile.BadZipFile):
             return {"valid": False, "issues": ["OOXML package is not a valid ZIP container."]}
-        return {"valid": True, "issues": []}
+        return ReportGuardrails.deep_validate(fmt, content)
+
+    @staticmethod
+    def deep_validate(fmt: str, content: bytes) -> Dict[str, Any]:
+        """Re-open the artifact with its own library and require real content.
+
+        Structural checks only proved the ZIP/PDF envelope; a package whose XML
+        the Office libraries cannot parse, or a document with no content,
+        still passed. Each format is now loaded the way a reader would load
+        it. A missing optional library skips that check rather than failing.
+        """
+        import io
+
+        try:
+            if fmt == "docx":
+                from docx import Document
+
+                doc = Document(io.BytesIO(content))
+                blocks = sum(1 for p in doc.paragraphs if p.text.strip()) + len(doc.tables)
+                stats = {"paragraphs": len(doc.paragraphs), "tables": len(doc.tables)}
+                ok = blocks > 0
+            elif fmt == "pptx":
+                from pptx import Presentation
+
+                prs = Presentation(io.BytesIO(content))
+                stats = {"slides": len(prs.slides)}
+                ok = len(prs.slides) > 0
+            elif fmt == "xlsx":
+                from openpyxl import load_workbook
+
+                wb = load_workbook(io.BytesIO(content), read_only=True)
+                cells = sum(1 for ws in wb.worksheets for row in ws.iter_rows(values_only=True) for v in row if v not in (None, ""))
+                stats = {"sheets": len(wb.worksheets), "filled_cells": cells}
+                wb.close()
+                ok = cells > 0
+            elif fmt == "pdf":
+                from pypdf import PdfReader
+
+                reader = PdfReader(io.BytesIO(content))
+                text = "".join((page.extract_text() or "") for page in reader.pages[:3])
+                stats = {"pages": len(reader.pages)}
+                ok = len(reader.pages) > 0 and bool(text.strip())
+            else:
+                return {"valid": False, "issues": [f"Unsupported artifact format: {fmt}."]}
+        except ImportError:
+            return {"valid": True, "issues": [], "deep_check": "skipped_library_missing"}
+        except Exception as exc:
+            return {"valid": False, "issues": [f"{fmt.upper()} could not be opened: {type(exc).__name__}."]}
+        if not ok:
+            return {"valid": False, "issues": [f"{fmt.upper()} opened but contains no content."], "stats": stats}
+        return {"valid": True, "issues": [], "stats": stats}
 
     @staticmethod
     def validate_agent_results(agent_results: List[Dict]) -> Dict[str, Any]:

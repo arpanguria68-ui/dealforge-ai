@@ -147,7 +147,28 @@ class OfficeCLIService:
         except json.JSONDecodeError:
             issues_data = []
 
-        return {"success": True, "issues": issues_data}
+        return {"success": True, "issues": self._normalize_issues(issues_data)}
+
+    @staticmethod
+    def _normalize_issues(issues_data: Any) -> list:
+        """Flatten OfficeCLI's issue report to a list of blocking issues.
+
+        OfficeCLI wraps results as {"success": true, "data": {"count": 0,
+        "issues": []}}. Callers tested ``if result["issues"]``, and a non-empty
+        wrapper dict is truthy, so every clean DOCX/PPTX/XLSX was rejected
+        whenever OfficeCLI was installed. Only error-level items block.
+        """
+        items = issues_data
+        if isinstance(items, dict):
+            items = (items.get("data") or {}).get("issues") if isinstance(items.get("data"), dict) else items.get("issues")
+        if not isinstance(items, list):
+            return []
+        blocking = []
+        for item in items:
+            level = str((item or {}).get("severity") or (item or {}).get("level") or "error").lower() if isinstance(item, dict) else "error"
+            if level in ("error", "critical", "fatal"):
+                blocking.append(item)
+        return blocking
 
     async def merge_template(
         self,

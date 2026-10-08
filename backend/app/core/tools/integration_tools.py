@@ -17,6 +17,8 @@ logger = structlog.get_logger(__name__)
 class RoadmapGeneratorTool(BaseTool):
     """Generates a risk-weighted 100-day integration plan."""
 
+    output_quality = "template"
+
     def __init__(self):
         super().__init__(
             name="roadmap_generator",
@@ -146,6 +148,7 @@ class ChurnMonteCarloTool(BaseTool):
         base_count: float = 0.0,
         cultural_fit_score: float = 50.0,
         iterations: int = 1000,
+        seed: int = 42,
         **kwargs
     ) -> ToolResult:
         if base_count <= 0:
@@ -157,6 +160,8 @@ class ChurnMonteCarloTool(BaseTool):
         # Suppose a perfect fit = 5% baseline churn, awful fit = 30% churn
         expected_churn_rate = 0.30 - (0.25 * (cultural_fit_score / 100.0))
 
+        # Seeded so the same inputs give the same answer across runs/reports.
+        rng = random.Random(seed)
         results = []
         for _ in range(iterations):
             # Beta distribution around the expected mean
@@ -165,12 +170,13 @@ class ChurnMonteCarloTool(BaseTool):
             low = max(0.0, mode - 0.10)
             high = min(1.0, mode + 0.15)
 
-            simulated_rate = random.triangular(low, high, mode)
+            simulated_rate = rng.triangular(low, high, mode)
             results.append(simulated_rate)
 
         avg_rate = sum(results) / iterations
-        p10 = sorted(results)[int(0.10 * iterations)]
-        p90 = sorted(results)[int(0.90 * iterations)]
+        ordered = sorted(results)
+        p10 = ordered[int(0.10 * iterations)]
+        p90 = ordered[int(0.90 * iterations)]
 
         expected_churned_count = int(base_count * avg_rate)
 
@@ -189,6 +195,8 @@ class ChurnMonteCarloTool(BaseTool):
 
 class SynergyTrackerTool(BaseTool):
     """Models phased synergy realization using an OU-inspired fade."""
+
+    output_quality = "template"
 
     def __init__(self):
         super().__init__(

@@ -10,6 +10,10 @@ import json
 from datetime import datetime
 
 from app.agents.base import BaseAgent, AgentOutput
+from app.core.prompt_context import render_context
+
+# Context keys that are runtime objects or duplicated elsewhere in the prompt.
+_CONTEXT_EXCLUDE = {"agent_results", "kb_graph", "knowledge_graph_context", "risk_data"}
 
 
 class InvestmentMemoAgent(BaseAgent):
@@ -87,11 +91,24 @@ RULES:
                 prompt += "AGENT FINDINGS:\n"
                 for r in agent_results[:10]:
                     agent_name = r.get("agent", "unknown")
-                    data = json.dumps(r.get("data", {}), default=str)[:500]
+                    data = render_context(r.get("data", {}), 1500, priority=())
                     prompt += f"\n--- {agent_name} ---\n{data}\n"
 
+            # Cross-agent risks from the deal knowledge graph feed section 6.
+            from app.core.knowledge_graph.service import format_risk_register, risk_register
+
+            register = await risk_register(context.get("deal_id"))
+            if register:
+                prompt += "\n" + format_risk_register(register) + "\n"
+                prompt += (
+                    "Use this register to populate the RISK ASSESSMENT section and the "
+                    "'Key risks' bullets; keep severities as given and note which agent "
+                    "area each risk came from.\n"
+                )
+                context.setdefault("risk_data", register)
+
             if context:
-                prompt += f"\nDEAL CONTEXT: {json.dumps({k: v for k, v in context.items() if k != 'agent_results'}, default=str)[:1500]}\n"
+                prompt += f"\nDEAL CONTEXT: {render_context(context, 4000, exclude=_CONTEXT_EXCLUDE)}\n"
 
             prompt += (
                 "\nDraft a complete investment memo following the structure above."
@@ -107,14 +124,16 @@ RULES:
                 "memo": content,
                 "charts": charts,
                 "sections": self._extract_sections(content),
+                "risk_register": register,
             }
+            analysis.update(await self._build_memo_files(context))
 
             elapsed = (datetime.utcnow() - start).total_seconds() * 1000
             return AgentOutput(
                 success=True,
                 data=analysis,
                 reasoning="Generated investment memo with executive summary and supporting charts.",
-                confidence=0.85,
+                confidence=self._evidence_confidence(0.85, result, analysis if content.strip() else {}),
                 execution_time_ms=elapsed,
                 tool_calls=result.get("tool_calls"),
             )
@@ -124,6 +143,43 @@ RULES:
             return AgentOutput(
                 success=False, data={"error": str(e)}, reasoning=str(e), confidence=0.0
             )
+
+    async def _build_memo_files(self, context: Dict) -> Dict[str, Any]:
+        """Produce the memo as real DOCX/PDF files via the build_document tool.
+
+        The LLM prose above is a draft; the deliverable files are built by
+        Python document libraries from the recorded agent results, so their
+        figures and risks come from evidence rather than generated text.
+        """
+        agent_results = [
+            {"agent_type": r.get("agent_type") or r.get("agent"), "success": r.get("success", True), "data": r.get("data")}
+            for r in context.get("agent_results", []) if isinstance(r, dict) and isinstance(r.get("data"), dict)
+        ]
+        if not agent_results:
+            return {"files": {}, "file_status": "skipped: no recorded agent results to build from"}
+        deal = {
+            "id": context.get("deal_id"),
+            "name": context.get("deal_name") or context.get("company_name"),
+            "target_company": context.get("company_name") or context.get("target_company"),
+            "industry": context.get("industry"),
+        }
+        try:
+            result = await self.tools.execute("build_document", {
+                "request": "IC memo", "doc_type": "ic_memo", "formats": ["docx", "pdf"],
+                "deal": deal, "agent_results": agent_results,
+            })
+        except Exception as exc:
+            self.logger.warning("memo_files_not_built", error=str(exc))
+            return {"files": {}, "file_status": f"failed: {type(exc).__name__}"}
+        if not result.success or not isinstance(result.data, dict):
+            self.logger.warning("memo_files_not_built", error=result.error)
+            return {"files": {}, "file_status": f"failed: {result.error}"}
+        return {
+            "files": result.data.get("files_base64", {}),
+            "file_status": "built",
+            "file_sections": result.data.get("sections", []),
+            "file_review_status": result.data.get("review_status"),
+        }
 
     def _generate_charts(self, context: Dict) -> Dict[str, str]:
         """Generate infographic charts from analysis data."""

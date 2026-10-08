@@ -25,6 +25,9 @@ ofas_outputs/
 *.json
 !package.json
 !tsconfig.json
+# Frontend build configs referenced by tsconfig.json (build fails without them)
+!frontend/tsconfig.app.json
+!frontend/tsconfig.node.json
 
 # IDE
 .vscode/
@@ -42,3 +45,20 @@ temp_diff.txt
 backend/data/pageindex/documents/
 gemini.env
 tmp/
+
+# OfficeCLI binaries are auto-downloaded at runtime (OFFICECLI_AUTO_DOWNLOAD)
+backend/data/officecli/
+
+# Embedded deal knowledge graph (SQLite)
+backend/data/knowledge_graph.db*
+backend/knowledge_graph.db*
+
+# Runtime artifacts: databases, logs, scratch output, downloaded binaries
+*.db
+*.sqlite3
+*.log
+*.err
+test_out*.txt
+/tmp/*
+!/tmp/*.py
+/data/officecli/

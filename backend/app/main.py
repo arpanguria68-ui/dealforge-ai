@@ -7,6 +7,7 @@ from fastapi import (
     UploadFile,
     File,
     Request,
+    Body,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -63,6 +64,16 @@ REPORT_DOWNLOAD_HEADERS = {
     "X-Content-Type-Options": "nosniff",
 }
 REQUIRED_REPORT_FORMATS = {"docx", "pdf", "pptx", "xlsx"}
+
+
+def _expected_report_formats(documents: List[Dict[str, Any]]) -> set:
+    """Formats a bundle must contain: what it was planned with, else the legacy four."""
+    planned = {tuple(sorted(d.get("expected_formats") or [])) for d in documents}
+    if len(planned) == 1:
+        only = next(iter(planned))
+        if only:
+            return set(only)
+    return REQUIRED_REPORT_FORMATS
 
 
 def _explicit_public_ticker(text: str) -> Optional[str]:
@@ -148,6 +159,11 @@ async def async_lifespan(app: FastAPI):
     # Initialize Redis Store
     RedisStore.get_instance()
 
+    # Warm the Laya decision backend off the request path (checkpoint load).
+    from app.core.laya.client import get_laya_client
+
+    app.state.laya_warmup = asyncio.create_task(get_laya_client().warmup())
+
     # ── Initialize OfficeCLI (if auto-download enabled) ──
     if settings.OFFICECLI_AUTO_DOWNLOAD:
         try:
@@ -167,6 +183,12 @@ async def async_lifespan(app: FastAPI):
     logger.info("Shutting down DealForge AI")
     await close_db()
     await RedisStore.get_instance().close()
+    from app.core.laya.client import get_laya_client
+
+    warmup = getattr(app.state, "laya_warmup", None)
+    if warmup is not None and not warmup.done():
+        warmup.cancel()
+    await get_laya_client().aclose()
 
 
 def get_orchestrator_instance():
@@ -194,6 +216,24 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
 )
+
+# Request body size guard for JSON APIs (uploads have their own limit above).
+API_MAX_JSON_BYTES = int(float(os.getenv("API_MAX_JSON_MB", "5")) * 1024 * 1024)
+
+
+@app.middleware("http")
+async def limit_json_body_size(request: Request, call_next):
+    content_type = request.headers.get("content-type", "")
+    length = request.headers.get("content-length")
+    if "application/json" in content_type and length and length.isdigit() and int(length) > API_MAX_JSON_BYTES:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=413,
+            content={"detail": f"Request body exceeds {API_MAX_JSON_BYTES // (1024 * 1024)} MB"},
+        )
+    return await call_next(request)
+
 
 # Security
 security = HTTPBearer(auto_error=False)
@@ -251,9 +291,16 @@ class TemplateMergeRequest(BaseModel):
     template_path: str
     output_path: str
     data: Dict[str, Any]
-    final_score: Optional[float] = None
-    final_recommendation: Optional[str] = None
-    created_at: str
+
+
+def _confined_path(path: str, *, enforce: bool = True) -> str:
+    """Resolve a caller-supplied server path inside SERVER_PATH_ROOTS or 400."""
+    from app.core.path_guard import PathNotAllowed, resolve_within_roots
+
+    try:
+        return str(resolve_within_roots(path, enforce=enforce))
+    except PathNotAllowed as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 class AgentRunRequest(BaseModel):
@@ -446,6 +493,17 @@ async def export_deal_provenance(deal_id: str):
 
     export_data = await get_provenance_collector().export_chain(deal_id)
     return export_data
+
+
+@app.get("/api/v1/deals/{deal_id}/knowledge-graph")
+async def get_deal_knowledge_graph(deal_id: str, label: Optional[str] = None):
+    """Current knowledge-graph facts for a deal (metrics, risks, entities written by agents)."""
+    from app.core.knowledge_graph.service import get_knowledge_graph
+
+    graph = get_knowledge_graph()
+    if label:
+        return {"deal_id": deal_id, "facts": await graph.query_current_facts(deal_id, label)}
+    return {"deal_id": deal_id, **await graph.deal_summary(deal_id)}
 
 
 @app.get("/api/v1/deals/{deal_id}/agent-messages")
@@ -733,7 +791,9 @@ async def generate_deal_report(
 
 
 @app.post("/api/v1/documents/merge")
-async def merge_document_template(request: TemplateMergeRequest):
+async def merge_document_template(
+    request: TemplateMergeRequest, _: bool = Depends(require_admin_token)
+):
     """
     Merge JSON data into a DOCX/XLSX/PPTX template using OfficeCLI.
 
@@ -749,20 +809,18 @@ async def merge_document_template(request: TemplateMergeRequest):
             detail="OfficeCLI not available. Install officecli binary.",
         )
 
-    result = await service.merge_template(
-        request.template_path,
-        request.output_path,
-        request.data,
-    )
+    template_path = _confined_path(request.template_path)
+    output_path = _confined_path(request.output_path)
+    result = await service.merge_template(template_path, output_path, request.data)
 
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Merge failed"))
 
-    return {"success": True, "output": request.output_path}
+    return {"success": True, "output": output_path}
 
 
 @app.get("/api/v1/documents/template/{template_path:path}/variables")
-async def get_template_vars(template_path: str):
+async def get_template_vars(template_path: str, _: bool = Depends(require_admin_token)):
     """Extract {{variable}} names from a template"""
     from app.core.reports.officecli_service import get_officecli_service
 
@@ -770,7 +828,7 @@ async def get_template_vars(template_path: str):
     if not service.is_available():
         raise HTTPException(status_code=503, detail="OfficeCLI not available")
 
-    variables = service.get_template_variables(template_path)
+    variables = service.get_template_variables(_confined_path(template_path))
     return {"variables": variables}
 
 
@@ -791,7 +849,9 @@ class BatchMergeRequest(BaseModel):
 
 
 @app.post("/api/v1/documents/batch")
-async def batch_merge_documents(request: BatchMergeRequest):
+async def batch_merge_documents(
+    request: BatchMergeRequest, _: bool = Depends(require_admin_token)
+):
     """
     Batch merge multiple templates in parallel or sequential.
 
@@ -803,6 +863,11 @@ async def batch_merge_documents(request: BatchMergeRequest):
     service = get_officecli_service()
     if not service.is_available():
         raise HTTPException(status_code=503, detail="OfficeCLI not available")
+
+    # Validate every path up front so a bad item rejects the whole batch.
+    for item in request.items:
+        item.template_path = _confined_path(item.template_path)
+        item.output_path = _confined_path(item.output_path)
 
     results = []
     if request.parallel:
@@ -901,8 +966,150 @@ def _require_approved_report(metadata: Optional[Dict[str, Any]]) -> None:
         )
 
 
+class DocumentGenerateRequest(BaseModel):
+    """Optional brief for an adaptive deliverable (omit for the legacy full pack)."""
+
+    request: str = Field("", max_length=4000, description="Plain-language ask, e.g. 'IC memo for the board as PDF'")
+    doc_type: Optional[str] = Field(None, description="dd_report | ic_memo | one_pager | risk_report | financial_summary")
+    formats: Optional[List[str]] = Field(None, description="Subset of docx, pdf, xlsx, pptx")
+    audience: Optional[str] = Field(None, max_length=120)
+    fill_gaps: bool = Field(False, description="Run the agents that own missing required sections")
+    max_gap_agents: int = Field(2, ge=0, le=4)
+    use_architect: bool = True
+
+    def is_adaptive(self) -> bool:
+        return bool(
+            self.request.strip() or (self.doc_type and self.doc_type != "dd_report")
+            or self.formats or self.fill_gaps or self.audience
+        )
+
+    def to_workflow_request(self):
+        from app.core.reports.document_workflow import DocumentRequest
+
+        return DocumentRequest(
+            request=self.request, doc_type=self.doc_type, formats=self.formats, audience=self.audience,
+            fill_gaps=self.fill_gaps, max_gap_agents=self.max_gap_agents, use_architect=self.use_architect,
+        )
+
+
+async def _load_report_inputs(deal_id: str):
+    """Deal + persisted task results (activity only enriches). Shared by plan/generate."""
+    redis_store = RedisStore.get_instance()
+    deal = await redis_store.get_deal(deal_id)
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    if deal.get("status") not in {"completed", "ready"}:
+        raise HTTPException(status_code=409, detail="Complete the analysis before generating deliverables.")
+    from app.core.tasks.task_manager import get_task_manager
+    from app.core.reports.document_planner import build_report_agent_results
+
+    task_lists = await get_task_manager().get_lists_for_deal(deal_id)
+    saved_tasks = [item for task_list in task_lists for item in task_list.items]
+    if task_lists and (
+        not any(item.status == "done" and isinstance(item.result, dict) for item in saved_tasks)
+        or any(item.status != "done" or not isinstance(item.result, dict) for item in saved_tasks)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Saved analysis still has unfinished or unpersisted tasks; finish or review the run before generating deliverables.",
+        )
+    activities = await redis_store.get_deal_activity(deal_id)
+    return deal, task_lists, activities, build_report_agent_results(task_lists, activities)
+
+
+@app.post("/api/v1/deals/{deal_id}/documents/plan")
+async def plan_deal_documents(
+    deal_id: str,
+    body: Optional[DocumentGenerateRequest] = Body(None),
+    _: bool = Depends(require_admin_token),
+):
+    """Outline first: the adaptive plan (type, formats, sections, coverage, gaps,
+    assumptions, questions) without generating or publishing anything."""
+    from app.agents.base import get_agent_registry
+    from app.core.reports.document_workflow import build_plan
+
+    deal, _, _, report_inputs = await _load_report_inputs(deal_id)
+    req = (body or DocumentGenerateRequest()).to_workflow_request()
+    plan, evidence, risks = await build_plan(req, deal, report_inputs, get_agent_registry())
+    return {
+        "deal_id": deal_id,
+        "plan": plan.as_dict(),
+        "risk_register_size": len(risks),
+        "evidence": {
+            "successful_analyses": evidence.get("successful_analysis_count", 0),
+            "sources": len(evidence.get("sources", [])),
+            "financial_data_points": len(evidence.get("data_points", [])),
+            "open_unknowns": len(evidence.get("unknowns", [])),
+        },
+    }
+
+
+async def _generate_adaptive_documents(deal_id: str, deal: Dict[str, Any], report_inputs, body: "DocumentGenerateRequest"):
+    import hashlib
+    import re as _re
+
+    from app.agents.base import get_agent_registry
+    from app.core.document_store import DocumentStore
+    from app.core.reports.document_workflow import run_document_workflow
+
+    outcome = await run_document_workflow(body.to_workflow_request(), deal, report_inputs, get_agent_registry())
+    plan, model = outcome["plan"], outcome["model"]
+    artifacts, errors = outcome["artifacts"], outcome["errors"]
+    safe_name = _re.sub(r"_+", "_", _re.sub(r"[^A-Za-z0-9]", "_", deal.get("target_company", "report"))).strip("_") or "report"
+    fingerprint = hashlib.sha256(json.dumps(
+        {"deal": deal, "plan": plan, "model": model}, sort_keys=True, default=str
+    ).encode("utf-8")).hexdigest()
+    metadata = {
+        "target_company": deal.get("target_company", "Unknown"),
+        "deal_name": deal.get("name", "Unknown"),
+        "agents_count": len(outcome["agent_results"]),
+        "safe_filename": f"{safe_name}_{plan['doc_type']}",
+        "report_version": str(uuid.uuid4()),
+        "analysis_fingerprint": fingerprint,
+        "release_status": "pending_review",
+        "review_status": model["review_status"],
+        "review_warnings": model["warnings"],
+        "doc_type": plan["doc_type"],
+        "document_title": plan["title"],
+        "audience": plan["audience"],
+        "expected_formats": plan["formats"],
+        "plan_sections": [s["key"] for s in plan["sections"]],
+    }
+    doc_store = DocumentStore.get_instance()
+    formats_generated = []
+    if artifacts and not errors and set(artifacts) == set(plan["formats"]):
+        try:
+            await doc_store.replace_documents(deal_id, artifacts, metadata)
+            formats_generated = list(artifacts)
+        except Exception as exc:
+            errors.append({"format": "bundle", "error": f"Bundle publication failed ({type(exc).__name__})."})
+    manifest = await doc_store.list_documents(deal_id)
+    return {
+        "deal_id": deal_id,
+        "status": "complete" if formats_generated else ("partial" if artifacts else "failed"),
+        "formats_generated": formats_generated,
+        "errors": errors,
+        "documents": manifest,
+        "plan": plan,
+        "gap_fill": outcome["gap_fill"],
+        "review_actions": outcome["review_actions"],
+        "coverage": {
+            "successful_analyses": outcome["evidence"].get("successful_analysis_count", 0),
+            "source_records": len(outcome["evidence"].get("sources", [])),
+            "financial_data_points": len(outcome["evidence"].get("data_points", [])),
+            "open_data_gaps": len(outcome["evidence"].get("unknowns", [])) + len(plan["gaps"]),
+            "human_review_required": model["review_status"] == "review_required" or bool(plan["gaps"]),
+            "release_status": "pending_review",
+        },
+    }
+
+
 @app.post("/api/v1/deals/{deal_id}/documents/generate")
-async def generate_deal_documents(deal_id: str, _: bool = Depends(require_admin_token)):
+async def generate_deal_documents(
+    deal_id: str,
+    body: Optional[DocumentGenerateRequest] = Body(None),
+    _: bool = Depends(require_admin_token),
+):
     """
     Generate & cache all report formats (DOCX, PPTX, Excel, PDF) for a deal.
 
@@ -919,30 +1126,24 @@ async def generate_deal_documents(deal_id: str, _: bool = Depends(require_admin_
 
     redis_store = RedisStore.get_instance()
     doc_store = DocumentStore.get_instance()
-    deal = await redis_store.get_deal(deal_id)
-    if not deal:
-        raise HTTPException(status_code=404, detail="Deal not found")
-    if deal.get("status") not in {"completed", "ready"}:
-        raise HTTPException(status_code=409, detail="Complete the analysis before generating deliverables.")
 
     import re
 
     # ── Step 1: Collect the persisted task results; activity is metadata only ──
-    from app.core.tasks.task_manager import get_task_manager
-    task_lists = await get_task_manager().get_lists_for_deal(deal_id)
-    saved_tasks = [item for task_list in task_lists for item in task_list.items]
-    if task_lists and (
-        not any(item.status == "done" and isinstance(item.result, dict) for item in saved_tasks)
-        or any(item.status != "done" or not isinstance(item.result, dict) for item in saved_tasks)
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="Saved analysis still has unfinished or unpersisted tasks; finish or review the run before generating deliverables.",
-        )
-    activities = await redis_store.get_deal_activity(deal_id)
+    deal, task_lists, activities, report_inputs = await _load_report_inputs(deal_id)
+
+    # Adaptive deliverable (type/format/audience/gap-filling from the brief).
+    requested_formats = None
+    if body is not None and body.is_adaptive():
+        from app.core.reports.document_workflow import interpret_request
+
+        intent = interpret_request(body.to_workflow_request())
+        if intent["doc_type"] != "dd_report":
+            return await _generate_adaptive_documents(deal_id, deal, report_inputs, body)
+        requested_formats = intent["formats"]
+
     from app.agents.base import get_agent_registry
-    from app.core.reports.document_planner import build_report_agent_results, prepare_document_payload
-    report_inputs = build_report_agent_results(task_lists, activities)
+    from app.core.reports.document_planner import prepare_document_payload
     agent_results, analyst_data, evidence_brief = await prepare_document_payload(
         get_agent_registry(), deal, report_inputs
     )
@@ -1025,11 +1226,15 @@ async def generate_deal_documents(deal_id: str, _: bool = Depends(require_admin_
         "pdf": generate_pdf,
         "docx": generate_docx,
     }
+    if requested_formats:
+        format_generators = {f: g for f, g in format_generators.items() if f in requested_formats} or format_generators
+    metadata["expected_formats"] = sorted(format_generators)
+    metadata["doc_type"] = "dd_report"
 
     from app.core.reports.report_guardrails import ReportGuardrails
     from starlette.concurrency import run_in_threadpool
 
-    for fmt, generator in format_generators.items():
+    async def _render_one(fmt, generator):
         try:
             content = await run_in_threadpool(
                 generator, deal, analyst_data, agent_results, provenance_records, deal_stage
@@ -1068,6 +1273,9 @@ async def generate_deal_documents(deal_id: str, _: bool = Depends(require_admin_
                 format=fmt,
                 error_type=type(e).__name__,
             )
+
+    # Formats are independent: render them concurrently (each in a worker thread).
+    await asyncio.gather(*(_render_one(fmt, generator) for fmt, generator in format_generators.items()))
 
     if not errors and len(pending_artifacts) == len(format_generators):
         try:
@@ -1118,7 +1326,7 @@ async def approve_deal_documents(
     formats = {document.get("format") for document in documents}
     if (
         None in versions or len(versions) != 1 or None in fingerprints
-        or len(fingerprints) != 1 or formats != REQUIRED_REPORT_FORMATS
+        or len(fingerprints) != 1 or formats != _expected_report_formats(documents)
     ):
         raise HTTPException(
             status_code=409,
@@ -1196,7 +1404,7 @@ async def download_deal_bundle(deal_id: str, _: bool = Depends(require_admin_tok
     formats = {document.get("format") for document in documents}
     if (
         len(versions) != 1 or None in versions or len(fingerprints) != 1
-        or None in fingerprints or formats != REQUIRED_REPORT_FORMATS
+        or None in fingerprints or formats != _expected_report_formats(documents)
     ):
         raise HTTPException(
             status_code=409,
@@ -1430,6 +1638,55 @@ async def documents_query(body: _QueryBody):
         raise HTTPException(status_code=500, detail="Knowledge search failed. Check service logs for a redacted diagnostic.")
 
 
+# ── Upload limits ────────────────────────────────────────────────
+# Uploads were read whole into memory with no size or type check.
+UPLOAD_MAX_BYTES = int(float(os.getenv("UPLOAD_MAX_MB", "50")) * 1024 * 1024)
+UPLOAD_MAX_FILES = int(os.getenv("UPLOAD_MAX_FILES", "50"))
+UPLOAD_ALLOWED_EXTENSIONS = {
+    e.strip().lower() for e in os.getenv(
+        "UPLOAD_ALLOWED_EXTENSIONS",
+        ".pdf,.docx,.doc,.txt,.md,.markdown,.csv,.json,.html,.htm,.xlsx,.xlsm,.xls,.pptx",
+    ).split(",") if e.strip()
+}
+
+
+async def _save_upload_to_temp(file: UploadFile) -> str:
+    """Stream an upload to a temp file, enforcing type and size limits (415/413)."""
+    import tempfile
+
+    suffix = os.path.splitext(file.filename or "")[1].lower()
+    if suffix not in UPLOAD_ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type '{suffix or '(none)'}'. Allowed: {sorted(UPLOAD_ALLOWED_EXTENSIONS)}",
+        )
+    written = 0
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > UPLOAD_MAX_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File exceeds the {UPLOAD_MAX_BYTES // (1024 * 1024)} MB upload limit",
+                )
+            tmp.write(chunk)
+        if written == 0:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+        tmp.close()
+        return tmp.name
+    except BaseException:
+        tmp.close()
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        raise
+
+
 @app.post("/api/v1/documents/upload")
 async def documents_upload(file: UploadFile = File(...), deal_id: Optional[str] = None):
     """Upload and index a document into the Knowledge Base."""
@@ -1437,11 +1694,7 @@ async def documents_upload(file: UploadFile = File(...), deal_id: Optional[str] 
 
     tmp_path: Optional[str] = None
     try:
-        suffix = os.path.splitext(file.filename or ".txt")[1]
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            content = await file.read()
-            tmp.write(content)
-            tmp_path = tmp.name
+        tmp_path = await _save_upload_to_temp(file)
 
         client = get_pageindex_client()
         metadata = {"original_filename": file.filename}
@@ -1457,6 +1710,8 @@ async def documents_upload(file: UploadFile = File(...), deal_id: Optional[str] 
             "total_pages": getattr(result, "total_pages", 0),
             "total_chunks": getattr(result, "total_chunks", 0),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -1474,17 +1729,17 @@ async def documents_upload_bulk(
     """Bulk upload and index multiple documents into the Knowledge Base."""
     import tempfile, os
 
+    if len(files) > UPLOAD_MAX_FILES:
+        raise HTTPException(
+            status_code=413, detail=f"At most {UPLOAD_MAX_FILES} files per bulk upload"
+        )
     client = get_pageindex_client()
     results = []
 
     for file in files:
         tmp_path: Optional[str] = None
         try:
-            suffix = os.path.splitext(file.filename or ".txt")[1]
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                content = await file.read()
-                tmp.write(content)
-                tmp_path = tmp.name
+            tmp_path = await _save_upload_to_temp(file)
 
             metadata = {"original_filename": file.filename}
             if deal_id:
@@ -1500,11 +1755,13 @@ async def documents_upload_bulk(
                 }
             )
         except Exception as e:
+            # Per-file failures (incl. 413/415) are reported, not fatal to the batch.
+            error = e.detail if isinstance(e, HTTPException) else str(e)
             logger.error(
-                "bulk_upload_file_failed", filename=file.filename, error=str(e)
+                "bulk_upload_file_failed", filename=file.filename, error=str(error)
             )
             results.append(
-                {"filename": file.filename, "status": "failed", "error": str(e)}
+                {"filename": file.filename, "status": "failed", "error": str(error)}
             )
         finally:
             if tmp_path:
@@ -1583,6 +1840,13 @@ async def documents_ingest_directory(
     background_tasks: __import__("fastapi").BackgroundTasks,
 ):
     """Ingest documents from a local directory in the background."""
+    # Server deployments confine imports to SERVER_PATH_ROOTS (otherwise any
+    # caller could index and read back arbitrary server files); local desktop
+    # mode keeps importing the user's own folders. See app/core/path_guard.py.
+    from app.core.path_guard import restriction_enabled
+
+    if restriction_enabled():
+        request.directory_path = _confined_path(request.directory_path)
     # We do NOT validate path.is_dir() here because the UI might send
     # a Windows path (e.g., C:\) while this backend runs in a Linux container.
     # The background task will attempt resolution and log any errors gracefully.
@@ -1603,27 +1867,38 @@ async def documents_ingest_directory(
 async def documents_ingest_url(request: URLIngestRequest):
     """Ingest content from a URL directly into the Knowledge Base."""
     try:
-        from app.core.tools.scraper_tool import WebScraperTool
+        # app.core.tools.scraper_tool never existed, so this endpoint always
+        # failed; use the router's scraper (blocks private/internal addresses).
+        from app.core.tools.tool_router import WebScraperTool
 
         scraper = WebScraperTool()
-        result = await scraper.execute(request.url)
+        result = await scraper.execute(request.url, max_chars=200_000)
         if not result.success:
             raise HTTPException(
                 status_code=400, detail=f"Scraper failed: {result.error}"
             )
+        text = (result.data or {}).get("text", "") if isinstance(result.data, dict) else str(result.data or "")
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="No extractable text at URL")
 
         client = get_pageindex_client()
-        metadata = {"original_filename": request.url, "source": "url"}
+        metadata = {
+            "original_filename": (result.data or {}).get("title") or request.url,
+            "source": "url",
+            "url": request.url,
+        }
         if request.deal_id:
             metadata["deal_id"] = request.deal_id
 
-        res = await client.ingest_text(result.data, metadata=metadata)
+        res = await client.ingest_text(text, metadata=metadata)
 
         return {
             "status": "indexed",
             "url": request.url,
             "index_id": getattr(res, "index_id", ""),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("url_ingest_failed", url=request.url, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
@@ -1871,12 +2146,8 @@ async def upload_document(deal_id: str, file: UploadFile = File(...)):
 
     import tempfile
 
-    # Save file safely to a temporary file
-    suffix = os.path.splitext(file.filename or ".txt")[1]
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        content = await file.read()
-        tmp.write(content)
-        temp_path = tmp.name
+    # Save file safely to a temporary file (type/size limits enforced)
+    temp_path = await _save_upload_to_temp(file)
 
     # Index with PageIndex
     pageindex = get_pageindex_client()
@@ -2642,7 +2913,9 @@ async def reorder_tasks(list_id: str, body: Dict[str, Any]):
 
 
 @app.post("/api/v1/knowledge/ingest")
-async def ingest_knowledge_base(body: Optional[Dict[str, Any]] = None):
+async def ingest_knowledge_base(
+    body: Optional[Dict[str, Any]] = None, _: bool = Depends(require_admin_token)
+):
     """Batch-ingest knowledge base documents into RAG."""
     from app.core.tasks.knowledge_ingestion import KnowledgeIngestionService
 
@@ -2653,7 +2926,7 @@ async def ingest_knowledge_base(body: Optional[Dict[str, Any]] = None):
 
     directory = body.get("directory")
     if directory:
-        result = await service.ingest_directory(directory)
+        result = await service.ingest_directory(_confined_path(directory))
     else:
         result = await service.ingest_all_knowledge_bases()
 
@@ -2920,6 +3193,34 @@ async def chat_plan(request: Request):
         return {"error": "invalid_prompt", "details": guard}
 
     deal_id = body.get("deal_id", "unknown")
+
+    # A deliverable request on an already-analysed deal is served from the
+    # saved results: plan the document instead of re-running every agent.
+    from app.core.reports.document_workflow import DocumentRequest, build_plan, detect_document_request
+
+    if deal_id and deal_id != "unknown" and detect_document_request(prompt) and not body.get("force_analysis"):
+        try:
+            from app.agents.base import get_agent_registry
+
+            deal, _, _, report_inputs = await _load_report_inputs(deal_id)
+            plan, evidence, _ = await build_plan(
+                DocumentRequest(request=prompt), deal, report_inputs, get_agent_registry()
+            )
+            if evidence.get("successful_analysis_count", 0):
+                return {
+                    "success": True,
+                    "mode": "document",
+                    "reasoning": (
+                        f"The analysis for this deal is complete, so the {plan.title.lower()} can be built "
+                        "from the saved results without re-running agents."
+                    ),
+                    "data": {"document_plan": plan.as_dict(), "document_request": {"request": prompt}},
+                }
+        except HTTPException:
+            pass  # analysis not finished (or no deal): plan the analysis as usual
+        except Exception as exc:
+            logger.warning("chat_document_plan_failed", deal_id=deal_id, error=str(exc))
+
     company_name = body.get("company_name", "Target Company")
     ticker = _explicit_public_ticker(prompt)
     if str(company_name or "").strip().lower() in {"", "target company", "the target", "unknown"}:
@@ -3022,6 +3323,7 @@ async def chat_execute_task(request: Request):
         re.IGNORECASE,
     ))
 
+    upstream_results: List[Dict[str, Any]] = []
     if task_list_id and task_id:
         task_manager = get_task_manager()
         todo = await task_manager.get_todo_list(task_list_id)
@@ -3039,6 +3341,19 @@ async def chat_execute_task(request: Request):
                 status_code=409,
                 detail={"error": "dependencies_not_satisfied", "blocked_by": unmet_dependencies},
             )
+        # Hand synthesis tasks (memo, curator, reasoning, scoring, architect) the
+        # persisted results of the tasks they depend on. Previously they only
+        # saw whatever the client chose to send in agent_outputs, and the memo
+        # agent's agent_results was never set at all.
+        upstream_results = [
+            {
+                "agent_type": item.assigned_agent, "agent": item.assigned_agent,
+                "task_id": item.id, "task_title": item.title,
+                "success": True, "data": item.result,
+            }
+            for item in todo.items
+            if item.id in planned_task.depends_on and item.status == "done" and isinstance(item.result, dict)
+        ]
 
     # Prefer an explicitly supplied public ticker in the user/task text over
     # heuristic company-name extraction, which can select an unrelated phrase.
@@ -3101,16 +3416,30 @@ async def chat_execute_task(request: Request):
         if agent:
             if client is not None:
                 agent.llm = client
+            client_outputs = body.get("agent_outputs", {})
+            server_outputs = {r["agent_type"]: r["data"] for r in upstream_results}
             agent_context = {
                 "deal_id": deal_id,
                 "task_id": task_id,
                 "ticker": ticker,
                 "company_name": company_name,
                 "user_prompt": body.get("user_prompt", ""),
-                "agent_outputs": body.get("agent_outputs", {}),
+                # Persisted upstream results win over client-supplied copies.
+                "agent_outputs": {**(client_outputs if isinstance(client_outputs, dict) else {}), **server_outputs},
+                "agent_results": upstream_results,
                 "routed_provider": provider,
                 "local_only": local_only,
             }
+            if deal_id and upstream_results:
+                try:
+                    from app.core.knowledge_graph.graph_store import render_graph_context
+                    from app.core.knowledge_graph.service import get_knowledge_graph
+
+                    graph_block = render_graph_context(await get_knowledge_graph().deal_summary(deal_id))
+                    if graph_block:
+                        agent_context["knowledge_graph_context"] = graph_block
+                except Exception as exc:
+                    logger.debug("execute_task_graph_context_unavailable", error=str(exc))
             agent._current_context = agent_context
             if input_only or resolved_type == "financial_analyst":
                 execution = agent.run(task_description, context=agent_context)
@@ -3981,6 +4310,7 @@ async def laya_status(_: bool = Depends(require_admin_token)):
         "lmstudio": lmstudio,
         "local": {"installed": client._local_importable()},
         "remote": {"url": client._remote_url()},
+        "runtime": client.stats(),
     }
 
 

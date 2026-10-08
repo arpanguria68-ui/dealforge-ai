@@ -12,6 +12,17 @@ import structlog
 from app.core.tools.tool_router import BaseTool, ToolResult
 
 
+_EQUITIES = None
+
+
+def _equities(fd):
+    """FinanceDatabase loads a ~300K-row dataset; build it once per process."""
+    global _EQUITIES
+    if _EQUITIES is None:
+        _EQUITIES = fd.Equities()
+    return _EQUITIES
+
+
 # Lazy import to avoid startup delays
 def _try_import_fd():
     try:
@@ -61,6 +72,8 @@ class PeerDiscoveryTool(BaseTool):
             "required": [],
         }
 
+    # Synchronous on purpose (pandas-heavy); ToolRouter runs sync tools in a
+    # worker thread so the event loop is not blocked.
     def execute(
         self,
         sector: Optional[str] = None,
@@ -79,7 +92,7 @@ class PeerDiscoveryTool(BaseTool):
             )
 
         try:
-            equities = fd.Equities()
+            equities = _equities(fd)
 
             # Start with all equities, then apply filters
             # The .select() method applies filters logically ANDed together

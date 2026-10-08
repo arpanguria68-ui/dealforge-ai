@@ -39,9 +39,8 @@ class ComplexReasoningAgent(BaseAgent):
         prompt = self._build_prompt(task, curated_data, memory_context, context)
         system_prompt = self._build_system_prompt()
 
-        response = await self.generate_with_tools(prompt, system_prompt)
-
         try:
+            response = await self.generate_with_tools(prompt, system_prompt)
             content = response.get("content", "")
             reasoning_trace = self._parse_output(content)
 
@@ -51,7 +50,7 @@ class ComplexReasoningAgent(BaseAgent):
                 success=True,
                 data=reasoning_trace,
                 reasoning="Executed CoT reasoning successfully.",
-                confidence=0.95,
+                confidence=self._evidence_confidence(0.85, response, reasoning_trace),
                 execution_time_ms=execution_time,
                 tool_calls=response.get("function_calls"),
             )

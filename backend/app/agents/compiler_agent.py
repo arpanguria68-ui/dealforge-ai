@@ -59,34 +59,66 @@ class ReportCompilerAgent(BaseAgent):
         system_prompt = self._build_system_prompt()
 
         # The LLM will decide how to structure the narrative and call the `generate_report` tool
-        response = await self.generate_with_tools(prompt, system_prompt)
-
         try:
+            response = await self.generate_with_tools(prompt, system_prompt)
             # Parse the LLM's structural narrative decisions
             from app.core.json_helpers import extract_and_parse_json
 
             narrative_data = extract_and_parse_json(response["content"])
+            if not isinstance(narrative_data, dict):
+                narrative_data = {"reasoning": str(narrative_data)[:500]} if narrative_data else {}
 
             # Extract generated files from the tool context (handled natively by base.py execute loop)
             generated_files = {}
             if "tool_results" in response:
                 for res in response["tool_results"]:
                     if res.get("name") == "generate_report":
-                        output = res.get("result", {})
+                        # generate_with_tools records {name, success, data, error};
+                        # older code nested it under "result", which never existed,
+                        # so generated files were always dropped.
+                        output = res.get("result") or res
                         if output.get("success"):
-                            data = output.get("data", {})
+                            data = output.get("data") or {}
                             ext = data.get("file_extension")
                             if ext:
                                 generated_files[ext] = data.get("file_bytes_base64")
 
+            built_by = {ext: "llm_tool_call" for ext in generated_files}
+
+            # Files must come from the Python generators, not from whether the
+            # model remembered to call the tool: build any requested format it
+            # skipped by calling generate_report directly.
+            risk_matrix = [
+                {"risk": r.get("name"), "severity": r.get("severity"), "category": r.get("category"),
+                 "mitigation": "", "evidence": "knowledge_graph"}
+                for r in (deal_state.get("risk_register") or []) if isinstance(r, dict)
+            ]
+            for fmt in target_formats:
+                ext = "xlsx" if fmt in ("excel", "xlsx") else fmt
+                if ext in generated_files:
+                    continue
+                tool_result = await self.tools.execute("generate_report", {
+                    "format": "excel" if ext == "xlsx" else ext,
+                    "deal_context": deal_state,
+                    "analyst_data": {**narrative_data, **({"risk_matrix": risk_matrix} if risk_matrix else {})},
+                    "agent_results": agent_results,
+                })
+                data = tool_result.data if tool_result.success and isinstance(tool_result.data, dict) else {}
+                if data.get("file_bytes_base64"):
+                    generated_files[data.get("file_extension") or ext] = data["file_bytes_base64"]
+                    built_by[data.get("file_extension") or ext] = "deterministic_tool_call"
+                else:
+                    self.logger.warning("compiler_format_not_built", format=ext, error=tool_result.error)
+
             execution_time = (datetime.now() - start_time).total_seconds() * 1000
 
             return AgentOutput(
-                success=True,
+                success=bool(generated_files),
                 data={
                     "narrative_structure": narrative_data,
                     "generated_formats": list(generated_files.keys()),
                     "files_base64": generated_files,
+                    "built_by": built_by,
                 },
                 reasoning=narrative_data.get(
                     "reasoning", "Compiled requested reports."
@@ -117,11 +149,21 @@ class ReportCompilerAgent(BaseAgent):
             "agents_completed": agents_run,
         }
 
+        from app.core.knowledge_graph.service import format_risk_register
+
+        risk_block = format_risk_register(deal_state.get("risk_register") or [])
+        risk_section = (
+            f"\n{risk_block}\nReflect the highest-severity items in the Key Takeaways "
+            "and pass them to `generate_report` inside `analyst_data.risk_matrix` "
+            "(fields: risk, severity, category, mitigation).\n"
+            if risk_block else ""
+        )
+
         return f"""Task: {task}
 
 Requested Formats: {formats}
 Deal Context Summary: {json.dumps(deal_info, indent=2)}
-
+{risk_section}
 --- AGENT ANALYSIS RESULTS ---
 {json.dumps(agent_results, indent=2)}
 

@@ -220,6 +220,7 @@ class DealState(TypedDict, total=False):
     # MECE Issue Tree
     issue_tree: Optional[Dict[str, Any]]
     red_team_flags: Optional[List[Dict[str, Any]]]
+    knowledge_graph: Optional[Dict[str, Any]]  # counts + top risks snapshot at completion
 
     # Cross-agent consistency (from QA Flow 3)
     consistency_warnings: Optional[List[Dict[str, Any]]]

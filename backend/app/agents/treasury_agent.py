@@ -9,6 +9,7 @@ import json
 from datetime import datetime
 
 from app.agents.base import BaseAgent, AgentOutput
+from app.core.prompt_context import render_context
 
 
 class TreasuryCashAgent(BaseAgent):
@@ -36,7 +37,7 @@ ANALYSIS AREAS:
 Always present a clear 13-week cash forecast with confidence bands."""
 
             prompt = (
-                f"TASK: {task}\n\nCONTEXT: {json.dumps(context, default=str)[:2000]}"
+                f"TASK: {task}\n\nCONTEXT: {render_context(context)}"
             )
 
             result = await self.generate_with_tools(prompt, system_prompt=system_prompt)
@@ -55,7 +56,7 @@ Always present a clear 13-week cash forecast with confidence bands."""
                 success=True,
                 data=analysis,
                 reasoning="Completed treasury analysis with cash flow projections.",
-                confidence=0.80,
+                confidence=self._evidence_confidence(0.80, result, analysis),
                 execution_time_ms=elapsed,
             )
 
@@ -123,17 +124,18 @@ CAPABILITIES:
 Always present 3 scenarios with probability weights."""
 
             prompt = (
-                f"TASK: {task}\n\nCONTEXT: {json.dumps(context, default=str)[:2000]}"
+                f"TASK: {task}\n\nCONTEXT: {render_context(context)}"
             )
             result = await self.generate_with_tools(prompt, system_prompt=system_prompt)
             content = result.get("content", "")
 
             elapsed = (datetime.utcnow() - start).total_seconds() * 1000
+            parsed = self._parse_output(content)
             return AgentOutput(
                 success=True,
-                data=self._parse_output(content),
+                data=parsed,
                 reasoning="Generated FP&A forecast with scenario analysis.",
-                confidence=0.80,
+                confidence=self._evidence_confidence(0.80, result, parsed),
                 execution_time_ms=elapsed,
             )
 
@@ -177,17 +179,18 @@ ANALYSIS AREAS:
 Flag any material tax risks or planning opportunities."""
 
             prompt = (
-                f"TASK: {task}\n\nCONTEXT: {json.dumps(context, default=str)[:2000]}"
+                f"TASK: {task}\n\nCONTEXT: {render_context(context)}"
             )
             result = await self.generate_with_tools(prompt, system_prompt=system_prompt)
             content = result.get("content", "")
 
             elapsed = (datetime.utcnow() - start).total_seconds() * 1000
+            parsed = self._parse_output(content)
             return AgentOutput(
                 success=True,
-                data=self._parse_output(content),
+                data=parsed,
                 reasoning="Completed tax compliance analysis.",
-                confidence=0.78,
+                confidence=self._evidence_confidence(0.78, result, parsed),
                 execution_time_ms=elapsed,
             )
 

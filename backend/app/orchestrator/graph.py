@@ -47,8 +47,7 @@ from app.agents.advanced_financial_modeler import AdvancedFinancialModelerAgent
 from app.agents.ingestion_agent import IngestionAgent
 from app.core.halugate import HaluGateEngine, HaluGateSeverity
 
-from app.core.knowledge_graph.neo4j_client import Neo4jClient, DealKnowledgeGraph
-from app.core.knowledge_graph.ontology_service import OntologyService
+from app.core.knowledge_graph.service import get_knowledge_graph, risk_register
 
 from app.orchestrator.planner import AgentSelectionPlanner
 from app.orchestrator.screening_config import ScreeningTaskMap
@@ -80,9 +79,7 @@ class DealOrchestrator:
         self.agent_registry = get_agent_registry()
         self._register_agents()
         
-        self.neo4j_client = Neo4jClient()
-        self.kb_graph = DealKnowledgeGraph(self.neo4j_client)
-        self.ontology_service = OntologyService()
+        self.kb_graph = get_knowledge_graph()
         
         # Phase 5: Advanced Orchestration Initialization (F-026, F-027, F-028)
         self.planner = AgentSelectionPlanner()
@@ -379,7 +376,7 @@ class DealOrchestrator:
                 updates["context"] = context
                 updates["deal_name"] = fallback_name
 
-        # Create Neo4j Deal Node (F-021)
+        # Create the deal root node in the knowledge graph (F-021)
         try:
             await self.kb_graph.initialize_deal(
                 deal_id=state["deal_id"],
@@ -387,7 +384,7 @@ class DealOrchestrator:
                 industry=state.get("context", {}).get("industry", "N/A")
             )
         except Exception as e:
-            self.logger.warning("neo4j_init_failed", error=str(e))
+            self.logger.warning("knowledge_graph_init_failed", error=str(e))
 
         # Phase 5: Dynamic Agent Selection (F-026)
         try:
@@ -560,16 +557,6 @@ Return the tasks in JSON format:
                 import json
                 tasks = json.loads(tasks)
                 
-            # Generate Dynamic Ontology (F-022)
-            try:
-                 ontology = await self.ontology_service.generate_ontology(
-                     industry=industry,
-                     deal_brief=state.get("deal_brief", "")
-                 )
-                 tasks["_ontology"] = ontology
-            except Exception as e:
-                 self.logger.warning("ontology_generation_failed", error=str(e))
-
             ctx_update = {}
             if guard_action != "allow":
                 ctx_update = {
@@ -687,6 +674,10 @@ Return the tasks in JSON format:
         if not active_agents:
              active_agents = agents_to_run
 
+        # Knowledge graph read-back (F-023): facts written by earlier agents and
+        # earlier passes (loop-backs) are shared with every agent in this pass.
+        kg_context = await self._knowledge_graph_context(state["deal_id"])
+
         if self.config.get("parallel_execution", True):
             # Run agents in parallel
             tasks = []
@@ -722,6 +713,8 @@ Return the tasks in JSON format:
                     
                     # Inject Knowledge Graph Service (F-023)
                     agent_specific_context["kb_graph"] = self.kb_graph
+                    if kg_context:
+                        agent_specific_context["knowledge_graph_context"] = kg_context
                     
                     # Run structured if requested (F-012/F-013)
                     task = self._run_agent_with_timeout(
@@ -763,18 +756,24 @@ Return the tasks in JSON format:
                                 "Injecting peer review feedback", agent=agent_name
                             )
 
+                    agent_specific_context["kb_graph"] = self.kb_graph
+                    if kg_context:
+                        agent_specific_context["knowledge_graph_context"] = kg_context
+
                     state = set_agent_state(state, agent_name, AgentState.RUNNING)
                     try:
                         task_str = (state.get("dynamic_tasks", {}) or {}).get(agent_name) or (
                             f"Perform focused {agent_name.replace('_', ' ')} due diligence. "
                             "Use cited evidence, identify material unknowns, and state assumptions and confidence."
                         )
+                        agent._current_context = agent_specific_context
                         result = await agent.run(
                             task_str,
                             context=agent_specific_context,
                         )
 
                         if result.success:
+                            await self._record_findings(agent, state["deal_id"], result.data)
                             if output_key == "specialist_outputs":
                                 specialist_outputs = dict(state.get("specialist_outputs") or {})
                                 specialist_outputs[agent_name] = result.data
@@ -825,6 +824,29 @@ Return the tasks in JSON format:
 
         return state
 
+    async def _knowledge_graph_context(self, deal_id: str) -> str:
+        """Prompt block of current graph facts for this deal ("" if none/unavailable)."""
+        try:
+            from app.core.knowledge_graph.graph_store import render_graph_context
+
+            return render_graph_context(await self.kb_graph.deal_summary(deal_id))
+        except Exception as e:
+            self.logger.warning("knowledge_graph_read_failed", error=str(e))
+            return ""
+
+    async def _record_findings(self, agent, deal_id: Optional[str], data: Any) -> None:
+        """Persist an agent's metrics/risks/entities to the knowledge graph (F-023).
+
+        The orchestrator calls ``agent.run()`` directly, so the write-back in
+        ``run_with_structure`` never ran for deal workflows; do it here.
+        """
+        if not deal_id or not isinstance(data, dict):
+            return
+        try:
+            await agent._write_findings_to_graph(data, deal_id, self.kb_graph)
+        except Exception as e:
+            self.logger.warning("knowledge_graph_write_failed", agent=getattr(agent, "name", "?"), error=str(e))
+
     async def _run_agent_with_timeout(
         self, agent, context: Dict, agent_name: str, output_key: str, task: str
     ):
@@ -833,6 +855,10 @@ Return the tasks in JSON format:
             try:
                 timeout = self.config.get("agent_timeout_seconds", 60)
 
+                # agent.run() bypasses run_with_structure, which is where
+                # _current_context is normally set; without this the tool loop
+                # read the previous run's context (provider, deal_id filters).
+                agent._current_context = context
                 result = await asyncio.wait_for(
                     agent.run(
                         task,
@@ -842,6 +868,7 @@ Return the tasks in JSON format:
                 )
 
                 if result.success:
+                    await self._record_findings(agent, context.get("deal_id"), result.data)
                     return agent_name, output_key, result.data
                 else:
                     return agent_name, output_key, None
@@ -1194,6 +1221,21 @@ Return the tasks in JSON format:
                         },
                     )
 
+                    # Red-team flags become graph risks so the debate/loop-back
+                    # pass and the final snapshot see them (severity 1-5 -> 2-10).
+                    for flag in (result.data.get("flags") or [])[:25]:
+                        try:
+                            await self.kb_graph.add_risk(
+                                deal_id=state["deal_id"],
+                                risk_name=f"Red team: {str(flag.get('description') or flag.get('type'))[:150]}",
+                                severity=int(flag.get("severity", 1)) * 2,
+                                category=str(flag.get("type") or "red_team"),
+                                description=str(flag.get("description") or ""),
+                            )
+                        except Exception as e:
+                            self.logger.warning("knowledge_graph_red_team_write_failed", error=str(e))
+                            break
+
                     # Log severity summary
                     max_sev = result.data.get("max_severity", 0)
                     total_flags = result.data.get("total_flags", 0)
@@ -1432,6 +1474,7 @@ Return the tasks in JSON format:
                         "target_company": deal_info.get("target_company"),
                         "final_score": state.get("final_score"),
                         "agents_run": [r["agent_type"] for r in agent_results],
+                        "risk_register": await risk_register(state["deal_id"]),
                     },
                 }
 
@@ -1540,11 +1583,22 @@ Return the tasks in JSON format:
         except Exception as e:
             self.logger.error("Provenance DB flush failed", error=str(e))
 
+        graph_snapshot = None
+        try:
+            summary = await self.kb_graph.deal_summary(state["deal_id"])
+            graph_snapshot = {
+                "counts": summary.get("counts", {}),
+                "top_risks": summary.get("top_risks", [])[:10],
+            }
+        except Exception as e:
+            self.logger.warning("knowledge_graph_snapshot_failed", error=str(e))
+
         return update_state(
             state,
             {
                 "current_stage": DealStage.COMPLETED,
                 "completed_at": datetime.utcnow().isoformat(),
+                **({"knowledge_graph": graph_snapshot} if graph_snapshot else {}),
             },
         )
 

@@ -12,6 +12,9 @@ services:
     container_name: dealforge-backend
     environment:
       - PYTHONUNBUFFERED=1
+      # Redis runs as the "redis" service; the app default (localhost) is unreachable here
+      # and RedisStore has no in-memory fallback, so deal/activity APIs would fail.
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
       # LLM & Search API Keys (Loaded from .env.docker via env_file but documented here)
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
@@ -34,6 +37,8 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    depends_on:
+      - redis
     restart: always
     networks:
       - dealforge-net

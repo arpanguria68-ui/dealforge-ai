@@ -10,6 +10,7 @@ import json
 from datetime import datetime
 
 from app.agents.base import BaseAgent, AgentOutput
+from app.core.prompt_context import render_context
 
 
 class ProspectusProcessingAgent(BaseAgent):
@@ -52,7 +53,7 @@ OUTPUT FORMAT: Structured JSON with clear sourcing for each data point."""
 
             prompt = f"TASK: {task}\n\n"
             if context:
-                prompt += f"CONTEXT: {json.dumps(context, default=str)[:2000]}\n\n"
+                prompt += f"CONTEXT: {render_context(context)}\n\n"
             if memory_context:
                 prompt += "RETRIEVED DOCUMENTS:\n"
                 for i, doc in enumerate(memory_context[:5]):
@@ -69,7 +70,7 @@ OUTPUT FORMAT: Structured JSON with clear sourcing for each data point."""
                 success=True,
                 data=analysis,
                 reasoning=f"Processed filing documents, extracted {len(analysis.get('kpis', {}))} KPIs.",
-                confidence=0.82,
+                confidence=self._evidence_confidence(0.82, result, analysis),
                 execution_time_ms=elapsed,
                 tool_calls=result.get("tool_calls"),
             )

@@ -7,6 +7,7 @@ MCP Tool: finance_analysis
 - Auto-fallback to Yahoo Finance
 """
 
+import asyncio
 from typing import Dict, Any, List, Optional, Union
 import os
 import structlog
@@ -110,7 +111,8 @@ class FinanceAnalysisTool(BaseTool):
             "%Y-%m-%d"
         )
 
-        try:
+        def _run_sync() -> ToolResult:
+            # FinanceToolkit performs blocking HTTP + pandas work.
             # Initialize Toolkit without local caching to prevent Uvicorn hot-reloads
             toolkit = Toolkit(
                 tickers=tickers,
@@ -179,6 +181,8 @@ class FinanceAnalysisTool(BaseTool):
                 )
 
             return ToolResult(success=True, data=result_data)
+        try:
+            return await asyncio.to_thread(_run_sync)
 
         except Exception as e:
             self.logger.error("finance_toolkit_failed", error=str(e))

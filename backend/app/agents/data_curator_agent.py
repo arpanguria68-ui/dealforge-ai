@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional, List
 import json
 from datetime import datetime
 
+from app.core.prompt_context import render_context
 from app.agents.base import BaseAgent, AgentOutput
 from app.core.json_helpers import extract_and_parse_json
 
@@ -40,11 +41,9 @@ class DataCuratorAgent(BaseAgent):
         prompt = self._build_synthesis_prompt(task, context, memory_context)
         system_prompt = self._build_system_prompt()
 
-        # 3. Call LLM
-        response = await self.generate_with_tools(prompt, system_prompt)
-
-        # 4. Parse output
+        # 4. Call LLM and parse output (provider failures return success=False)
         try:
+            response = await self.generate_with_tools(prompt, system_prompt)
             content = response.get("content", "")
             curated_data = self._parse_output(content)
 
@@ -56,7 +55,7 @@ class DataCuratorAgent(BaseAgent):
                 success=True,
                 data=curated_data,
                 reasoning="Synthesized agent outputs and resolved conflicts.",
-                confidence=0.9,
+                confidence=self._evidence_confidence(0.85, response, curated_data),
                 execution_time_ms=execution_time,
                 tool_calls=response.get("function_calls"),
             )
@@ -93,7 +92,7 @@ RULES:
         prompt = f"TASK: {task}\n"
         prompt += f"TARGET COMPANY: {company_name}\n\n"
         prompt += "AGENT OUTPUTS TO SYNTHESIZE:\n"
-        prompt += json.dumps(agent_outputs, default=str, indent=2) + "\n\n"
+        prompt += render_context(agent_outputs, 12000, priority=()) + "\n\n"
 
         if memory:
             prompt += "CROSS-DEAL INSIGHTS (PRIOR DEALS MEMORY):\n"

@@ -60,11 +60,12 @@ class IngestionAgent(BaseAgent):
             
             execution_time = (datetime.now() - start_time).total_seconds() * 1000
 
+            fact_data = fact_base.dict()
             return AgentOutput(
                 success=True,
-                data=fact_base.dict(),
+                data=fact_data,
                 reasoning="Extracted structured FactBase from available deal documents and context.",
-                confidence=0.85,
+                confidence=self._evidence_confidence(0.85, response, fact_data if extracted_data else {}),
                 execution_time_ms=execution_time,
                 tool_calls=response.get("function_calls"),
             )

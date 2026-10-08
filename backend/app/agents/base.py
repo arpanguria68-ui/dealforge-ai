@@ -9,6 +9,7 @@ import structlog
 import json
 import re
 import asyncio
+from contextvars import ContextVar
 
 from app.core.llm import get_llm_client
 from app.core.llm.model_router import get_model_router
@@ -22,9 +23,14 @@ from app.core.validation.output_validator import (
     format_validation_block,
 )
 from app.core.messaging.message_bus import get_message_bus, AgentMessage
-from app.core.knowledge_graph.neo4j_client import DealKnowledgeGraph
 
 logger = structlog.get_logger()
+
+# Per-task agent run context. Agent instances are process-wide singletons, so a
+# plain attribute let two concurrent deals overwrite each other's context
+# (provider choice, deal_id used to filter document retrieval) mid-run.
+# asyncio tasks copy the ContextVar on creation, so each run sees its own.
+_AGENT_RUN_CONTEXT: ContextVar[Dict[int, Any]] = ContextVar("agent_run_context", default={})
 
 
 @dataclass
@@ -60,6 +66,16 @@ class BaseAgent(ABC):
     name: str = "base_agent"
     description: str = "Base agent class"
     recommended_model: str = ""
+
+    @property
+    def _current_context(self) -> Any:
+        return _AGENT_RUN_CONTEXT.get().get(id(self), {})
+
+    @_current_context.setter
+    def _current_context(self, value: Any) -> None:
+        contexts = dict(_AGENT_RUN_CONTEXT.get())
+        contexts[id(self)] = value
+        _AGENT_RUN_CONTEXT.set(contexts)
 
     def __init__(
         self,
@@ -104,7 +120,8 @@ class BaseAgent(ABC):
             model = None
         else:
             provider, model, _used_fallback = await router.get_model_route_for_text(
-                self.name, f"{self.name}: {prompt[:1600]}"
+                self.name, f"{self.name}: {prompt[:1600]}",
+                est_tokens=self._estimate_tokens((system_prompt or "") + prompt) + 2048,
             )
         result = await get_llm_gateway().call(
             provider=provider,
@@ -170,6 +187,7 @@ class BaseAgent(ABC):
         # [NEW] Step 0.1: Closed-loop RL — inject historical best practices
         best_practices_context = ""
         action_id = None
+        quality_store = None
         try:
             from app.core.quality.agent_quality_store import AgentQualityStore
             quality_store = AgentQualityStore()
@@ -263,11 +281,15 @@ class BaseAgent(ABC):
                 )
 
         # Step 3: Retrieve context per branch
-        branch_contexts = {}
-        for branch in issue_tree.sub_branches:
-            branch_contexts[branch.id] = await self.retrieve_context(
-                branch.hypothesis, top_k=3
-            )
+        # Branch retrievals are independent; run them concurrently.
+        branch_results = await asyncio.gather(*(
+            self.retrieve_context(branch.hypothesis, top_k=3)
+            for branch in issue_tree.sub_branches
+        ))
+        branch_contexts = {
+            branch.id: result
+            for branch, result in zip(issue_tree.sub_branches, branch_results)
+        }
 
         # Step 4: Execute the core run() with enriched context
         enriched_context = {
@@ -295,17 +317,16 @@ class BaseAgent(ABC):
 
         # Step 8: Closed-loop RL — reflect, reward, update best practices
         try:
-            if action_id is not None:
-                reflection_score = await self.reflect(task, output)
+            if action_id is not None and quality_store is not None:
+                # Reflection is an LLM call; a failed run has nothing worth
+                # grading, so it is scored 0 without spending the call.
+                reflection_score = await self.reflect(task, output) if output.success else 0.0
                 reward = self.reward.compute_reward(
                     reflection_score=reflection_score,
                     task_completed=output.success,
                 )
                 output.reflection_score = reflection_score
 
-                from app.core.quality.agent_quality_store import AgentQualityStore
-                quality_store = AgentQualityStore()
-                await quality_store.initialize()
                 await quality_store.reward_action(
                     action_id, reward, f"reflection={reflection_score:.2f}"
                 )
@@ -371,7 +392,7 @@ class BaseAgent(ABC):
         return output
 
     async def _write_findings_to_graph(self, findings: Dict[str, Any], deal_id: str, kb_graph: Any):
-        """Extract entities/metrics from findings and persist to Neo4j (F-023)."""
+        """Extract entities/metrics from findings and persist to the deal knowledge graph (F-023)."""
         self.logger.info("writing_to_graph", deal_id=deal_id)
         
         # 1. Handle specialized metrics (Financial Analyst)
@@ -527,16 +548,31 @@ class BaseAgent(ABC):
             system_prompt = (system_prompt or "") + "\n\n" + sector_prompt
         if skill_context:
             system_prompt = (system_prompt or "") + "\n\n" + skill_context
+        kg_context = ctx.get("knowledge_graph_context")
+        if kg_context:
+            system_prompt = (system_prompt or "") + "\n\n" + kg_context
+        deliverable_guidance = self._deliverable_guidance(allowed_tool_names)
+        if deliverable_guidance:
+            system_prompt = (system_prompt or "") + "\n\n" + deliverable_guidance
 
         # Keep the task-level Laya decision for every call in this tool loop.
+        # Route on the real request size (system + prompt + tool schemas +
+        # output + headroom for tool results), not on the 1600-char excerpt
+        # Laya classifies; otherwise context-window fitting never triggered.
+        request_tokens = self._estimate_tokens(
+            (system_prompt or "") + prompt + (json.dumps(tools, default=str) if tools else "")
+        )
+        est_tokens = request_tokens + 1024 + (self._TOOL_RESULT_HEADROOM_TOKENS if tools else 0)
         model_router = get_model_router()
         selected_model = None
         if ctx.get("routed_provider"):
             provider = ctx["routed_provider"]
         else:
             provider, selected_model, _ = await model_router.get_model_route_for_text(
-                self.name, f"{self.name}: {prompt[:1600]}"
+                self.name, f"{self.name}: {prompt[:1600]}", est_tokens=est_tokens
             )
+        # Size the tool-result block to what the chosen model can hold.
+        tool_context_chars = self._tool_context_budget(provider, selected_model, request_tokens)
         if selected_model:
             self.logger.info("laya_model_selected", agent=self.name, provider=provider, model=selected_model)
         is_local_model = provider in ["ollama", "lmstudio", "mistral"]
@@ -566,8 +602,13 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
         # ── Multi-round tool calling loop (up to max_tool_rounds) ──
         accumulated_tool_results = []
         all_function_calls = []
+        # Identical (tool, args) requests are answered from this memo instead
+        # of re-executing, which models often do when they re-plan a round.
+        call_memo: Dict[str, Dict[str, Any]] = {}
         current_prompt = prompt
         response = {}
+        # True while the latest round executed tools the model has not yet seen.
+        pending_tool_results = False
 
         for round_num in range(1, max_tool_rounds + 1):
             # Route through LLM Gateway (rate limit, cache, fallback)
@@ -605,7 +646,8 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
 
             # Check if tool calls were requested
             if not response.get("function_calls"):
-                break  # No more tool calls needed — exit loop
+                pending_tool_results = False
+                break  # Model produced its final answer — exit loop
 
             self.logger.info(
                 "Tool calls detected",
@@ -613,25 +655,43 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
                 calls=[c["name"] for c in response["function_calls"]],
             )
 
-            # Execute tools
-            tool_results = await self.tools.execute_function_calls(
-                response["function_calls"],
+            calls = response["function_calls"]
+            memo_keys = [self._tool_call_key(c) for c in calls]
+            fresh, fresh_keys = [], []
+            for call, key in zip(calls, memo_keys):
+                if key not in call_memo and key not in fresh_keys:
+                    fresh.append(call)
+                    fresh_keys.append(key)
+            fresh_results = await self.tools.execute_function_calls(
+                fresh,
                 allowed_tools=allowed_tool_names,
-            )
-
-            round_results = []
-            for i, r in enumerate(tool_results):
-                round_results.append({
-                    "name": response["function_calls"][i]["name"],
+            ) if fresh else []
+            for call, key, r in zip(fresh, fresh_keys, fresh_results):
+                call_memo[key] = {
+                    "name": call.get("name", ""),
                     "success": r.success,
                     "data": r.data,
-                    "error": r.error
-                })
+                    "error": r.error,
+                }
+            round_results = []
+            reported = set()
+            for key in memo_keys:
+                entry = dict(call_memo[key])
+                if key not in fresh_keys or key in reported:
+                    entry["note"] = "duplicate request; reused earlier result"
+                reported.add(key)
+                round_results.append(entry)
             accumulated_tool_results.extend(round_results)
-            all_function_calls.extend(response["function_calls"])
+            all_function_calls.extend(calls)
+            pending_tool_results = True
+
+            if not fresh:
+                # The model only repeated earlier calls: it has all the data
+                # it is going to get, so stop looping and synthesize.
+                break
 
             # Build follow-up prompt with accumulated results
-            tool_context = json.dumps(accumulated_tool_results, indent=2)
+            tool_context = self._format_tool_results(accumulated_tool_results, tool_context_chars)
             current_prompt = (
                 f"{prompt}\n\n--- TOOL EXECUTION RESULTS (Round {round_num}) ---\n"
                 f"{tool_context}\n\n"
@@ -639,9 +699,12 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
                 f"or provide your final comprehensive analysis in the requested JSON format."
             )
 
-        # If we did tool calls, do a final synthesis through the gateway
-        if accumulated_tool_results:
-            tool_context = json.dumps(accumulated_tool_results, indent=2)
+        # A final synthesis call is needed only when the loop stopped with
+        # tool results the model has not answered yet (round budget exhausted
+        # or duplicate-only round). When the model already returned a final
+        # answer after seeing the results, a second call is pure waste.
+        if accumulated_tool_results and pending_tool_results:
+            tool_context = self._format_tool_results(accumulated_tool_results, tool_context_chars)
             final_prompt = (
                 f"{prompt}\n\n--- ALL TOOL RESULTS ---\n{tool_context}\n\n"
                 f"Based on all these results, provide your final comprehensive analysis "
@@ -662,11 +725,145 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
                     f"{final_response.get('content') or 'No usable response'}"
                 )
             response["content"] = final_response.get("content", "")
+            response["provider_used"] = final_response.get("provider_used", provider)
+        if accumulated_tool_results:
             response["tool_results"] = accumulated_tool_results
             response["function_calls"] = all_function_calls
-            response["provider_used"] = final_response.get("provider_used", provider)
+            # Alias kept for agents that read the older key.
+            response["tool_calls"] = all_function_calls
 
         return response
+
+    # Keys agents use when the model's output could not be parsed as JSON.
+    _PARSE_FALLBACK_KEYS = frozenset({"raw_reasoning", "raw_synthesis", "raw_response", "raw"})
+
+    @classmethod
+    def _evidence_confidence(
+        cls,
+        prior: float,
+        response: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
+        *,
+        cap: float = 0.85,
+    ) -> float:
+        """Confidence from observable output signals instead of a fixed constant.
+
+        Starts from the agent's prior (capped, so no LLM synthesis claims
+        near-certainty by default) and discounts for: empty/error output,
+        unstructured output (JSON parse fallback), failed tool calls, a failed
+        deterministic validation, and analysis run with no retrieved evidence.
+        The result is a heuristic, not a calibrated probability, and the
+        output is marked that way (``confidence_basis``) so reports never
+        render it as a percentage.
+        """
+        conf = min(float(prior), cap)
+        signals: List[str] = []
+        payload = data if isinstance(data, dict) else {}
+        if not payload or payload.get("error"):
+            conf *= 0.5
+            signals.append("empty_or_error_output")
+        elif cls._PARSE_FALLBACK_KEYS & set(payload) or payload.get("format") == "narrative":
+            conf *= 0.6
+            signals.append("unstructured_output")
+
+        tool_results = (response or {}).get("tool_results") or []
+        if tool_results:
+            ok = sum(1 for t in tool_results if isinstance(t, dict) and t.get("success"))
+            conf *= 0.6 + 0.4 * (ok / len(tool_results))
+            if ok < len(tool_results):
+                signals.append(f"tool_failures:{len(tool_results) - ok}/{len(tool_results)}")
+
+        validation = payload.get("_validation")
+        if isinstance(validation, dict) and validation.get("passed") is False:
+            conf *= 0.6
+            signals.append("validation_failed")
+
+        rag = payload.get("_rag_context")
+        if isinstance(rag, dict) and not rag.get("chunks_used"):
+            conf *= 0.85
+            signals.append("no_retrieved_evidence")
+
+        if isinstance(data, dict):
+            data.setdefault("confidence_basis", "heuristic_signals")
+            data["confidence_signals"] = signals
+        return round(max(0.0, min(conf, cap)), 3)
+
+    @staticmethod
+    def _tool_call_key(call: Dict[str, Any]) -> str:
+        args = call.get("args", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (TypeError, ValueError):
+                pass
+        return json.dumps([call.get("name", ""), args], sort_keys=True, default=str)
+
+    # Per-result and total character budgets (upper bounds) for tool output fed
+    # back to the model; the effective total adapts to the model's window.
+    _TOOL_RESULT_CHAR_LIMIT = 6000
+    _TOOL_CONTEXT_CHAR_LIMIT = 24000
+    _TOOL_CONTEXT_MIN_CHARS = 2000
+    _TOOL_RESULT_HEADROOM_TOKENS = 4000
+    _CHARS_PER_TOKEN = 3.5
+
+    @classmethod
+    def _estimate_tokens(cls, text: str) -> int:
+        return max(1, int(len(text or "") / cls._CHARS_PER_TOKEN))
+
+    _FILE_BUILDING_TOOLS = ("build_document", "generate_report", "generate_ic_memo",
+                            "generate_deal_deck", "generate_meeting_memo")
+
+    @classmethod
+    def _deliverable_guidance(cls, tool_names: List[str]) -> str:
+        """Tell the model that deliverables are files built by tools, not prose."""
+        available = [name for name in cls._FILE_BUILDING_TOOLS if name in (tool_names or [])]
+        if not available:
+            return ""
+        preferred = "build_document" if "build_document" in available else available[0]
+        return (
+            "DELIVERABLES: Any document, memo, report, spreadsheet or deck the user should "
+            f"receive must be produced by calling a file-building tool ({', '.join(available)}); "
+            f"prefer `{preferred}`. Pass the upstream agent results as evidence. Never present "
+            "Markdown or prose as the deliverable file, and never claim a file exists unless a "
+            "tool returned it."
+        )
+
+    @classmethod
+    def _tool_context_budget(cls, provider: str, model: Optional[str], request_tokens: int) -> int:
+        """Chars of tool results that fit beside the request in the model's window.
+
+        A fixed 24K-char block is ~6.9K tokens, which on an 8K local model
+        left no room for the prompt, so the gateway cut it blindly.
+        """
+        try:
+            from app.config import get_settings
+            from app.core.llm.model_registry import get_capabilities
+            from app.core.llm.model_router import get_configured_model
+
+            model_name = model or get_configured_model(provider, get_settings())
+            window = get_capabilities(model_name, provider).context_window
+        except Exception:
+            return cls._TOOL_CONTEXT_CHAR_LIMIT
+        reserve = max(int(window * 0.15), 1024)
+        free_tokens = window - reserve - request_tokens
+        budget = int(free_tokens * cls._CHARS_PER_TOKEN * 0.9)
+        return max(cls._TOOL_CONTEXT_MIN_CHARS, min(cls._TOOL_CONTEXT_CHAR_LIMIT, budget))
+
+    @classmethod
+    def _format_tool_results(cls, results: List[Dict[str, Any]], total_limit: Optional[int] = None) -> str:
+        total_limit = total_limit or cls._TOOL_CONTEXT_CHAR_LIMIT
+        per_result = min(cls._TOOL_RESULT_CHAR_LIMIT, max(500, total_limit // max(1, min(len(results), 4))))
+        rendered = []
+        for item in results:
+            text = json.dumps(item, default=str)
+            if len(text) > per_result:
+                text = text[:per_result] + f'... [truncated {len(text) - per_result} chars]'
+            rendered.append(text)
+        joined = "[\n" + ",\n".join(rendered) + "\n]"
+        if len(joined) > total_limit:
+            # Keep the most recent results: they reflect the model's latest plan.
+            joined = "[... earlier tool results truncated ...]\n" + joined[-total_limit:]
+        return joined
 
     # ═══════════════════════════════════════════════════════════
     #  Stage-Aware Prompt Injection (QA Flow 1 & 5)

@@ -98,6 +98,10 @@ class OllamaClient:
             "options": {
                 "temperature": _clamp_temperature(temperature),
                 "num_predict": max_tokens,
+                # Without num_ctx Ollama uses its small default window and
+                # silently drops the start of long prompts (system prompt and
+                # instructions). Size it to the request, capped by OLLAMA_MAX_CTX.
+                "num_ctx": _ollama_num_ctx(messages, tools, max_tokens),
             },
         }
 
@@ -137,6 +141,21 @@ class OllamaClient:
         except httpx.HTTPError as e:
             logger.error("Ollama connection failed. Is Ollama running?", error=str(e))
             raise
+
+
+def _ollama_num_ctx(messages: List[Dict], tools: Optional[List[Dict]], max_tokens: int) -> int:
+    import json as _json
+
+    from app.core.llm.model_registry import ollama_max_ctx
+
+    chars = sum(len(str(m.get("content") or "")) for m in messages)
+    if tools:
+        chars += len(_json.dumps(tools, default=str))
+    needed = int(chars / 3.5) + int(max_tokens or 0) + 256
+    size = 4096
+    while size < needed and size < ollama_max_ctx():
+        size *= 2
+    return min(size, ollama_max_ctx())
 
 
 class LMStudioClient:

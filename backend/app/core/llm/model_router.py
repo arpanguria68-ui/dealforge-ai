@@ -275,6 +275,8 @@ class ModelRouter:
                     healthy = bool(str(message.get("content", "")).strip() or message.get("tool_calls"))
                     self._local_health["lmstudio"] = healthy
                     self._local_health_ts["lmstudio"] = time.monotonic()
+                    if healthy:
+                        await self._discover_lmstudio_context(client, url, model)
                     return healthy
             except Exception:
                 self._local_health["lmstudio"] = False
@@ -282,6 +284,46 @@ class ModelRouter:
                 return False
 
         return True  # Cloud providers assumed always healthy
+
+    @staticmethod
+    def _lmstudio_context_from_models(payload: dict, model: str) -> Optional[int]:
+        """Loaded context length for ``model`` from LM Studio's model listing."""
+        items = payload.get("models") or payload.get("data") or []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            ident = str(item.get("key") or item.get("id") or "")
+            if model and ident != model:
+                continue
+            for inst in item.get("loaded_instances") or []:
+                cfg = inst.get("config") if isinstance(inst, dict) else None
+                value = (cfg or {}).get("context_length") if isinstance(cfg, dict) else None
+                if value:
+                    return int(value)
+            value = item.get("loaded_context_length") or (
+                item.get("max_context_length") if item.get("state") == "loaded" else None
+            )
+            if value:
+                return int(value)
+        return None
+
+    async def _discover_lmstudio_context(self, client, url: str, model: str) -> None:
+        """Record the loaded model's real context window (best-effort)."""
+        from app.core.llm.model_registry import set_live_context_window
+
+        root = url[:-3] if url.endswith("/v1") else url
+        for path in ("/api/v1/models", "/api/v0/models"):
+            try:
+                resp = await client.get(f"{root}{path}", timeout=5.0)
+                if resp.status_code != 200:
+                    continue
+                tokens = self._lmstudio_context_from_models(resp.json(), model)
+                if tokens:
+                    set_live_context_window("lmstudio", model, tokens)
+                    logger.info("lmstudio_context_discovered", model=model, context_window=tokens)
+                    return
+            except Exception:
+                continue
 
     def get_provider_for_agent(self, agent_name: str) -> str:
         """Get the preferred LLM provider for a specific agent"""
@@ -394,7 +436,9 @@ class ModelRouter:
                 continue
         return None
 
-    async def get_provider_for_text(self, agent_name: str, task_text: str, _tier=None) -> Tuple[str, bool]:
+    async def get_provider_for_text(
+        self, agent_name: str, task_text: str, _tier=None, est_tokens: Optional[int] = None,
+    ) -> Tuple[str, bool]:
         """Laya System-1 tier pre-route (~33ms) across the full provider fleet.
 
         - ``simple`` → healthy local LLM, else cheapest fast cloud pool.
@@ -408,7 +452,10 @@ class ModelRouter:
         self.fast_pool = _env_pool("LAYA_FAST_POOL", FAST_POOL)
         self.general_pool = _env_pool("LAYA_GENERAL_POOL", GENERAL_POOL)
         self.reasoning_pool = _env_pool("LAYA_REASONING_POOL", REASONING_POOL)
-        est_tokens = max(500, (len(task_text or "") + 2) // 3 + 2048)
+        # Callers that know the real request size (full prompt + system +
+        # tools + output) pass it; task_text is only a classification excerpt.
+        if not est_tokens:
+            est_tokens = max(500, (len(task_text or "") + 2) // 3 + 2048)
         tier = None
         try:
             from app.core.laya.client import get_laya_client
@@ -451,19 +498,28 @@ class ModelRouter:
             logger.warning("laya_complexity_route_failed", error=str(e))
         return await self.get_provider_with_fallback(agent_name, est_tokens)
 
-    async def get_model_route_for_text(self, agent_name: str, task_text: str):
-        """Return provider, optional tier model override, and fallback status."""
+    async def get_model_route_for_text(
+        self, agent_name: str, task_text: str, est_tokens: Optional[int] = None,
+    ):
+        """Return provider, optional tier model override, and fallback status.
+
+        ``est_tokens`` is the full request size; without it the size is
+        guessed from ``task_text``, which callers usually truncate.
+        """
         tier = None
         try:
             from app.core.laya.client import get_laya_client
             tier = await get_laya_client().route_tier(task_text or agent_name)
         except Exception as exc:
             logger.debug("laya_tier_unavailable_for_model_route", error=str(exc))
-        if tier is None:
+        if not est_tokens:
             est_tokens = max(500, (len(task_text or "") + 2) // 3 + 2048)
+        if tier is None:
             provider, fallback = await self.get_provider_with_fallback(agent_name, est_tokens)
         else:
-            provider, fallback = await self.get_provider_for_text(agent_name, task_text, _tier=tier)
+            provider, fallback = await self.get_provider_for_text(
+                agent_name, task_text, _tier=tier, est_tokens=est_tokens
+            )
         model = None
         try:
             setting = {"simple": "fast_model", "moderate": "general_model", "complex": "reasoning_model"}.get(tier)

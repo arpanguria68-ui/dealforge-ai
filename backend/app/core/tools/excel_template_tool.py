@@ -14,9 +14,9 @@ from app.core.tools.tool_router import BaseTool, ToolResult
 logger = structlog.get_logger()
 
 # Knowledge base directories with Excel templates
-TEMPLATE_DIRS = [
-    r"F:\code project\Kimi_Agent_DealForge AI PRD\Knowledge managerment\Excel knowledge",
-]
+from app.core.paths import excel_template_dir
+
+TEMPLATE_DIRS = [str(excel_template_dir())]
 
 # Template categories for agent discovery
 TEMPLATE_CATEGORIES = {

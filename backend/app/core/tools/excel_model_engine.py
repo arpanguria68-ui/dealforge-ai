@@ -33,14 +33,12 @@ from app.core.tools.tool_router import BaseTool, ToolResult
 logger = structlog.get_logger()
 
 # Template directory
-TEMPLATE_BASE = Path(
-    r"F:\code project\Kimi_Agent_DealForge AI PRD\Knowledge managerment\Excel knowledge"
-)
+from app.core.paths import excel_template_dir, output_dir
+
+TEMPLATE_BASE = excel_template_dir()
 
 # Output directory for populated models
-OUTPUT_DIR = Path(
-    r"F:\code project\Kimi_Agent_DealForge AI PRD\dealforge-ai\backend\ofas_outputs"
-)
+OUTPUT_DIR = output_dir()
 
 # Template ID → file mapping
 TEMPLATE_MAP = {

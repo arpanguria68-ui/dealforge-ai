@@ -11,6 +11,7 @@ import math
 from datetime import datetime
 
 from app.agents.base import BaseAgent, AgentOutput
+from app.core.prompt_context import render_context
 
 
 class DCFLBOArchitectAgent(BaseAgent):
@@ -76,7 +77,7 @@ class DCFLBOArchitectAgent(BaseAgent):
                 data=analysis,
                 reasoning=f"Built financial model covering DCF/LBO analysis. "
                 f"Deterministic calcs: {len(calc_results)} models executed.",
-                confidence=0.85,
+                confidence=self._evidence_confidence(0.85, result, analysis),
                 execution_time_ms=elapsed,
                 tool_calls=result.get("tool_calls"),
             )
@@ -107,7 +108,7 @@ RULES:
     def _build_prompt(self, task: str, context: Dict, memory: list) -> str:
         prompt = f"TASK: {task}\n\n"
         if context:
-            prompt += f"DEAL CONTEXT:\n{json.dumps(context, default=str)[:2000]}\n\n"
+            prompt += f"DEAL CONTEXT:\n{render_context(context)}\n\n"
             if context.get("fact_base"):
                 prompt += f"FACT BASE (GROUND TRUTH):\n{json.dumps(context['fact_base'], default=str)}\n\n"
         if memory:

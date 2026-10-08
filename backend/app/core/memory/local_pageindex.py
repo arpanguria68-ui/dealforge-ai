@@ -598,7 +598,13 @@ class LocalPageIndexService:
                     if any(w in title.lower() for w in query_words):
                         relevance = min(1.0, relevance + 0.2)
 
-                    content = sanitize_brief(text if text else summary, max_chars=2000)
+                    # Long section nodes (pageindex trees): return the window
+                    # around the matched terms, not just the section's first
+                    # 2000 chars, which often missed the matching passage.
+                    source_text = text if text else summary
+                    content = sanitize_brief(
+                        self._excerpt(source_text, overlap, 2000), max_chars=2100
+                    )
 
                     if content:
                         chunk_idx = node.get("start_index", 0)
@@ -610,13 +616,14 @@ class LocalPageIndexService:
                         results.append(
                             SearchResult(
                                 chunk_id=f"{doc.doc_id}_{node.get('node_id', 'unknown')}",
-                                content=content[:2000],  # Cap content length
+                                content=content,  # already bounded by _excerpt
                                 page_number=chunk_idx,
                                 node_title=title,
                                 relevance_score=round(relevance, 4),
                                 doc_id=doc.doc_id,
                                 metadata={
                                     "filename": doc.filename,
+                                    "node_chars": len(source_text or ""),
                                     "depth": depth,
                                     "section_path": section_path,
                                     "chunk_index": chunk_idx,
@@ -634,6 +641,27 @@ class LocalPageIndexService:
 
         walk_nodes(tree_data.get("nodes", []) or [], 0)
         return [result for result in results if result.relevance_score >= 0.2]
+
+    @staticmethod
+    def _excerpt(text: str, terms, limit: int = 2000) -> str:
+        """Window of ``text`` (<= limit chars) with the most query-term hits."""
+        text = text or ""
+        if len(text) <= limit:
+            return text
+        lower = text.lower()
+        terms = [t for t in terms if len(t) > 2]
+        best_start, best_hits = 0, -1
+        for term in terms:
+            pos = lower.find(term)
+            while pos != -1:
+                start = max(0, min(pos - limit // 4, len(text) - limit))
+                window = lower[start:start + limit]
+                hits = sum(window.count(t) for t in terms)
+                if hits > best_hits:
+                    best_start, best_hits = start, hits
+                pos = lower.find(term, pos + limit // 2)
+        snippet = text[best_start:best_start + limit]
+        return ("… " if best_start > 0 else "") + snippet + (" …" if best_start + limit < len(text) else "")
 
     @staticmethod
     def _query_terms(text: str) -> set[str]:

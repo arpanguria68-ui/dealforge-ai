@@ -14,6 +14,7 @@ import statistics
 from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
 from datetime import datetime
+import asyncio
 import structlog
 
 from app.core.tools.tool_router import BaseTool, ToolResult
@@ -135,11 +136,15 @@ class FetchComparableCompaniesTool(BaseTool):
         # Try fetching live data from Yahoo Finance
         peers_data = []
         if peer_tickers:
-            peers_data = self._fetch_peer_multiples(peer_tickers)
+            # yfinance is blocking network I/O: keep it off the event loop.
+            peers_data = await asyncio.to_thread(self._fetch_peer_multiples, peer_tickers)
 
-        # If no live data available, use sector defaults
+        # If no live data available, fall back to the sector benchmark and
+        # say so explicitly; downstream agents must not cite it as peer data.
+        data_quality = "live_peer_multiples"
         if not peers_data:
             peers_data = self._generate_sector_defaults(sector_info, peer_tickers or [])
+            data_quality = "sector_default_estimate"
 
         # Compute quartile statistics
         stats = self._compute_quartile_stats(peers_data)
@@ -177,6 +182,12 @@ class FetchComparableCompaniesTool(BaseTool):
             data={
                 "ticker": ticker,
                 "sector": sector,
+                "data_quality": data_quality,
+                **({"warning": (
+                    "No live peer multiples were available; values are static sector "
+                    "benchmarks, not observed peer data. Mark any figure derived from "
+                    "them as [ESTIMATED]."
+                )} if data_quality != "live_peer_multiples" else {}),
                 "peer_count": len(peers_data),
                 "peers": peers_data,
                 "quartile_stats": stats,
@@ -227,28 +238,23 @@ class FetchComparableCompaniesTool(BaseTool):
     def _generate_sector_defaults(
         self, sector_info: Dict, tickers: List[str]
     ) -> List[Dict]:
-        """Generate sector-default peer data when live data unavailable"""
+        """Return the static sector benchmark when live data is unavailable.
+
+        Previously this attached randomly jittered multiples to the requested
+        tickers, which presented fabricated numbers as real peer data. The
+        benchmark is now a single, clearly labelled, deterministic row.
+        """
         defaults = sector_info["default_multiples"]
-        import random
-
-        synthetic_peers = []
-        # Use provided tickers or generate synthetic ones
-        names = tickers if tickers else [f"Peer_{i+1}" for i in range(6)]
-
-        for name in names:
-            # Add some variance to create realistic distribution
-            variance = random.uniform(0.7, 1.3)
-            peer = {
-                "ticker": name.upper(),
-                "name": name,
-                "source": "sector_default",
-                "ev_revenue": round(defaults["ev_revenue"] * variance, 2),
-                "ev_ebitda": round(defaults["ev_ebitda"] * variance, 2),
-                "pe": round(defaults["pe"] * variance, 2),
-            }
-            synthetic_peers.append(peer)
-
-        return synthetic_peers
+        return [{
+            "ticker": "SECTOR_BENCHMARK",
+            "name": "Static sector benchmark (not live peer data)",
+            "source": "sector_default",
+            "is_estimate": True,
+            "requested_peers_unavailable": [t.upper() for t in tickers],
+            "ev_revenue": defaults["ev_revenue"],
+            "ev_ebitda": defaults["ev_ebitda"],
+            "pe": defaults["pe"],
+        }]
 
     def _compute_quartile_stats(self, peers: List[Dict]) -> Dict[str, Dict]:
         """Compute quartile statistics for each multiple"""

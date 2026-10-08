@@ -89,11 +89,25 @@ interface TaskListRecord {
     items?: TaskPlanItem[];
 }
 
+interface DocumentPlanResponse {
+    title: string;
+    formats: string[];
+    audience: string;
+    sections: { key: string; title: string }[];
+    gaps: string[];
+    gap_agents: string[];
+    assumptions: string[];
+    questions: string[];
+}
+
 interface PlanResponse {
+    mode?: 'document';
     reasoning?: string;
     data?: {
         todo_list?: TaskListRecord;
         laya_decision?: { selected_agent?: string };
+        document_plan?: DocumentPlanResponse;
+        document_request?: { request: string };
     };
 }
 
@@ -687,6 +701,7 @@ export function ChatWindow() {
     const [executingProgress, setExecutingProgress] = useState({ done: 0, total: 0 });
     const [approvalRequest, setApprovalRequest] = useState<{
         taskCount: number;
+        label?: string;
         resolve: (approved: boolean) => void;
     } | null>(null);
     const eventSourceRef = useRef<EventSource | null>(null);
@@ -1124,6 +1139,7 @@ export function ChatWindow() {
                         user_answers: userAnswers,
                         focus_mode: focusMode, sources: activeSources,
                         local_only: /\b(?:local[- ]only|lm\s*studio\s+only|no\s+(?:cloud|remote)\s+(?:llm|models?))\b/i.test(currentPrompt),
+                        force_analysis: /\b(?:re-?run|fresh\s+analysis|re-?analy[sz]e|from\s+scratch)\b/i.test(currentPrompt),
                     }),
                 });
                 if (planRes.ok) planResponse = await planRes.json() as PlanResponse;
@@ -1156,6 +1172,64 @@ export function ChatWindow() {
             }
 
             if (!planResponse && !planRes) throw planRequestError;
+
+            // Deliverable request on an already-analysed deal: build it from the
+            // saved results instead of re-running the agents.
+            const documentPlan = planRes?.ok ? planResponse?.data?.document_plan : undefined;
+            if (documentPlan) {
+                const sectionList = documentPlan.sections.map((section, i) => `${i + 1}. ${section.title}`).join('\n');
+                const notes = [...documentPlan.assumptions, ...documentPlan.questions].map(note => `- ${note}`).join('\n');
+                const gapLine = documentPlan.gaps.length
+                    ? `⚠️ **Missing evidence:** ${documentPlan.gaps.join(', ')}${documentPlan.gap_agents.length ? ` (owned by ${documentPlan.gap_agents.join(', ')})` : ''}\n\n`
+                    : '';
+                const documentPlanMessage = `📄 **Document Plan — ${documentPlan.title}**\n\n` +
+                    `> **💭 Reasoning:** ${planResponse?.reasoning || 'Built from the saved analysis.'}\n\n` +
+                    `**Formats:** ${documentPlan.formats.map(f => f.toUpperCase()).join(', ')} · **Audience:** ${documentPlan.audience}\n\n` +
+                    `${sectionList}\n\n${gapLine}${notes ? `${notes}\n\n` : ''}` +
+                    `_Built from the saved analysis. To re-run the agents first, ask again with "fresh analysis"._\n\n` +
+                    `---\nAwaiting your approval to generate.`;
+                updateMessage(thinkingPlanId, { content: documentPlanMessage, status: 'done' });
+                setPhase('awaiting_approval');
+                const approvedDocument = await new Promise<boolean>(resolve => {
+                    setApprovalRequest({
+                        taskCount: documentPlan.sections.length,
+                        label: `Review the ${documentPlan.title} plan above. Nothing is generated until you approve.`,
+                        resolve,
+                    });
+                });
+                setApprovalRequest(null);
+                if (!approvedDocument) {
+                    addMessage({ role: 'system', content: 'Document plan saved. Nothing was generated.' });
+                    setPhase('idle');
+                    return;
+                }
+                updateMessage(thinkingPlanId, {
+                    content: documentPlanMessage.replace('Awaiting your approval to generate.', 'Approved. Generating from saved results.'),
+                });
+                const genRes = await fetch(`${API_BASE}/api/v1/deals/${dealId}/documents/generate`, withAdminAuth({
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(planResponse?.data?.document_request ?? { request: currentPrompt }),
+                }));
+                const generated = await genRes.json() as {
+                    formats_generated?: string[];
+                    errors?: { format: string; error: string }[];
+                    review_actions?: string[];
+                    detail?: string;
+                };
+                if (!genRes.ok) throw new Error(generated.detail || `Document generation failed (HTTP ${genRes.status}).`);
+                const ready = (generated.formats_generated || []).map(f => f.toUpperCase());
+                const failures = (generated.errors || []).map(item => `${item.format.toUpperCase()}: ${item.error}`).join('; ');
+                const actions = (generated.review_actions || []).map(action => `- ${action}`).join('\n');
+                addMessage({
+                    role: 'assistant',
+                    content: `${ready.length ? `✅ **${documentPlan.title}** generated: ${ready.join(', ')}.` : `⚠️ **${documentPlan.title}** was not generated.`}` +
+                        `${failures ? `\n\nErrors: ${failures}` : ''}` +
+                        `\n\nOpen the Reports Hub to review and approve before download.${actions ? `\n\n${actions}` : ''}`,
+                });
+                setPhase('idle');
+                return;
+            }
 
             let taskList: TaskPlanItem[] = [];
             let taskListId: string | null = null;
@@ -1964,7 +2038,7 @@ export function ChatWindow() {
                     <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-amber-300/20 bg-amber-300/[0.06] px-4 py-3 sm:px-6" role="status">
                         <div className="flex min-w-0 items-center gap-2 text-sm text-amber-100">
                             <AlertTriangle className="h-4 w-4 shrink-0 text-amber-300" />
-                            <span>Review the {approvalRequest.taskCount}-task plan above. Nothing runs until you approve.</span>
+                            <span>{approvalRequest.label ?? `Review the ${approvalRequest.taskCount}-task plan above. Nothing runs until you approve.`}</span>
                         </div>
                         <div className="ml-auto flex shrink-0 items-center gap-2">
                             <Button variant="outline" size="sm" onClick={() => approvalRequest.resolve(false)} className="border-white/15 bg-transparent text-white/75 hover:bg-white/10">
