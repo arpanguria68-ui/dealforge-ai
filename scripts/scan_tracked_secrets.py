@@ -59,7 +59,11 @@ PLACEHOLDER_MARKERS = {
     "dummy",
     "test",
     "no_key_required",
+    "fallback",
 }
+
+# Values that read a secret from the environment are references, not secrets.
+ENV_REFERENCE_MARKERS = ("os.environ", "os.getenv", "getenv(", "process.env", "import.meta.env")
 
 ASSIGNMENT_KEY_NAMES = {
     "api_key",
@@ -140,6 +144,8 @@ def looks_placeholder(value: str) -> bool:
     if lower.startswith("http://") or lower.startswith("https://"):
         return True
     if any(marker in lower for marker in PLACEHOLDER_MARKERS):
+        return True
+    if any(marker in lower for marker in ENV_REFERENCE_MARKERS):
         return True
     return False
 

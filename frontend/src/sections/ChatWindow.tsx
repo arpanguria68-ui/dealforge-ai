@@ -708,16 +708,16 @@ export function ChatWindow() {
         label?: string;
         resolve: (approved: boolean) => void;
     } | null>(null);
-    const [approvalArmed, setApprovalArmed] = useState(false);
+    // The approve button only arms ~900ms after a request appears, so a stray
+    // click on the previous prompt cannot approve it. Arming is tied to the
+    // request object itself, so a new request is never armed by an old timer.
+    const [armedRequest, setArmedRequest] = useState<typeof approvalRequest>(null);
+    const approvalArmed = approvalRequest !== null && armedRequest === approvalRequest;
     const eventSourceRef = useRef<EventSource | null>(null);
 
     useEffect(() => {
-        if (!approvalRequest) {
-            setApprovalArmed(false);
-            return;
-        }
-        setApprovalArmed(false);
-        const timer = window.setTimeout(() => setApprovalArmed(true), 900);
+        if (!approvalRequest) return;
+        const timer = window.setTimeout(() => setArmedRequest(approvalRequest), 900);
         return () => window.clearTimeout(timer);
     }, [approvalRequest]);
 
