@@ -11,10 +11,10 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first (Docker layer caching)
-COPY requirements.txt .
+COPY requirements.txt constraints.txt ./
 
 # Install Python dependencies + aiosqlite for SQLite async support
-RUN pip install --no-cache-dir -r requirements.txt aiosqlite
+RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt aiosqlite
 
 # Copy the full application
 COPY app/ ./app/
