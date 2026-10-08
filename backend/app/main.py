@@ -3044,6 +3044,83 @@ async def search_startup(company: str, depth: str = "standard"):
 # ═══════════════════════════════════════════════════════════
 
 
+@app.post("/api/v1/chat/respond")
+async def chat_respond(request: Request):
+    """Answer a direct question without creating a deal or launching agents."""
+    from app.core.validation.chat_guard import check_prompt
+    from app.core.llm import get_llm_client
+    from app.core.llm.model_router import LOCAL_PROVIDERS, get_model_router
+
+    body = await request.json()
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt or len(prompt) > 2000:
+        raise HTTPException(status_code=400, detail="Provide a prompt between 1 and 2000 characters.")
+
+    guard = check_prompt(prompt)
+    if not guard["valid"]:
+        raise HTTPException(status_code=400, detail=guard)
+
+    router = get_model_router()
+    local_only = bool(body.get("local_only", False))
+    route_tier = None
+    if local_only:
+        preferred = router.get_provider_for_agent("business_analyst")
+        candidates = [preferred] if preferred in LOCAL_PROVIDERS else []
+        candidates.extend(provider for provider in ("lmstudio", "ollama") if provider not in candidates)
+        provider = None
+        for candidate in candidates:
+            if await router.check_local_health(candidate):
+                provider = candidate
+                break
+        if not provider:
+            raise HTTPException(status_code=503, detail="No local LLM is available; cloud fallback is disabled.")
+        used_fallback = provider != preferred
+    else:
+        try:
+            from app.core.laya.client import get_laya_client
+            route_tier = await get_laya_client().route_tier(prompt)
+        except Exception:
+            route_tier = None
+        provider, used_fallback = await router.get_provider_for_text(
+            "business_analyst", prompt, _tier=route_tier,
+            est_tokens=max(1200, (len(prompt) + 2) // 3 + 900),
+        )
+
+    client = get_llm_client(provider)
+    try:
+        response = await asyncio.wait_for(
+            client.generate(
+                prompt=prompt,
+                system_prompt=(
+                    "Answer the user's direct question concisely. Do not create a deal plan, "
+                    "assign agents, or invent company facts. For finance or market claims, "
+                    "state when current source data is unavailable. Follow requested output format."
+                ),
+                temperature=0.2,
+                max_tokens=1000,
+            ),
+            timeout=45,
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="The selected model timed out.") from exc
+    except Exception as exc:
+        logger.warning("direct_chat_generation_failed", provider=provider, error=str(exc))
+        raise HTTPException(status_code=502, detail=f"The selected model could not answer ({provider}).") from exc
+
+    content = str((response or {}).get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=502, detail=f"The selected model returned an empty response ({provider}).")
+
+    return {
+        "success": True,
+        "response": content,
+        "provider": provider,
+        "model": getattr(client, "model", None) or getattr(client, "model_name", None),
+        "route_tier": route_tier,
+        "used_fallback": used_fallback,
+    }
+
+
 @app.post("/api/v1/chat/clarify")
 async def chat_clarify(request: Request):
     """

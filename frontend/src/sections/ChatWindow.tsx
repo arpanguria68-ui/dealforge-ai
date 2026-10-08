@@ -14,6 +14,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useDealForgeStore } from '@/lib/dealforge-store';
 import { API_BASE, withAdminAuth } from '@/lib/api-base';
+import { isDealAnalysisRequest } from '@/lib/chat-intent';
 
 // Stable fallback for stored messages without a timestamp (keeps rendering pure).
 const FALLBACK_TIMESTAMP = Date.now();
@@ -707,7 +708,18 @@ export function ChatWindow() {
         label?: string;
         resolve: (approved: boolean) => void;
     } | null>(null);
+    const [approvalArmed, setApprovalArmed] = useState(false);
     const eventSourceRef = useRef<EventSource | null>(null);
+
+    useEffect(() => {
+        if (!approvalRequest) {
+            setApprovalArmed(false);
+            return;
+        }
+        setApprovalArmed(false);
+        const timer = window.setTimeout(() => setApprovalArmed(true), 900);
+        return () => window.clearTimeout(timer);
+    }, [approvalRequest]);
 
     // Use ref to avoid stale closure issues
     const addMessageRef = useRef<(msg: Omit<Message, 'id' | 'timestamp'>) => void>(() => {});
@@ -1013,6 +1025,36 @@ export function ChatWindow() {
                     content: `🔄 **Follow-up on existing deal** — Reusing context from ${completedResultsRef.current.length} prior agent results.`,
                     status: 'done',
                 });
+            } else if (!isDealAnalysisRequest(userText, uploadedFiles.length > 0, Boolean(activeDealId))) {
+                const responseId = addMessage({
+                    role: 'assistant', agentName: 'DealForge AI',
+                    content: 'Thinking...', status: 'thinking',
+                });
+                try {
+                    const response = await fetch(`${API_BASE}/api/v1/chat/respond`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            prompt: userText,
+                            local_only: /\b(?:local[- ]only|lm\s*studio\s+only|no\s+(?:cloud|remote)\s+(?:llm|models?))\b/i.test(userText),
+                        }),
+                    });
+                    const result = await response.json();
+                    if (!response.ok) throw new Error(result.detail || `Chat response failed (HTTP ${response.status})`);
+                    updateMessage(responseId, {
+                        content: result.response,
+                        status: 'done',
+                        provider: result.provider,
+                        metadata: { model: result.model, route_tier: result.route_tier },
+                    });
+                } catch (error) {
+                    const detail = error instanceof Error ? error.message : 'Direct chat request failed';
+                    updateMessage(responseId, { content: `⚠️ ${detail}`, status: 'error' });
+                    setPhase('idle');
+                    return;
+                }
+                setPhase('idle');
+                return;
             } else {
                 const createRes = await fetch(`${API_BASE}/api/v1/deals`, {
                     method: 'POST',
@@ -2057,7 +2099,7 @@ export function ChatWindow() {
                             <Button variant="outline" size="sm" onClick={() => approvalRequest.resolve(false)} className="border-white/15 bg-transparent text-white/75 hover:bg-white/10">
                                 Cancel
                             </Button>
-                            <Button size="sm" onClick={() => approvalRequest.resolve(true)}>
+                            <Button size="sm" disabled={!approvalArmed} onClick={() => approvalRequest.resolve(true)}>
                                 <CheckCircle2 className="mr-2 h-4 w-4" /> Approve &amp; run
                             </Button>
                         </div>
