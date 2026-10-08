@@ -25,6 +25,8 @@ ofas_outputs/
 *.json
 !package.json
 !tsconfig.json
+# Lockfile makes `npm ci` (teammates, CI, Docker) reproducible
+!frontend/package-lock.json
 # Frontend build configs referenced by tsconfig.json (build fails without them)
 !frontend/tsconfig.app.json
 !frontend/tsconfig.node.json
