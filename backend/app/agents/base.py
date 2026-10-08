@@ -9,6 +9,7 @@ import structlog
 import json
 import re
 import asyncio
+from contextvars import ContextVar
 
 from app.core.llm import get_llm_client
 from app.core.llm.model_router import get_model_router
@@ -24,6 +25,12 @@ from app.core.validation.output_validator import (
 from app.core.messaging.message_bus import get_message_bus, AgentMessage
 
 logger = structlog.get_logger()
+
+# Per-task agent run context. Agent instances are process-wide singletons, so a
+# plain attribute let two concurrent deals overwrite each other's context
+# (provider choice, deal_id used to filter document retrieval) mid-run.
+# asyncio tasks copy the ContextVar on creation, so each run sees its own.
+_AGENT_RUN_CONTEXT: ContextVar[Dict[int, Any]] = ContextVar("agent_run_context", default={})
 
 
 @dataclass
@@ -59,6 +66,16 @@ class BaseAgent(ABC):
     name: str = "base_agent"
     description: str = "Base agent class"
     recommended_model: str = ""
+
+    @property
+    def _current_context(self) -> Any:
+        return _AGENT_RUN_CONTEXT.get().get(id(self), {})
+
+    @_current_context.setter
+    def _current_context(self, value: Any) -> None:
+        contexts = dict(_AGENT_RUN_CONTEXT.get())
+        contexts[id(self)] = value
+        _AGENT_RUN_CONTEXT.set(contexts)
 
     def __init__(
         self,

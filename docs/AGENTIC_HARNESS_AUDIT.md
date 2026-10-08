@@ -294,3 +294,14 @@ Now:
   graph risks are agent-recorded findings, not sources. The report architect
   only plans sections from a capability inventory, so it needs no graph
   content.
+
+### Final check
+
+- **Fresh checkout:** full backend suite 261/261, the frontend builds, and the
+  backend boots.
+- **Per-task agent context:** agent instances are process-wide singletons,
+  and `_current_context` was a plain attribute. Two deals running at once
+  could overwrite each other's context mid-run, including the `deal_id` that
+  filters document retrieval. It's now backed by a `ContextVar`, so each
+  asyncio task (each agent run) sees its own context. There's a regression
+  test that fails on the old code.

@@ -524,3 +524,21 @@ async def test_laya_warmup_is_opt_out_and_skips_non_model_backends(remote_laya, 
     monkeypatch.setenv("LAYA_WARMUP", "true")
     monkeypatch.setenv("LAYA_MODE", "lmstudio")
     assert await remote_laya.warmup() is False, "LM Studio decisions are chat calls; nothing to preload"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_runs_on_a_shared_agent_keep_their_own_context():
+    """Agent instances are shared; one deal's run must not see another's deal_id."""
+    from app.agents.base import BaseAgent
+
+    class _Probe(BaseAgent):
+        name = "probe"
+
+        async def run(self, task, context=None):
+            self._current_context = context
+            await asyncio.sleep(0.01)  # let the other run overwrite, if it could
+            return self._current_context["deal_id"]
+
+    agent = _Probe.__new__(_Probe)
+    seen = await asyncio.gather(*(agent.run("t", {"deal_id": f"deal-{i}"}) for i in range(5)))
+    assert seen == [f"deal-{i}" for i in range(5)]
