@@ -530,6 +530,9 @@ class BaseAgent(ABC):
             system_prompt = (system_prompt or "") + "\n\n" + sector_prompt
         if skill_context:
             system_prompt = (system_prompt or "") + "\n\n" + skill_context
+        kg_context = ctx.get("knowledge_graph_context")
+        if kg_context:
+            system_prompt = (system_prompt or "") + "\n\n" + kg_context
 
         # Keep the task-level Laya decision for every call in this tool loop.
         model_router = get_model_router()

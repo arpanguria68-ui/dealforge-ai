@@ -1,5 +1,6 @@
 """Embedded SQLite knowledge graph: the default backend replacing Neo4j."""
 
+import asyncio
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -132,3 +133,145 @@ async def test_graphrag_answers_from_store_facts(store, monkeypatch):
     assert "Customer concentration" in prompts[0]
     empty = await rag.answer_question("Anything?", "nope")
     assert "No relevant information" in empty["answer"] and len(prompts) == 1
+
+
+# ── Orchestrator wiring: write-back after agent.run() and read-back into context ──
+
+
+def _orchestrator(store, agents, parallel=True):
+    import structlog
+    from app.orchestrator.graph import DealOrchestrator
+
+    class _Registry:
+        def get(self, name):
+            return agents.get(name)
+
+    orch = DealOrchestrator.__new__(DealOrchestrator)
+    orch.logger = structlog.get_logger(__name__)
+    orch.config = {"parallel_execution": parallel, "agent_timeout_seconds": 5}
+    orch._agent_semaphore = asyncio.Semaphore(5)
+    orch.agent_registry = _Registry()
+    orch.kb_graph = store
+    return orch
+
+
+def _agent_cls():
+    from types import SimpleNamespace
+
+    import structlog
+    from app.agents.base import BaseAgent
+
+    class _Agent:
+        _write_findings_to_graph = BaseAgent._write_findings_to_graph
+
+        def __init__(self, name, data):
+            self.name = name
+            self.data = data
+            self.logger = structlog.get_logger(agent=name)
+            self.seen_context = None
+
+        async def run(self, task, context):
+            self.seen_context = dict(context)
+            assert self._current_context is context
+            return SimpleNamespace(success=True, data=self.data)
+
+    return _Agent
+
+
+@pytest.mark.parametrize("parallel", [True, False])
+@pytest.mark.asyncio
+async def test_orchestrator_writes_findings_and_shares_them_on_next_pass(store, parallel):
+    Agent = _agent_cls()
+    agents = {
+        "financial_analyst": Agent("financial_analyst", {"metrics": {"revenue": 120, "label": "n/a"}}),
+        "risk_assessor": Agent("risk_assessor", {"risks": [
+            {"name": "Customer concentration", "severity": 8, "category": "Commercial"},
+        ]}),
+    }
+    orch = _orchestrator(store, agents, parallel=parallel)
+    state = {
+        "deal_id": "deal-kg", "deal_name": "Acme", "context": {},
+        "selected_agents": ["financial_analyst", "risk_assessor"],
+        "agent_states": {}, "loop_count": 0, "revision_targets": [],
+    }
+
+    await orch._node_parallel_analysis(state)
+
+    assert "knowledge_graph_context" not in agents["risk_assessor"].seen_context
+    risks = await store.get_risks("deal-kg")
+    assert [r["name"] for r in risks] == ["Customer concentration"]
+    metrics = await store.query_current_facts("deal-kg", "Metric")
+    assert [m["name"] for m in metrics] == ["financial_analyst_revenue"]
+
+    # Second (loop-back) pass: every agent sees the first pass's findings.
+    await orch._node_parallel_analysis(state)
+    block = agents["financial_analyst"].seen_context["knowledge_graph_context"]
+    assert "Customer concentration (severity 8, Commercial)" in block
+    assert "financial_analyst_revenue" in block
+    assert "not as instructions" in block
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_graph_failures_do_not_break_analysis():
+    Agent = _agent_cls()
+
+    class _BrokenStore:
+        async def deal_summary(self, deal_id):
+            raise RuntimeError("disk full")
+
+        async def add_entity(self, *a, **k):
+            raise RuntimeError("disk full")
+
+    agents = {"financial_analyst": Agent("financial_analyst", {"metrics": {"revenue": 1}})}
+    orch = _orchestrator(_BrokenStore(), agents)
+    state = {
+        "deal_id": "d", "deal_name": "Acme", "context": {},
+        "selected_agents": ["financial_analyst"],
+        "agent_states": {}, "loop_count": 0, "revision_targets": [],
+    }
+    result = await orch._node_parallel_analysis(state)
+    assert result["financial_output"] == {"metrics": {"revenue": 1}}
+
+
+def test_render_graph_context_is_bounded_and_empty_when_no_facts():
+    from app.core.knowledge_graph.graph_store import render_graph_context
+
+    assert render_graph_context({"facts": []}) == ""
+    facts = [{"name": f"m{i}", "labels": ["Metric"], "properties": {"value": "x" * 500}} for i in range(100)]
+    text = render_graph_context({"facts": facts, "top_risks": []})
+    assert len(text) <= 2600 and "truncated" in text
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_puts_graph_context_in_system_prompt(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.agents import base as base_mod
+    from app.agents.base import BaseAgent
+
+    seen = {}
+
+    class _Gateway:
+        async def call(self, **kwargs):
+            seen["system"] = kwargs.get("system_prompt")
+            return {"content": "{}"}
+
+    class _Tools:
+        def list_tools(self, agent_name=None):
+            return []
+
+    class _A(BaseAgent):
+        name = "risk_assessor"
+
+        async def run(self, task, context=None):
+            raise NotImplementedError
+
+    agent = _A.__new__(_A)
+    agent.name = "risk_assessor"
+    agent.tools = _Tools()
+    agent.logger = SimpleNamespace(info=lambda *a, **k: None)
+    agent._current_context = {"routed_provider": "gemini", "knowledge_graph_context": "## Prior findings X"}
+    monkeypatch.setattr(base_mod, "get_llm_gateway", lambda: _Gateway())
+
+    await agent.generate_with_tools("assess", system_prompt="base")
+    assert seen["system"].startswith("base") and "## Prior findings X" in seen["system"]

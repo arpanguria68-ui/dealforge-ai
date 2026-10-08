@@ -159,3 +159,26 @@ tools are the stubs listed above.
 `KG_BACKEND=sqlite|neo4j|off` (default `sqlite`) and `KG_SQLITE_PATH`
 configure it. Tests: `backend/tests/test_knowledge_graph.py`. The full suite
 passes with the `neo4j` package uninstalled.
+
+### Graph wired into the deal workflow
+
+Before this change, the orchestrator ran agents via `agent.run()`, so
+`_write_findings_to_graph` (only called from `run_with_structure`) never ran
+during deal workflows. The graph only filled up from the chat-execute path.
+Now:
+
+- **Write-back:** after every successful agent in the analysis pass
+  (parallel and sequential), the orchestrator writes its metrics, risks and
+  entities. Red-team flags are recorded as risks (severity 1–5 → 2–10).
+- **Read-back:** each analysis pass loads the deal's current facts once and
+  passes them to every agent as `knowledge_graph_context`, which the tool
+  loop appends to the system prompt. It's labelled as leads to verify, not
+  evidence or instructions, and capped at 2.5k chars. The first pass sees
+  nothing; loop-back passes see what earlier agents and the red team found.
+- **Snapshot:** the completed state carries `knowledge_graph` (counts + top
+  10 risks).
+- **Stale-context fix:** the orchestrator now sets `agent._current_context`
+  before `agent.run()`. Previously the tool loop read whatever context the
+  previous run left behind (provider choice, the `deal_id` used to filter
+  document retrieval).
+- Every graph read and write fails soft; a graph error never fails an agent.
