@@ -350,3 +350,38 @@ per-deal log keeps full events for report generation.
 (`"1,000"` → 1000, `"true"` → True, JSON-string arrays and objects are
 parsed) and `enum` is enforced. Uncoercible values return an actionable
 error to the model instead of crashing inside the tool.
+
+## 7. Context windows and adaptive budgets
+
+- **Routing used the wrong size.** Agents routed on `prompt[:1600]`, so the
+  router's context-fit check always saw a tiny request and never
+  steered large prompts to a large-window model. The tool loop and
+  `generate_with_routed_fallback` now pass the real estimate:
+  system + prompt + tool schemas + output, plus tool-result headroom.
+- **The context guard didn't fit large overflows.**
+  - It always kept 80% of the prompt, so a 3× overflow stayed 2.4× over and
+    was rejected upstream.
+  - It reserved a fixed 15% for output whatever `max_tokens` was, ignored
+    tool schemas, and never trimmed the system prompt.
+  - The cut is now proportional to the excess. Its reserve is the larger of
+    15% or `max_tokens`, plus the tool-schema tokens, and the system prompt
+    is capped at 40% of the budget.
+  - Head and tail are kept: instructions and data first, then the latest
+    task and results.
+  - The gateway result reports `context_truncated` and `context_window`.
+- **Gateway estimates include tool schemas** for rate limiting and fallback
+  selection.
+- **Ollama silently dropped prompt starts.** The client never sent
+  `num_ctx`, so Ollama ran with its small default window and cut the start of
+  long prompts (system prompt and instructions). Meanwhile the registry
+  claimed 131K for llama3.1, so the guard never acted.
+  - `num_ctx` is now sized to each request (power of two, minimum 4096,
+    capped by `OLLAMA_MAX_CTX`, default 16384).
+  - The guard budgets to that cap.
+- **LM Studio windows are discovered.** The health check reads the loaded
+  model's real context length from `/api/v1/models` (or v0) and overrides
+  the static 8K guess.
+- **Tool-result budget adapts to the routed model's window.** It used to be a
+  fixed 24K chars (≈6.9K tokens, more than an 8K model has free). Now it
+  ranges from a 2K-char floor to the 24K-char ceiling, and the per-result
+  share scales with the number of results.

@@ -83,7 +83,7 @@ async def test_document_agent_completion_uses_laya_route_and_gateway_fallback(mo
     import app.agents.base as base_module
 
     class FakeRouter:
-        async def get_model_route_for_text(self, agent, task):
+        async def get_model_route_for_text(self, agent, task, est_tokens=None):
             assert agent == "business_analyst"
             assert "business_analyst" in task
             return "mistral", "mistral-large-custom", True

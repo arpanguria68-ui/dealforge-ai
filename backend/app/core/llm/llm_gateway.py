@@ -325,7 +325,10 @@ class LLMGateway:
         messages.append({"role": "user", "content": prompt})
 
         est_in = self.counter.estimate_messages(messages)
-        est_total = est_in + max_tokens
+        # Tool schemas count against the window and the vendor's token rate
+        # limits, so include them when choosing a provider/fallback.
+        tool_tokens = self.counter.estimate(json.dumps(tools, default=str)) if tools else 0
+        est_total = est_in + max_tokens + tool_tokens
 
         # ── Resolve model name (F-009) ──
         settings = get_settings()
@@ -405,6 +408,8 @@ class LLMGateway:
             provider=actual_provider,
             model=actual_model,
             context_window=caps.context_window,
+            max_output_tokens=max_tokens,
+            extra_tokens=tool_tokens,
         )
         if was_truncated:
             logger.warning("prompt_was_truncated", provider=actual_provider)
@@ -598,6 +603,9 @@ class LLMGateway:
             "cached": False,
             "fallback_used": fallback_used,
             "model_used": actual_model,
+            # Callers can tell the model saw a shortened prompt.
+            "context_truncated": was_truncated,
+            "context_window": caps.context_window,
         }
 
     async def hybrid_reasoning(

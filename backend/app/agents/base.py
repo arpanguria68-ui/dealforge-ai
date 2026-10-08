@@ -120,7 +120,8 @@ class BaseAgent(ABC):
             model = None
         else:
             provider, model, _used_fallback = await router.get_model_route_for_text(
-                self.name, f"{self.name}: {prompt[:1600]}"
+                self.name, f"{self.name}: {prompt[:1600]}",
+                est_tokens=self._estimate_tokens((system_prompt or "") + prompt) + 2048,
             )
         result = await get_llm_gateway().call(
             provider=provider,
@@ -552,14 +553,23 @@ class BaseAgent(ABC):
             system_prompt = (system_prompt or "") + "\n\n" + kg_context
 
         # Keep the task-level Laya decision for every call in this tool loop.
+        # Route on the real request size (system + prompt + tool schemas +
+        # output + headroom for tool results), not on the 1600-char excerpt
+        # Laya classifies; otherwise context-window fitting never triggered.
+        request_tokens = self._estimate_tokens(
+            (system_prompt or "") + prompt + (json.dumps(tools, default=str) if tools else "")
+        )
+        est_tokens = request_tokens + 1024 + (self._TOOL_RESULT_HEADROOM_TOKENS if tools else 0)
         model_router = get_model_router()
         selected_model = None
         if ctx.get("routed_provider"):
             provider = ctx["routed_provider"]
         else:
             provider, selected_model, _ = await model_router.get_model_route_for_text(
-                self.name, f"{self.name}: {prompt[:1600]}"
+                self.name, f"{self.name}: {prompt[:1600]}", est_tokens=est_tokens
             )
+        # Size the tool-result block to what the chosen model can hold.
+        tool_context_chars = self._tool_context_budget(provider, selected_model, request_tokens)
         if selected_model:
             self.logger.info("laya_model_selected", agent=self.name, provider=provider, model=selected_model)
         is_local_model = provider in ["ollama", "lmstudio", "mistral"]
@@ -678,7 +688,7 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
                 break
 
             # Build follow-up prompt with accumulated results
-            tool_context = self._format_tool_results(accumulated_tool_results)
+            tool_context = self._format_tool_results(accumulated_tool_results, tool_context_chars)
             current_prompt = (
                 f"{prompt}\n\n--- TOOL EXECUTION RESULTS (Round {round_num}) ---\n"
                 f"{tool_context}\n\n"
@@ -691,7 +701,7 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
         # or duplicate-only round). When the model already returned a final
         # answer after seeing the results, a second call is pure waste.
         if accumulated_tool_results and pending_tool_results:
-            tool_context = self._format_tool_results(accumulated_tool_results)
+            tool_context = self._format_tool_results(accumulated_tool_results, tool_context_chars)
             final_prompt = (
                 f"{prompt}\n\n--- ALL TOOL RESULTS ---\n{tool_context}\n\n"
                 f"Based on all these results, provide your final comprehensive analysis "
@@ -785,26 +795,53 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
                 pass
         return json.dumps([call.get("name", ""), args], sort_keys=True, default=str)
 
-    # Per-result and total character budgets for tool output fed back to the
-    # model; raw filings/search payloads otherwise overflow the context window.
+    # Per-result and total character budgets (upper bounds) for tool output fed
+    # back to the model; the effective total adapts to the model's window.
     _TOOL_RESULT_CHAR_LIMIT = 6000
     _TOOL_CONTEXT_CHAR_LIMIT = 24000
+    _TOOL_CONTEXT_MIN_CHARS = 2000
+    _TOOL_RESULT_HEADROOM_TOKENS = 4000
+    _CHARS_PER_TOKEN = 3.5
 
     @classmethod
-    def _format_tool_results(cls, results: List[Dict[str, Any]]) -> str:
+    def _estimate_tokens(cls, text: str) -> int:
+        return max(1, int(len(text or "") / cls._CHARS_PER_TOKEN))
+
+    @classmethod
+    def _tool_context_budget(cls, provider: str, model: Optional[str], request_tokens: int) -> int:
+        """Chars of tool results that fit beside the request in the model's window.
+
+        A fixed 24K-char block is ~6.9K tokens, which on an 8K local model
+        left no room for the prompt, so the gateway cut it blindly.
+        """
+        try:
+            from app.config import get_settings
+            from app.core.llm.model_registry import get_capabilities
+            from app.core.llm.model_router import get_configured_model
+
+            model_name = model or get_configured_model(provider, get_settings())
+            window = get_capabilities(model_name, provider).context_window
+        except Exception:
+            return cls._TOOL_CONTEXT_CHAR_LIMIT
+        reserve = max(int(window * 0.15), 1024)
+        free_tokens = window - reserve - request_tokens
+        budget = int(free_tokens * cls._CHARS_PER_TOKEN * 0.9)
+        return max(cls._TOOL_CONTEXT_MIN_CHARS, min(cls._TOOL_CONTEXT_CHAR_LIMIT, budget))
+
+    @classmethod
+    def _format_tool_results(cls, results: List[Dict[str, Any]], total_limit: Optional[int] = None) -> str:
+        total_limit = total_limit or cls._TOOL_CONTEXT_CHAR_LIMIT
+        per_result = min(cls._TOOL_RESULT_CHAR_LIMIT, max(500, total_limit // max(1, min(len(results), 4))))
         rendered = []
         for item in results:
             text = json.dumps(item, default=str)
-            if len(text) > cls._TOOL_RESULT_CHAR_LIMIT:
-                text = (
-                    text[: cls._TOOL_RESULT_CHAR_LIMIT]
-                    + f'... [truncated {len(text) - cls._TOOL_RESULT_CHAR_LIMIT} chars]'
-                )
+            if len(text) > per_result:
+                text = text[:per_result] + f'... [truncated {len(text) - per_result} chars]'
             rendered.append(text)
         joined = "[\n" + ",\n".join(rendered) + "\n]"
-        if len(joined) > cls._TOOL_CONTEXT_CHAR_LIMIT:
+        if len(joined) > total_limit:
             # Keep the most recent results: they reflect the model's latest plan.
-            joined = "[... earlier tool results truncated ...]\n" + joined[-cls._TOOL_CONTEXT_CHAR_LIMIT:]
+            joined = "[... earlier tool results truncated ...]\n" + joined[-total_limit:]
         return joined
 
     # ═══════════════════════════════════════════════════════════

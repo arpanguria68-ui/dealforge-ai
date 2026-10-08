@@ -2,6 +2,8 @@
 Model Capability Registry — Static knowledge of LLM capabilities.
 Used by LLMGateway to auto-adapt requests (tool format, JSON mode, context limits).
 """
+import dataclasses
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -122,7 +124,45 @@ LMSTUDIO_REGISTRY: dict[str, ModelCapabilities] = {
 # ── Combined Registry ────────────────────────────────────────────────────────
 MODEL_REGISTRY: dict[str, ModelCapabilities] = {**OLLAMA_REGISTRY, **LMSTUDIO_REGISTRY, **CLOUD_REGISTRY}
 
+# Context windows observed at runtime (e.g. LM Studio's loaded context length),
+# keyed by (provider, model). These override the static table, because local
+# windows depend on how the model was loaded, not on the model family.
+_LIVE_CONTEXT: dict = {}
+
+
+def set_live_context_window(provider: str, model: str, tokens: Optional[int]) -> None:
+    if tokens and int(tokens) > 0:
+        _LIVE_CONTEXT[((provider or "").lower(), model or "")] = int(tokens)
+
+
+def ollama_max_ctx() -> int:
+    """Largest num_ctx DealForge requests from Ollama (VRAM grows with it)."""
+    try:
+        return max(2048, int(os.getenv("OLLAMA_MAX_CTX", "16384")))
+    except ValueError:
+        return 16384
+
+
 def get_capabilities(model: str, provider: str = "") -> ModelCapabilities:
+    """Static capabilities adjusted to the effective runtime context window.
+
+    - A live window discovered from the provider wins.
+    - Ollama runs with the ``num_ctx`` the client requests (capped by
+      OLLAMA_MAX_CTX), not the family's maximum, so the guard must budget to
+      that cap or prompts are silently cut by Ollama from the front.
+    """
+    caps = _static_capabilities(model, provider)
+    p = (provider or "").lower()
+    # "" = the model the server has loaded when no name was configured.
+    live = _LIVE_CONTEXT.get((p, model or "")) or _LIVE_CONTEXT.get((p, ""))
+    if live:
+        return dataclasses.replace(caps, context_window=live)
+    if p == "ollama":
+        return dataclasses.replace(caps, context_window=min(caps.context_window, ollama_max_ctx()))
+    return caps
+
+
+def _static_capabilities(model: str, provider: str = "") -> ModelCapabilities:
     """Look up model capabilities. Returns safe defaults if unknown.
 
     Provider-aware: the same model id (e.g. "llama3.1") has different
