@@ -264,7 +264,7 @@ OUTPUT structured JSON."""
             reasoning=analysis.get(
                 "reasoning", f"Synergy analysis for {acquirer} + {target} complete."
             ),
-            confidence=0.75,
+            confidence=self._evidence_confidence(0.75, result, analysis),
             execution_time_ms=elapsed,
         )
 

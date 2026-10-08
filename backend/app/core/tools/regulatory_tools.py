@@ -15,6 +15,8 @@ logger = structlog.get_logger(__name__)
 class CyberVulnScannerTool(BaseTool):
     """Detects vulnerabilities in security policies via regex/keyword mapping."""
 
+    output_quality = "heuristic"
+
     def __init__(self):
         super().__init__(
             name="cyber_vuln_scanner",
@@ -137,6 +139,8 @@ class AntitrustHHICalculatorTool(BaseTool):
 
 class PrivacyAuditorTool(BaseTool):
     """Flags high-risk data localization and privacy compliance issues."""
+
+    output_quality = "heuristic"
 
     def __init__(self):
         super().__init__(

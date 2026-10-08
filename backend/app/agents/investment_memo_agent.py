@@ -131,7 +131,7 @@ RULES:
                 success=True,
                 data=analysis,
                 reasoning="Generated investment memo with executive summary and supporting charts.",
-                confidence=0.85,
+                confidence=self._evidence_confidence(0.85, result, analysis if content.strip() else {}),
                 execution_time_ms=elapsed,
                 tool_calls=result.get("tool_calls"),
             )

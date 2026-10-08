@@ -40,11 +40,9 @@ class DataCuratorAgent(BaseAgent):
         prompt = self._build_synthesis_prompt(task, context, memory_context)
         system_prompt = self._build_system_prompt()
 
-        # 3. Call LLM
-        response = await self.generate_with_tools(prompt, system_prompt)
-
-        # 4. Parse output
+        # 4. Call LLM and parse output (provider failures return success=False)
         try:
+            response = await self.generate_with_tools(prompt, system_prompt)
             content = response.get("content", "")
             curated_data = self._parse_output(content)
 
@@ -56,7 +54,7 @@ class DataCuratorAgent(BaseAgent):
                 success=True,
                 data=curated_data,
                 reasoning="Synthesized agent outputs and resolved conflicts.",
-                confidence=0.9,
+                confidence=self._evidence_confidence(0.85, response, curated_data),
                 execution_time_ms=execution_time,
                 tool_calls=response.get("function_calls"),
             )

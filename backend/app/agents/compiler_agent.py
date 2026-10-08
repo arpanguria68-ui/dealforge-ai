@@ -59,9 +59,8 @@ class ReportCompilerAgent(BaseAgent):
         system_prompt = self._build_system_prompt()
 
         # The LLM will decide how to structure the narrative and call the `generate_report` tool
-        response = await self.generate_with_tools(prompt, system_prompt)
-
         try:
+            response = await self.generate_with_tools(prompt, system_prompt)
             # Parse the LLM's structural narrative decisions
             from app.core.json_helpers import extract_and_parse_json
 

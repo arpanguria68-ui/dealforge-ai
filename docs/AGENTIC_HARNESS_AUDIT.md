@@ -78,32 +78,63 @@ Readiness by behaviour (not covered by the contract check):
 |---|---|---|
 | Production-ready (real data or deterministic math, timeouts, fail-closed) | `web_search`, `web_scraper` (SSRF-guarded), `sec_filings`, `company_data`, `fetch_financial_statements`, `alpha_vantage`, `finnhub_data`, `financial_datasets`, `financial_calculator`, `antitrust_hhi_calculator`, `run_sensitivity_analysis`, `generate_football_field`, `document_search`, MCP tools | Depend on API keys; return `success=False` when they're unconfigured. |
 | Usable with caveats | `fetch_comparable_companies` (benchmark fallback now labelled), `peer_discovery`, `finance_analysis` (FMP key), `run_monte_carlo_irr`, `churn_monte_carlo` (unseeded `random`, so not reproducible), `excel_*`, `generate_*` reporting tools | Fine as calculators/formatters. Outputs are only as good as the inputs. |
-| **Not production-grade (heuristic/keyword stubs presented as analysis)** | `ai_stack_scanner` (keyword match, "Simplified mock logic"), `model_defensibility_scorer`, `ai_value_quantifier`, `carbon_footprint_extractor` ("mock logic" regex), `supply_chain_risk_flagger`, `esg_scorer` ("simulated_msci_rating"), `cyber_vuln_scanner`, `privacy_auditor`, `roadmap_generator`, `synergy_tracker`, `filing_due_diligence` (Kernel Ridge model trained on **synthetic** data at import time) | These should either be relabelled as heuristics in their descriptions and outputs (`data_quality: "heuristic"`), or replaced with LLM-extraction + rule scoring or real data sources. |
+| **Heuristic / synthetic (now labelled `output_quality`; still not sourced analysis)** | `ai_stack_scanner` (keyword match, "Simplified mock logic"), `model_defensibility_scorer`, `ai_value_quantifier`, `carbon_footprint_extractor` ("mock logic" regex), `supply_chain_risk_flagger`, `esg_scorer` ("simulated_msci_rating"), `cyber_vuln_scanner`, `privacy_auditor`, `roadmap_generator`, `synergy_tracker`, `filing_due_diligence` (Kernel Ridge model trained on **synthetic** data at import time) | Labelled to the model and stamped on every result (`data_quality`, `method_note`). Replacing them with real data sources is still open. |
 
 ## 3. Agent readiness (24 agents)
 
-Cross-cutting issues found (not changed in this pass, since they alter agent
-behaviour):
+All five cross-cutting issues found in the first pass are now fixed:
 
-1. **Hardcoded confidence on success**: 0.95 in `complex_reasoning_agent`,
-   `ofas_supervisor`; 0.9 in `data_curator_agent`; 0.85 in `dcf_lbo_architect`,
-   `investment_memo_agent`, `ingestion_agent`; 0.75 in `due_diligence_agent`,
-   `market_researcher`. The confidence gate and Laya pre-gate route on this
-   value, so a constant 0.95 bypasses peer review regardless of output quality.
-   Derive it from validation results, tool success ratio, and the Laya
-   `gate_confidence().combined` score.
-2. **Unguarded LLM calls**: `complex_reasoning_agent`, `data_curator_agent` and
-   `compiler_agent` call `generate_with_tools` outside their `try`, so a
-   provider failure raises out of `run()` instead of returning
-   `AgentOutput(success=False)`.
-3. **Placeholder logic**: `legal_advisor._assess_compliance_item` always returns
-   `status: "unknown"` ("For now, return placeholder").
-4. **Per-agent `ToolRouter` construction**: each agent instantiates all 38
-   tools. A shared registry plus per-agent filtering would cut startup cost
-   and memory.
-5. **RL loop overhead**: `run_with_structure` constructs and initializes
-   `AgentQualityStore` twice per run and always runs `reflect()` (an LLM call)
-   even for failed outputs.
+1. **Hardcoded confidence → evidence-based.** Eleven LLM-synthesis agents
+   returned constant confidence (up to 0.95), which the confidence gate routes
+   on, so weak outputs skipped peer review. They now use
+   `BaseAgent._evidence_confidence(prior, response, data)`:
+   - The prior is capped at 0.85.
+   - It's discounted for empty or error output (×0.5), unparsed narrative
+     output (×0.6), the failed-tool share (down to ×0.6), failed deterministic
+     validation (×0.6), and no retrieved evidence (×0.85).
+   - Output is marked `confidence_basis: "heuristic_signals"` and carries
+     `confidence_signals`, so reports keep showing "Not calibrated" rather
+     than a percentage.
+
+   Agents covered: complex_reasoning, data_curator, dcf_lbo_architect,
+   due_diligence, ingestion, investment_memo, market_researcher (debate),
+   prospectus, and treasury (×3). Deterministic agents (compliance QA, red
+   team, OFAS supervisor, report architect, compiler) keep rule-based values.
+2. **Unguarded LLM calls:** `complex_reasoning_agent`, `data_curator_agent` and
+   `compiler_agent` now return `AgentOutput(success=False)` on provider
+   failure instead of raising.
+3. **`ComplianceAgent` placeholder → real assessment.**
+   - It retrieves deal-document excerpts per checklist item (concurrently) and
+     assesses all items in one LLM call.
+   - Any status other than `unknown` must cite a supplied excerpt id;
+     otherwise it's downgraded to `unknown`.
+   - `compliance_score` counts assessed items only (`None` when nothing
+     could be assessed), with `coverage` and `unassessed` reported alongside.
+     Previously "not assessed" scored as 0% compliant.
+   - Confidence scales with coverage.
+4. **Shared tool instances:** default tools are built once per process and
+   shared by every agent's router. Only `document_search` is per agent. Router
+   setup went from ~140 ms to ~0.06 ms per agent, which is ~3.5 s per
+   orchestrator init.
+5. **RL loop:** one `AgentQualityStore` per run instead of two, and no
+   reflection LLM call for failed runs.
+
+Tool labelling (see section 2):
+- Tools now declare `output_quality`.
+- The 8 keyword-screen tools are `heuristic`, `filing_due_diligence` is
+  `synthetic_model`, and `roadmap_generator` / `synergy_tracker` are
+  `template`.
+- The model sees a `[HEURISTIC]` / `[SYNTHETIC_MODEL]` / `[TEMPLATE]` prefix
+  in the tool description, and every result is stamped with `data_quality`
+  plus a `method_note` instructing `[ESTIMATED]` citation.
+- `churn_monte_carlo` is now seeded, so the same inputs give the same output.
+
+Still open, needing data sources or product decisions rather than code fixes:
+- Replacing the heuristic tools with real data (security scanners, ESG data
+  providers, an LLM-extraction pipeline).
+- Retraining `filing_due_diligence` on observed filings.
+- The two committed Windows OfficeCLI binaries (~66 MB) in
+  `backend/data/officecli/`. Deleting them won't shrink git history.
 
 Strongest agents: `financial_analyst` (grounded assessment, Laya output gate,
 deterministic validation), `project_manager` (Laya triage with safety floors),

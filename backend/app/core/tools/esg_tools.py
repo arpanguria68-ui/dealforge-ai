@@ -16,6 +16,8 @@ logger = structlog.get_logger(__name__)
 class CarbonFootprintExtractorTool(BaseTool):
     """Extracts Scope 1/2/3 emissions data from sustainability texts."""
 
+    output_quality = "heuristic"
+
     def __init__(self):
         super().__init__(
             name="carbon_footprint_extractor",
@@ -84,6 +86,8 @@ class CarbonFootprintExtractorTool(BaseTool):
 class SupplyChainRiskFlaggerTool(BaseTool):
     """Flags ethical and environmental risks in supplier docs."""
 
+    output_quality = "heuristic"
+
     def __init__(self):
         super().__init__(
             name="supply_chain_risk_flagger",
@@ -144,6 +148,8 @@ class SupplyChainRiskFlaggerTool(BaseTool):
 
 class ESGScorerTool(BaseTool):
     """Computes a composite MSCI-style ESG score and NPV impact."""
+
+    output_quality = "heuristic"
 
     def __init__(self):
         super().__init__(

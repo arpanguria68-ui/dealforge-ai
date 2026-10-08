@@ -15,6 +15,8 @@ logger = structlog.get_logger(__name__)
 class AIStackScannerTool(BaseTool):
     """Parses technical documents or repos to map out an AI/ML tech stack."""
 
+    output_quality = "heuristic"
+
     def __init__(self):
         super().__init__(
             name="ai_stack_scanner",
@@ -79,6 +81,8 @@ class AIStackScannerTool(BaseTool):
 
 class ModelDefensibilityScorerTool(BaseTool):
     """Scores IP protection, scalability, and obsolescence risk."""
+
+    output_quality = "heuristic"
 
     def __init__(self):
         super().__init__(
@@ -146,6 +150,8 @@ class ModelDefensibilityScorerTool(BaseTool):
 
 class AIValueQuantifierTool(BaseTool):
     """Estimates AI-driven revenue uplift potential."""
+
+    output_quality = "heuristic"
 
     def __init__(self):
         super().__init__(

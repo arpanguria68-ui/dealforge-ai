@@ -470,6 +470,8 @@ class FilingDueDiligenceTool(BaseTool):
     ROA/ROE impacts.
     """
 
+    output_quality = "synthetic_model"
+
     def __init__(self):
         super().__init__(
             name="filing_due_diligence",

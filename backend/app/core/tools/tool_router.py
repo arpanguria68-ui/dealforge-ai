@@ -994,6 +994,9 @@ AGENT_TOOL_MAP: Dict[str, List[str]] = {
 }
 
 
+_SHARED_DEFAULT_TOOLS: Optional[Dict[str, BaseTool]] = None
+
+
 class ToolRouter:
     """Routes tool calls to appropriate tools with per-agent filtering"""
 
@@ -1050,7 +1053,23 @@ class ToolRouter:
         return None
 
     def register_default_tools(self, pageindex_client=None):
-        """Register all tools"""
+        """Register all default tools.
+
+        Tool objects are stateless, so the process builds them once and every
+        agent's router shares them (building all ~38 took ~140ms per agent).
+        Only DocumentSearchTool is per-router, bound to that agent's memory.
+        """
+        global _SHARED_DEFAULT_TOOLS
+        if _SHARED_DEFAULT_TOOLS is None:
+            builder = ToolRouter()
+            builder._build_default_tools()
+            _SHARED_DEFAULT_TOOLS = dict(builder.tools)
+        self.tools.update(_SHARED_DEFAULT_TOOLS)
+        if pageindex_client:
+            self.register_tool(DocumentSearchTool(pageindex_client))
+
+    def _build_default_tools(self):
+        """Instantiate every default tool (except document_search)."""
         self.register_tool(FinancialCalculatorTool())
         self.register_tool(WebSearchTool())
         self.register_tool(WebScraperTool())
@@ -1066,9 +1085,6 @@ class ToolRouter:
             self.register_tool(StartupIntelligenceTool())
         except ImportError:
             self.logger.warning("StartupIntelligenceTool import failed")
-
-        if pageindex_client:
-            self.register_tool(DocumentSearchTool(pageindex_client))
 
         # Financial Data Integrations (FinanceDatabase & FinanceToolkit)
         try:
@@ -1468,6 +1484,12 @@ class ToolRouter:
                     result = await asyncio.wait_for(result, timeout=timeout)
             if not isinstance(result, ToolResult):
                 result = ToolResult(success=True, data=result)
+            quality = getattr(tool, "output_quality", "data")
+            if result.success and isinstance(result.data, dict) and quality != "data":
+                from app.core.tools.base_tool import OUTPUT_QUALITY_NOTES
+
+                result.data.setdefault("data_quality", quality)
+                result.data.setdefault("method_note", OUTPUT_QUALITY_NOTES.get(quality, ""))
             if result.execution_time_ms is None:
                 result.execution_time_ms = round((time.monotonic() - started) * 1000, 1)
             self.logger.info(

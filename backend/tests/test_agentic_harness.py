@@ -346,3 +346,156 @@ def test_laya_noul_confidence_is_distance_from_coin_flip():
     confident_no = LayaDecisionClient._parse_noul({"x": {"noul": 0.05}}, "x")
     assert confident_no.answer == 0.05
     assert confident_no.confidence == pytest.approx(0.95)
+
+
+# ── Agent readiness: confidence, failure handling, compliance, tool labels ──
+
+
+def _bare_agent(cls, name, **attrs):
+    agent = cls.__new__(cls)
+    agent.name = name
+    agent.logger = SimpleNamespace(
+        info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None
+    )
+    agent._current_context = {}
+    for key, value in attrs.items():
+        setattr(agent, key, value)
+    return agent
+
+
+def test_evidence_confidence_reflects_output_signals():
+    from app.agents.base import BaseAgent
+
+    clean = {"thesis": "x"}
+    assert BaseAgent._evidence_confidence(0.95, None, clean) == 0.85, "capped below near-certainty"
+    assert clean["confidence_basis"] == "heuristic_signals"
+
+    unparsed = BaseAgent._evidence_confidence(0.85, None, {"raw_reasoning": "text"})
+    empty = BaseAgent._evidence_confidence(0.85, None, {})
+    tools = {"tool_results": [{"success": True}, {"success": False}]}
+    partial_tools = BaseAgent._evidence_confidence(0.85, tools, {"a": 1})
+    failed_validation = BaseAgent._evidence_confidence(0.85, None, {"a": 1, "_validation": {"passed": False}})
+    assert empty < unparsed < 0.85
+    assert partial_tools == pytest.approx(0.85 * 0.8, abs=1e-3)
+    assert failed_validation == pytest.approx(0.51, abs=1e-3)
+    assert BaseAgent._evidence_confidence(0.85, None, {"a": 1, "_rag_context": {"chunks_used": 0}}) < 0.85
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module,cls_name,name", [
+    ("app.agents.complex_reasoning_agent", "ComplexReasoningAgent", "complex_reasoning_agent"),
+    ("app.agents.data_curator_agent", "DataCuratorAgent", "data_curator_agent"),
+])
+async def test_llm_provider_failure_returns_failed_output(monkeypatch, module, cls_name, name):
+    import importlib
+
+    cls = getattr(importlib.import_module(module), cls_name)
+    agent = _bare_agent(cls, name)
+
+    async def boom(*a, **k):
+        raise RuntimeError("all providers down")
+
+    async def no_context(*a, **k):
+        return []
+
+    monkeypatch.setattr(agent, "generate_with_tools", boom)
+    monkeypatch.setattr(agent, "retrieve_context", no_context)
+    out = await agent.run("task", {"deal_id": "d1"})
+    assert out.success is False and out.confidence == 0.0
+
+
+@pytest.mark.asyncio
+async def test_compliance_agent_without_documents_reports_unassessed_not_noncompliant(monkeypatch):
+    from app.agents.legal_advisor import ComplianceAgent
+
+    agent = _bare_agent(ComplianceAgent, "compliance_agent")
+
+    async def no_docs(*a, **k):
+        return []
+
+    monkeypatch.setattr(agent, "retrieve_context", no_docs)
+    out = await agent.run("check", {"industry": "healthcare", "deal_id": "d1"})
+    assert out.success
+    assert out.data["compliance_score"] is None and out.data["coverage"] == 0.0
+    assert out.data["gaps"] == [] and "HIPAA compliance" in out.data["unassessed"]
+    assert out.confidence <= 0.2
+
+
+@pytest.mark.asyncio
+async def test_compliance_agent_requires_cited_evidence_per_status(monkeypatch):
+    import json as _json
+
+    from app.agents.legal_advisor import ComplianceAgent
+
+    agent = _bare_agent(ComplianceAgent, "compliance_agent")
+
+    async def docs(query, top_k=3):
+        if "Data protection" in query:
+            return [{"content": "The company has no data processing agreements in place.", "source": "dpa.pdf"}]
+        if "Tax compliance" in query:
+            return [{"content": "All federal and state tax returns filed through FY2024.", "source": "tax.pdf"}]
+        return []
+
+    async def llm(prompt, system_prompt=None):
+        assert "[E1]" in prompt and "[E2]" in prompt
+        return {"content": _json.dumps({"items": [
+            # Excerpts are numbered in checklist order: Tax (E1) before Data protection (E2).
+            {"requirement": "Data protection", "status": "non_compliant", "evidence": ["E2"],
+             "remediation": "Execute DPAs"},
+            {"requirement": "Tax compliance", "status": "compliant", "evidence": ["E1"]},
+            {"requirement": "Entity registration", "status": "compliant", "evidence": []},
+            {"requirement": "Annual filings", "status": "compliant", "evidence": ["E99"]},
+        ]})}
+
+    monkeypatch.setattr(agent, "retrieve_context", docs)
+    monkeypatch.setattr(agent, "generate_with_routed_fallback", llm)
+    out = await agent.run("check", {"industry": "technology"})
+
+    by_req = {r["requirement"]: r for r in out.data["assessment_results"]}
+    assert by_req["Data protection"]["status"] == "non_compliant"
+    assert by_req["Data protection"]["evidence"][0]["source"] == "dpa.pdf"
+    assert by_req["Tax compliance"]["status"] == "compliant"
+    # Uncited or invalidly cited statuses are downgraded to unknown.
+    assert by_req["Entity registration"]["status"] == "unknown"
+    assert by_req["Annual filings"]["status"] == "unknown"
+    assert out.data["compliance_score"] == 0.5
+    assert out.data["coverage"] == pytest.approx(0.4)
+    assert [g["requirement"] for g in out.data["gaps"]] == ["Data protection"]
+
+
+@pytest.mark.asyncio
+async def test_heuristic_tools_are_labelled_to_the_model_and_in_results(registry):
+    heuristic = {
+        "ai_stack_scanner", "model_defensibility_scorer", "ai_value_quantifier",
+        "carbon_footprint_extractor", "supply_chain_risk_flagger", "esg_scorer",
+        "cyber_vuln_scanner", "privacy_auditor",
+    }
+    for name in heuristic:
+        assert registry.tools[name].get_schema()["function"]["description"].startswith("[HEURISTIC]")
+    assert registry.tools["filing_due_diligence"].output_quality == "synthetic_model"
+    assert registry.tools["web_search"].output_quality == "data"
+    assert not registry.tools["web_search"].get_schema()["function"]["description"].startswith("[")
+
+    result = await registry.execute("cyber_vuln_scanner", {"security_text": "We suffered a ransomware breach."})
+    assert result.success
+    assert result.data["data_quality"] == "heuristic" and "[ESTIMATED]" in result.data["method_note"]
+
+
+@pytest.mark.asyncio
+async def test_churn_simulation_is_reproducible(registry):
+    args = {"base_count": 500, "cultural_fit_score": 40}
+    first = await registry.execute("churn_monte_carlo", dict(args))
+    second = await registry.execute("churn_monte_carlo", dict(args))
+    assert first.success and first.data == second.data
+
+
+def test_default_tools_are_shared_but_document_search_is_per_agent():
+    from app.core.tools.tool_router import ToolRouter
+
+    a, b = ToolRouter(), ToolRouter()
+    a.register_default_tools(object())
+    b.register_default_tools(object())
+    assert a.tools["web_search"] is b.tools["web_search"]
+    assert a.tools["document_search"] is not b.tools["document_search"]
+    a.tools.pop("web_search")
+    assert "web_search" in b.tools, "per-router dicts stay independent"

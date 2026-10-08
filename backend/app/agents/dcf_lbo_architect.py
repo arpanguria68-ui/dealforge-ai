@@ -76,7 +76,7 @@ class DCFLBOArchitectAgent(BaseAgent):
                 data=analysis,
                 reasoning=f"Built financial model covering DCF/LBO analysis. "
                 f"Deterministic calcs: {len(calc_results)} models executed.",
-                confidence=0.85,
+                confidence=self._evidence_confidence(0.85, result, analysis),
                 execution_time_ms=elapsed,
                 tool_calls=result.get("tool_calls"),
             )

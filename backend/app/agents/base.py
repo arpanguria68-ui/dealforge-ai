@@ -169,6 +169,7 @@ class BaseAgent(ABC):
         # [NEW] Step 0.1: Closed-loop RL — inject historical best practices
         best_practices_context = ""
         action_id = None
+        quality_store = None
         try:
             from app.core.quality.agent_quality_store import AgentQualityStore
             quality_store = AgentQualityStore()
@@ -298,17 +299,16 @@ class BaseAgent(ABC):
 
         # Step 8: Closed-loop RL — reflect, reward, update best practices
         try:
-            if action_id is not None:
-                reflection_score = await self.reflect(task, output)
+            if action_id is not None and quality_store is not None:
+                # Reflection is an LLM call; a failed run has nothing worth
+                # grading, so it is scored 0 without spending the call.
+                reflection_score = await self.reflect(task, output) if output.success else 0.0
                 reward = self.reward.compute_reward(
                     reflection_score=reflection_score,
                     task_completed=output.success,
                 )
                 output.reflection_score = reflection_score
 
-                from app.core.quality.agent_quality_store import AgentQualityStore
-                quality_store = AgentQualityStore()
-                await quality_store.initialize()
                 await quality_store.reward_action(
                     action_id, reward, f"reflection={reflection_score:.2f}"
                 )
@@ -703,6 +703,60 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
             response["tool_calls"] = all_function_calls
 
         return response
+
+    # Keys agents use when the model's output could not be parsed as JSON.
+    _PARSE_FALLBACK_KEYS = frozenset({"raw_reasoning", "raw_synthesis", "raw_response", "raw"})
+
+    @classmethod
+    def _evidence_confidence(
+        cls,
+        prior: float,
+        response: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
+        *,
+        cap: float = 0.85,
+    ) -> float:
+        """Confidence from observable output signals instead of a fixed constant.
+
+        Starts from the agent's prior (capped, so no LLM synthesis claims
+        near-certainty by default) and discounts for: empty/error output,
+        unstructured output (JSON parse fallback), failed tool calls, a failed
+        deterministic validation, and analysis run with no retrieved evidence.
+        The result is a heuristic, not a calibrated probability, and the
+        output is marked that way (``confidence_basis``) so reports never
+        render it as a percentage.
+        """
+        conf = min(float(prior), cap)
+        signals: List[str] = []
+        payload = data if isinstance(data, dict) else {}
+        if not payload or payload.get("error"):
+            conf *= 0.5
+            signals.append("empty_or_error_output")
+        elif cls._PARSE_FALLBACK_KEYS & set(payload) or payload.get("format") == "narrative":
+            conf *= 0.6
+            signals.append("unstructured_output")
+
+        tool_results = (response or {}).get("tool_results") or []
+        if tool_results:
+            ok = sum(1 for t in tool_results if isinstance(t, dict) and t.get("success"))
+            conf *= 0.6 + 0.4 * (ok / len(tool_results))
+            if ok < len(tool_results):
+                signals.append(f"tool_failures:{len(tool_results) - ok}/{len(tool_results)}")
+
+        validation = payload.get("_validation")
+        if isinstance(validation, dict) and validation.get("passed") is False:
+            conf *= 0.6
+            signals.append("validation_failed")
+
+        rag = payload.get("_rag_context")
+        if isinstance(rag, dict) and not rag.get("chunks_used"):
+            conf *= 0.85
+            signals.append("no_retrieved_evidence")
+
+        if isinstance(data, dict):
+            data.setdefault("confidence_basis", "heuristic_signals")
+            data["confidence_signals"] = signals
+        return round(max(0.0, min(conf, cap)), 3)
 
     @staticmethod
     def _tool_call_key(call: Dict[str, Any]) -> str:
