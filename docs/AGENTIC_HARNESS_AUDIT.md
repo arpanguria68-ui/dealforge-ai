@@ -122,3 +122,40 @@ tools are the stubs listed above.
 | `TOOL_TIMEOUT_SECONDS` | 90 | Per-tool wall clock (overridable per tool via `timeout_seconds`) |
 | `TOOL_MAX_CONCURRENCY` | 4 | Parallel tool calls per round |
 | `MCP_DISCOVERY_TTL_SECONDS` | 60 | MCP tool-list cache |
+
+## 5. Knowledge graph: Neo4j replaced with embedded SQLite
+
+**How Neo4j was being used.**
+- *Writes:* the orchestrator created a `Deal` node per run, and
+  `BaseAgent._write_findings_to_graph` wrote numeric metrics, risks and
+  entities after each successful agent run.
+- *Reads:* none in production. `query_current_facts` had no callers, and
+  `InsightForgeGraphRAG` was never instantiated.
+- *Deployment:* neither docker-compose file runs a Neo4j service, so every
+  deployment was offline. The client then re-dialled `bolt://localhost:7687`
+  on **every write** and silently dropped the data.
+- *Dependencies:* `requirements.txt` listed both `neo4j` and `neo4j-driver`.
+  They install the same package name, and installing both breaks
+  `import neo4j`.
+- *Correctness:* nodes were MERGEd on `(label, name)` globally, so one deal's
+  `financial_analyst_revenue` metric overwrote another deal's.
+- *Wasted LLM call:* `OntologyService` made one LLM call per deal. Its output
+  (`dynamic_tasks["_ontology"]`) was never read.
+- *Security:* GraphRAG executed LLM-generated Cypher verbatim, with `deal_id`
+  string-interpolated into the query.
+
+**Replacement** (`core/knowledge_graph/graph_store.py`, selected in `service.py`):
+
+| | Before | After |
+|---|---|---|
+| Backend | Neo4j server (never deployed) | Embedded SQLite file `$DATA_DIR/knowledge_graph.db` (WAL), stdlib only |
+| Hard dependency | `neo4j` + `neo4j-driver` | none (`pip install neo4j` only if `KG_BACKEND=neo4j`) |
+| Offline behaviour | reconnect attempt on every write, data dropped | always persists; Neo4j backend (if chosen) backs off 60s |
+| Node scope | global `(label, name)`: cross-deal overwrites | per deal `(deal_id, label, name)` |
+| Reads | none | `query_current_facts`, `get_risks`, `deal_summary`; `GET /api/v1/deals/{deal_id}/knowledge-graph` |
+| GraphRAG | LLM-written Cypher executed verbatim | parameterized read of the deal's facts; LLM answers only from them |
+| Ontology LLM call per deal | yes (output unused) | removed |
+
+`KG_BACKEND=sqlite|neo4j|off` (default `sqlite`) and `KG_SQLITE_PATH`
+configure it. Tests: `backend/tests/test_knowledge_graph.py`. The full suite
+passes with the `neo4j` package uninstalled.

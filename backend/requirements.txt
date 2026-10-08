@@ -10,8 +10,8 @@ asyncpg
 aiosqlite
 alembic
 redis
-neo4j
-neo4j-driver
+# Knowledge graph: embedded SQLite by default (no dependency).
+# Optional: `pip install neo4j` and set KG_BACKEND=neo4j to use a Neo4j server.
 
 # LangGraph & AI
 langgraph

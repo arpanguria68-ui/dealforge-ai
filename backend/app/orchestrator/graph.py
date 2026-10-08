@@ -47,8 +47,7 @@ from app.agents.advanced_financial_modeler import AdvancedFinancialModelerAgent
 from app.agents.ingestion_agent import IngestionAgent
 from app.core.halugate import HaluGateEngine, HaluGateSeverity
 
-from app.core.knowledge_graph.neo4j_client import Neo4jClient, DealKnowledgeGraph
-from app.core.knowledge_graph.ontology_service import OntologyService
+from app.core.knowledge_graph.service import get_knowledge_graph
 
 from app.orchestrator.planner import AgentSelectionPlanner
 from app.orchestrator.screening_config import ScreeningTaskMap
@@ -80,9 +79,7 @@ class DealOrchestrator:
         self.agent_registry = get_agent_registry()
         self._register_agents()
         
-        self.neo4j_client = Neo4jClient()
-        self.kb_graph = DealKnowledgeGraph(self.neo4j_client)
-        self.ontology_service = OntologyService()
+        self.kb_graph = get_knowledge_graph()
         
         # Phase 5: Advanced Orchestration Initialization (F-026, F-027, F-028)
         self.planner = AgentSelectionPlanner()
@@ -379,7 +376,7 @@ class DealOrchestrator:
                 updates["context"] = context
                 updates["deal_name"] = fallback_name
 
-        # Create Neo4j Deal Node (F-021)
+        # Create the deal root node in the knowledge graph (F-021)
         try:
             await self.kb_graph.initialize_deal(
                 deal_id=state["deal_id"],
@@ -387,7 +384,7 @@ class DealOrchestrator:
                 industry=state.get("context", {}).get("industry", "N/A")
             )
         except Exception as e:
-            self.logger.warning("neo4j_init_failed", error=str(e))
+            self.logger.warning("knowledge_graph_init_failed", error=str(e))
 
         # Phase 5: Dynamic Agent Selection (F-026)
         try:
@@ -560,16 +557,6 @@ Return the tasks in JSON format:
                 import json
                 tasks = json.loads(tasks)
                 
-            # Generate Dynamic Ontology (F-022)
-            try:
-                 ontology = await self.ontology_service.generate_ontology(
-                     industry=industry,
-                     deal_brief=state.get("deal_brief", "")
-                 )
-                 tasks["_ontology"] = ontology
-            except Exception as e:
-                 self.logger.warning("ontology_generation_failed", error=str(e))
-
             ctx_update = {}
             if guard_action != "allow":
                 ctx_update = {

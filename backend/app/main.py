@@ -451,6 +451,17 @@ async def export_deal_provenance(deal_id: str):
     return export_data
 
 
+@app.get("/api/v1/deals/{deal_id}/knowledge-graph")
+async def get_deal_knowledge_graph(deal_id: str, label: Optional[str] = None):
+    """Current knowledge-graph facts for a deal (metrics, risks, entities written by agents)."""
+    from app.core.knowledge_graph.service import get_knowledge_graph
+
+    graph = get_knowledge_graph()
+    if label:
+        return {"deal_id": deal_id, "facts": await graph.query_current_facts(deal_id, label)}
+    return {"deal_id": deal_id, **await graph.deal_summary(deal_id)}
+
+
 @app.get("/api/v1/deals/{deal_id}/agent-messages")
 async def get_deal_agent_messages(deal_id: str):
     """Retrieve the inter-agent message history for a specific deal."""

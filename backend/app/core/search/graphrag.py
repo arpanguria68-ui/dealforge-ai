@@ -1,96 +1,58 @@
-"""Graph-based RAG for complex deal intelligence (F-025)."""
+"""Graph-grounded Q&A over the deal knowledge graph (F-025).
+
+The old implementation asked an LLM to write Cypher and executed it
+verbatim against Neo4j (unvalidated, write-capable queries built from user
+text). This version reads the deal's current facts through the store API
+(parameterized, read-only) and has the LLM answer only from those facts.
+"""
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
+
 import structlog
+
 from app.core.llm.llm_gateway import get_llm_gateway
-from app.core.knowledge_graph.neo4j_client import Neo4jClient
 
 logger = structlog.get_logger(__name__)
 
-class InsightForgeGraphRAG:
-    """Graph-based reasoning: traverse knowledge graph to answer complex deal questions (F-025)."""
 
-    def __init__(self, neo4j_client: Neo4jClient, provider: str = "gemini", model: Optional[str] = None):
-        self.neo4j_client = neo4j_client
+class InsightForgeGraphRAG:
+    """Answer deal questions from the knowledge graph's current facts."""
+
+    def __init__(self, graph_store: Any = None, provider: str = "gemini", model: Optional[str] = None):
+        if graph_store is None:
+            from app.core.knowledge_graph.service import get_knowledge_graph
+
+            graph_store = get_knowledge_graph()
+        self.graph = graph_store
         self.provider = provider
         self.model = model
         self.gateway = get_llm_gateway()
 
-    async def answer_question(self, question: str, deal_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Answer a complex question by translating it to Cypher and executing it.
-        """
-        self.logger = logger.bind(question=question, deal_id=deal_id)
-        self.logger.info("graphrag_query_started")
-
-        # 1. Translate NL question to Cypher
-        cypher_query = await self._decompose_to_cypher(question, deal_id)
-        if not cypher_query:
-            return {"answer": "I couldn't translate your question to a graph query.", "source": "graph_rag_failure"}
-
-        # 2. Execute Cypher
-        results = await self.neo4j_client.run_query(cypher_query)
-        self.logger.info("cypher_executed", result_count=len(results))
-
-        # 3. Synthesize Final Answer
-        answer = await self._synthesize_answer(question, results)
-        
+    async def answer_question(self, question: str, deal_id: str) -> Dict[str, Any]:
+        summary = await self.graph.deal_summary(deal_id)
+        facts = summary.get("facts") or []
+        logger.info("graphrag_facts_loaded", deal_id=deal_id, fact_count=len(facts))
+        if not facts:
+            return {
+                "answer": "No relevant information found in the knowledge graph for this deal.",
+                "graph_results": [],
+                "source": "InsightForge GraphRAG",
+            }
+        prompt = (
+            f"Question: {question}\n\n"
+            f"Deal knowledge graph facts (JSON):\n{json.dumps(facts[:60], default=str)}\n\n"
+            "Answer concisely using ONLY these facts. If they do not answer the "
+            "question, say what is missing."
+        )
+        response = await self.gateway.call(
+            provider=self.provider,
+            model=self.model,
+            prompt=prompt,
+            temperature=0.0,
+        )
         return {
-            "answer": answer,
-            "cypher": cypher_query,
-            "graph_results": results[:5],  # Subset for transparency
-            "source": "InsightForge GraphRAG"
+            "answer": str(response.get("content", "")).strip(),
+            "graph_results": facts[:5],
+            "counts": summary.get("counts", {}),
+            "source": "InsightForge GraphRAG",
         }
-
-    async def _decompose_to_cypher(self, question: str, deal_id: Optional[str] = None) -> str:
-        """Use LLM to convert a natural language question into a Cypher query."""
-        deal_context = f"WHERE d.id = '{deal_id}'" if deal_id else ""
-        
-        prompt = f"""
-        Knowledge Graph Schema:
-        Nodes: Deal {{id, name, industry}}, Company {{name, type}}, Risk {{name, severity, category}}, Metric {{name, value}}, Person, Product, RegulatoryBody.
-        Relationships: (Deal)-[:INVOLVES]->(Entity), (Deal)-[:HAS_RISK]->(Risk).
-        
-        Question: {question}
-        
-        Generate a Cypher query to answer this question. 
-        Always include the root Deal node 'd' if possible.
-        {deal_context}
-        
-        Return ONLY the Cypher query text. No markdown, no commentary.
-        Example: MATCH (d:Deal)-[:HAS_RISK]->(r:Risk) WHERE d.id = '...' RETURN r.name, r.severity ORDER BY r.severity DESC
-        """
-        
-        response = await self.gateway.call(
-            provider=self.provider,
-            model=self.model,
-            prompt=prompt,
-            temperature=0.0
-        )
-        
-        cypher = response.get("content", "").strip()
-        # Clean up possible markdown code blocks
-        cypher = cypher.replace("```cypher", "").replace("```", "").strip()
-        return cypher
-
-    async def _synthesize_answer(self, question: str, results: List[Dict[str, Any]]) -> str:
-        """Use LLM to synthesize the graph results into a readable answer."""
-        if not results:
-            return "No relevant information found in the knowledge graph for this question."
-
-        prompt = f"""
-        Question: {question}
-        Graph Data: {json.dumps(results[:20])}
-
-        Summarize the findings from the graph data into a concise, professional answer.
-        If the data is empty or generic, explain what was found.
-        """
-        
-        response = await self.gateway.call(
-            provider=self.provider,
-            model=self.model,
-            prompt=prompt,
-            temperature=0.3
-        )
-        
-        return response.get("content", "").strip()

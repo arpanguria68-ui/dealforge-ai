@@ -1,12 +1,21 @@
-"""Neo4j knowledge graph client and service for deal intelligence (F-021)."""
+"""Optional Neo4j backend for the deal knowledge graph (``KG_BACKEND=neo4j``).
+
+The default backend is the embedded SQLite store in ``graph_store.py``; this
+module is kept for deployments that already run Neo4j. The ``neo4j`` driver
+is imported lazily, so it is not a hard dependency
+(``pip install neo4j`` only when using this backend).
+"""
 import os
-import asyncio
+import time
 from typing import Any, Dict, List, Optional
-from datetime import datetime
 import structlog
-from neo4j import AsyncGraphDatabase, exceptions
 
 logger = structlog.get_logger(__name__)
+
+# After a failed connect, wait this long before trying again instead of
+# re-dialling Neo4j on every single write.
+_RECONNECT_BACKOFF_SECONDS = 60.0
+
 
 class Neo4jClient:
     """Core client for Neo4j operations with connection pooling and error handling."""
@@ -14,16 +23,19 @@ class Neo4jClient:
     def __init__(self, uri: Optional[str] = None, user: Optional[str] = None, password: Optional[str] = None):
         self.uri = uri or os.getenv("NEO4J_URI", "bolt://localhost:7687")
         self.user = user or os.getenv("NEO4J_USER", "neo4j")
-        self.password = password or os.getenv("NEO4J_PASSWORD", "password")
+        self.password = password or os.getenv("NEO4J_PASSWORD", "")
         self.driver = None
         self._connected = False
+        self._retry_after = 0.0
 
     async def connect(self):
         """Establish connection to Neo4j."""
-        if self._connected:
+        if self._connected or time.monotonic() < self._retry_after:
             return
-            
+
         try:
+            from neo4j import AsyncGraphDatabase
+
             self.driver = AsyncGraphDatabase.driver(
                 self.uri, 
                 auth=(self.user, self.password)
@@ -36,6 +48,7 @@ class Neo4jClient:
             logger.warning("neo4j_connection_failed", error=str(e), uri=self.uri)
             self._connected = False
             self.driver = None
+            self._retry_after = time.monotonic() + _RECONNECT_BACKOFF_SECONDS
 
     async def close(self):
         """Close Neo4j connection."""
@@ -57,15 +70,12 @@ class Neo4jClient:
                 result = await session.run(query, parameters or {})
                 records = await result.data()
                 return records
-            except exceptions.CypherError as e:
-                logger.error("neo4j_query_error", query=query, error=str(e))
-                return []
             except Exception as e:
                 logger.error("neo4j_execution_error", error=str(e))
                 return []
 
-class DealKnowledgeGraph:
-    """Service for high-level deal graph operations (F-021)."""
+class Neo4jGraphStore:
+    """Neo4j implementation of the deal graph store interface (F-021)."""
 
     def __init__(self, client: Neo4jClient):
         self.client = client
@@ -145,3 +155,37 @@ class DealKnowledgeGraph:
             "category": category,
             "description": description
         })
+
+    async def get_risks(self, deal_id: str, min_severity: int = 0) -> List[Dict[str, Any]]:
+        query = """
+        MATCH (d:Deal {id: $deal_id})-[:HAS_RISK]->(r:Risk)
+        WHERE coalesce(r.severity, 0) >= $min_severity
+        RETURN r.name AS name, r.severity AS severity, r.category AS category,
+               r.description AS description
+        ORDER BY r.severity DESC
+        """
+        return await self.client.run_query(query, {"deal_id": deal_id, "min_severity": min_severity})
+
+    async def get_deal(self, deal_id: str) -> Optional[Dict[str, Any]]:
+        rows = await self.client.run_query(
+            "MATCH (d:Deal {id: $deal_id}) RETURN d.id AS deal_id, d.name AS name, d.industry AS industry",
+            {"deal_id": deal_id},
+        )
+        return rows[0] if rows else None
+
+    async def deal_summary(self, deal_id: str) -> Dict[str, Any]:
+        facts = await self.query_current_facts(deal_id)
+        counts: Dict[str, int] = {}
+        for f in facts:
+            for label in f.get("labels") or ["Entity"]:
+                counts[label] = counts.get(label, 0) + 1
+        return {
+            "deal": await self.get_deal(deal_id),
+            "counts": counts,
+            "top_risks": (await self.get_risks(deal_id))[:10],
+            "facts": facts,
+        }
+
+
+# Backwards-compatible name for older imports.
+DealKnowledgeGraph = Neo4jGraphStore

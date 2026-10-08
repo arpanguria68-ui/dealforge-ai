@@ -22,7 +22,6 @@ from app.core.validation.output_validator import (
     format_validation_block,
 )
 from app.core.messaging.message_bus import get_message_bus, AgentMessage
-from app.core.knowledge_graph.neo4j_client import DealKnowledgeGraph
 
 logger = structlog.get_logger()
 
@@ -375,7 +374,7 @@ class BaseAgent(ABC):
         return output
 
     async def _write_findings_to_graph(self, findings: Dict[str, Any], deal_id: str, kb_graph: Any):
-        """Extract entities/metrics from findings and persist to Neo4j (F-023)."""
+        """Extract entities/metrics from findings and persist to the deal knowledge graph (F-023)."""
         self.logger.info("writing_to_graph", deal_id=deal_id)
         
         # 1. Handle specialized metrics (Financial Analyst)

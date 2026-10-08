@@ -45,3 +45,7 @@ tmp/
 
 # OfficeCLI binary auto-downloaded at runtime
 backend/data/officecli/officecli-linux-x64
+
+# Embedded deal knowledge graph (SQLite)
+backend/data/knowledge_graph.db*
+backend/knowledge_graph.db*
