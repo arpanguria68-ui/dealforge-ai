@@ -51,6 +51,14 @@ class BuildDocumentTool(BaseTool):
                     "type": "array", "items": {"type": "object"},
                     "description": "Agent outputs [{agent_type, success, data}] to build from.",
                 },
+                "content": {
+                    "type": "object",
+                    "description": (
+                        "Alternative to agent_results: document text you wrote, as "
+                        "{title?, sections: {<section_key>: {paragraphs?, bullets?, table?, sources?}}, sources?}. "
+                        "Requires doc_type. Validated against the document guide and marked review-required."
+                    ),
+                },
             },
             "required": [],
         }
@@ -64,9 +72,13 @@ class BuildDocumentTool(BaseTool):
         deal_id: Optional[str] = None,
         deal: Optional[Dict[str, Any]] = None,
         agent_results: Optional[List[Dict[str, Any]]] = None,
+        content: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> ToolResult:
         from app.core.reports.document_workflow import DocumentRequest, run_document_workflow
+
+        if content is not None:
+            return await self._build_from_content(doc_type, content, formats, audience, deal)
 
         deal = dict(deal or {})
         if deal_id and not deal.get("id"):
@@ -110,4 +122,39 @@ class BuildDocumentTool(BaseTool):
                 "built_with": "python-docx / reportlab / openpyxl / python-pptx",
             },
             error="; ".join(e["error"] for e in outcome["errors"]) or None,
+        )
+
+    async def _build_from_content(
+        self, doc_type: Optional[str], content: Dict[str, Any], formats: Optional[List[str]],
+        audience: Optional[str], deal: Optional[Dict[str, Any]],
+    ) -> ToolResult:
+        """LLM-written content -> guide validation -> the same renderers as evidence-built documents."""
+        from app.core.reports import doc_guidance
+        from app.core.reports.document_workflow import render_formats
+
+        if not doc_type:
+            return ToolResult(False, None, error="doc_type is required when content is supplied.")
+        try:
+            result = doc_guidance.validate_content(doc_type, content, formats=formats, audience=audience, deal=deal)
+        except doc_guidance.ContentError as exc:
+            return ToolResult(False, None, error=str(exc))
+        if not result.ok:
+            return ToolResult(False, {"issues": result.issues}, error="; ".join(
+                f"{i['section'] + ': ' if i['section'] else ''}{i['message']}" for i in result.errors))
+        model = result.build_model()
+        artifacts, errors = await render_formats(model, result.formats)
+        if not artifacts:
+            return ToolResult(False, None, error="; ".join(e["error"] for e in errors) or "No file produced.")
+        return ToolResult(
+            success=not errors,
+            data={
+                "doc_type": result.doc_type, "title": result.title, "formats": sorted(artifacts),
+                "files_base64": {f: base64.b64encode(b).decode("ascii") for f, b in artifacts.items()},
+                "sizes_bytes": {f: len(b) for f, b in artifacts.items()},
+                "sections": [s["key"] for s in result.sections], "issues": result.issues,
+                "review_status": model["review_status"], "errors": errors,
+                "content_source": "llm_supplied",
+                "built_with": "python-docx / reportlab / openpyxl / python-pptx",
+            },
+            error="; ".join(e["error"] for e in errors) or None,
         )

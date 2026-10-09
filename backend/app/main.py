@@ -1044,46 +1044,62 @@ async def plan_deal_documents(
     }
 
 
-async def _generate_adaptive_documents(deal_id: str, deal: Dict[str, Any], report_inputs, body: "DocumentGenerateRequest"):
+async def _publish_document_bundle(
+    deal_id: str, deal: Dict[str, Any], *, doc_type: str, title: str, audience: str, formats: List[str],
+    section_keys: List[str], model: Dict[str, Any], artifacts: Dict[str, bytes], errors: List[Dict[str, str]],
+    agents_count: int, analysis_basis: Any, extra_metadata: Optional[Dict[str, Any]] = None,
+):
+    """Store a rendered, validated bundle as one pending-review release. Shared by every adaptive path."""
     import hashlib
     import re as _re
 
-    from app.agents.base import get_agent_registry
     from app.core.document_store import DocumentStore
-    from app.core.reports.document_workflow import run_document_workflow
 
-    outcome = await run_document_workflow(body.to_workflow_request(), deal, report_inputs, get_agent_registry())
-    plan, model = outcome["plan"], outcome["model"]
-    artifacts, errors = outcome["artifacts"], outcome["errors"]
     safe_name = _re.sub(r"_+", "_", _re.sub(r"[^A-Za-z0-9]", "_", deal.get("target_company", "report"))).strip("_") or "report"
     fingerprint = hashlib.sha256(json.dumps(
-        {"deal": deal, "plan": plan, "model": model}, sort_keys=True, default=str
+        {"deal": deal, "basis": analysis_basis, "model": model}, sort_keys=True, default=str
     ).encode("utf-8")).hexdigest()
     metadata = {
         "target_company": deal.get("target_company", "Unknown"),
         "deal_name": deal.get("name", "Unknown"),
-        "agents_count": len(outcome["agent_results"]),
-        "safe_filename": f"{safe_name}_{plan['doc_type']}",
+        "agents_count": agents_count,
+        "safe_filename": f"{safe_name}_{doc_type}",
         "report_version": str(uuid.uuid4()),
         "analysis_fingerprint": fingerprint,
         "release_status": "pending_review",
         "review_status": model["review_status"],
         "review_warnings": model["warnings"],
-        "doc_type": plan["doc_type"],
-        "document_title": plan["title"],
-        "audience": plan["audience"],
-        "expected_formats": plan["formats"],
-        "plan_sections": [s["key"] for s in plan["sections"]],
+        "doc_type": doc_type,
+        "document_title": title,
+        "audience": audience,
+        "expected_formats": formats,
+        "plan_sections": section_keys,
+        **(extra_metadata or {}),
     }
     doc_store = DocumentStore.get_instance()
-    formats_generated = []
-    if artifacts and not errors and set(artifacts) == set(plan["formats"]):
+    formats_generated: List[str] = []
+    if artifacts and not errors and set(artifacts) == set(formats):
         try:
             await doc_store.replace_documents(deal_id, artifacts, metadata)
             formats_generated = list(artifacts)
         except Exception as exc:
             errors.append({"format": "bundle", "error": f"Bundle publication failed ({type(exc).__name__})."})
-    manifest = await doc_store.list_documents(deal_id)
+    return formats_generated, await doc_store.list_documents(deal_id)
+
+
+async def _generate_adaptive_documents(deal_id: str, deal: Dict[str, Any], report_inputs, body: "DocumentGenerateRequest"):
+    from app.agents.base import get_agent_registry
+    from app.core.reports.document_workflow import run_document_workflow
+
+    outcome = await run_document_workflow(body.to_workflow_request(), deal, report_inputs, get_agent_registry())
+    plan, model = outcome["plan"], outcome["model"]
+    artifacts, errors = outcome["artifacts"], outcome["errors"]
+    formats_generated, manifest = await _publish_document_bundle(
+        deal_id, deal, doc_type=plan["doc_type"], title=plan["title"], audience=plan["audience"],
+        formats=plan["formats"], section_keys=[s["key"] for s in plan["sections"]], model=model,
+        artifacts=artifacts, errors=errors, agents_count=len(outcome["agent_results"]),
+        analysis_basis=plan,
+    )
     return {
         "deal_id": deal_id,
         "status": "complete" if formats_generated else ("partial" if artifacts else "failed"),
@@ -1101,6 +1117,71 @@ async def _generate_adaptive_documents(deal_id: str, deal: Dict[str, Any], repor
             "human_review_required": model["review_status"] == "review_required" or bool(plan["gaps"]),
             "release_status": "pending_review",
         },
+    }
+
+
+# ── Guidance layer: LLM-authored content in, validated documents out ──
+
+@app.get("/api/v1/documents/guidance/{doc_type}")
+async def document_guidance(doc_type: str, audience: Optional[str] = None):
+    """What a model must write for this document type: per-section guide, prompt text, JSON schema."""
+    from app.core.reports import doc_guidance
+
+    try:
+        return {
+            "guide": doc_guidance.guide_for(doc_type, audience),
+            "instructions": doc_guidance.llm_instructions(doc_type, audience),
+            "response_schema": doc_guidance.response_schema(doc_type),
+        }
+    except doc_guidance.ContentError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+class DocumentContentRequest(BaseModel):
+    doc_type: str = Field(..., description="ic_memo | one_pager | risk_report | financial_summary | board_deck | dd_report")
+    content: Any = Field(..., description="The LLM response: a JSON object or JSON text matching the guidance schema")
+    formats: Optional[List[str]] = Field(None, description="Subset of docx, pdf, xlsx, pptx")
+    audience: Optional[str] = Field(None, max_length=120)
+    dry_run: bool = Field(False, description="Validate only; render and publish nothing")
+
+
+@app.post("/api/v1/deals/{deal_id}/documents/from-content")
+async def documents_from_content(
+    deal_id: str, body: DocumentContentRequest, _: bool = Depends(require_admin_token),
+):
+    """Build documents from content an LLM wrote. Validated against the type's guide, rendered with the
+    same renderers as agent-evidence documents, marked review-required, and published as a pending release."""
+    from app.core.reports import doc_guidance
+    from app.core.reports.document_workflow import SUPPORTED_FORMATS, render_formats
+
+    deal = await RedisStore.get_instance().get_deal(deal_id)
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    bad_formats = [f for f in (body.formats or []) if f not in SUPPORTED_FORMATS]
+    if bad_formats:
+        raise HTTPException(status_code=422, detail=f"Unsupported formats: {', '.join(bad_formats)}")
+    try:
+        result = doc_guidance.validate_content(
+            body.doc_type, body.content, formats=body.formats, audience=body.audience, deal=deal)
+    except doc_guidance.ContentError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    if body.dry_run or not result.ok:
+        # Invalid content is a normal outcome for model output: report every issue, publish nothing.
+        return {"deal_id": deal_id, "status": "validated" if result.ok else "rejected", **result.as_dict()}
+
+    model = result.build_model()
+    artifacts, errors = await render_formats(model, result.formats)
+    formats_generated, manifest = await _publish_document_bundle(
+        deal_id, deal, doc_type=result.doc_type, title=result.title, audience=result.audience,
+        formats=result.formats, section_keys=[s["key"] for s in result.sections], model=model,
+        artifacts=artifacts, errors=errors, agents_count=0, analysis_basis=body.content,
+        extra_metadata={"content_source": "llm_supplied"},
+    )
+    return {
+        "deal_id": deal_id,
+        "status": "complete" if formats_generated else ("partial" if artifacts else "failed"),
+        "formats_generated": formats_generated, "errors": errors, "documents": manifest,
+        **result.as_dict(),
     }
 
 
