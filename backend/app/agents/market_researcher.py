@@ -1,8 +1,11 @@
 """Market Researcher Agent"""
 
+import asyncio
 from typing import Dict, Any, Optional, List
 import json
-from datetime import datetime
+import re
+from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 from app.agents.base import BaseAgent, AgentOutput
 
@@ -50,12 +53,60 @@ class MarketResearcherAgent(BaseAgent):
                 deal_id=deal_id,
             )
 
+        # Retrieve evidence before synthesis. Tool-calling support varies by
+        # provider/model; research must not depend on the LLM deciding to call
+        # search correctly (or silently inventing an answer when it cannot).
+        search = await self.tools.execute(
+            "web_search", {"query": task, "num_results": 5}
+        )
+        search_data = search.data if isinstance(search.data, dict) else {}
+        search_rows = search_data.get("results", []) if search.success else []
+        sources = await self._collect_sources(search_rows)
+        if not sources:
+            detail = search.error or "No usable web results were returned."
+            return AgentOutput(
+                success=False,
+                data={
+                    "sources": [],
+                    "findings": [],
+                    "synthesis_status": "failed_retrieval",
+                    "data_gaps": [detail],
+                },
+                reasoning=f"Web research could not collect evidence: {detail}",
+                confidence=0.0,
+                execution_time_ms=(datetime.now() - start_time).total_seconds() * 1000,
+            )
+
+        evidence_findings = [
+            {
+                "source_id": source["id"],
+                "text": source.get("excerpt") or source.get("snippet") or "",
+                "verification": source["evidence_level"],
+            }
+            for source in sources
+            if source.get("excerpt") or source.get("snippet")
+        ]
+        source_bundle = {
+            "sources": [
+                {
+                    "id": source["id"],
+                    "title": source["title"],
+                    "publisher": source["publisher"],
+                    "published": source.get("published"),
+                    "url": source["url"],
+                    "evidence_level": source["evidence_level"],
+                    "text": (source.get("excerpt") or source.get("snippet") or "")[:1800],
+                }
+                for source in sources
+            ]
+        }
+
         # Build research prompt — LLM will call tools itself via generate_with_tools()
         prompt = self._build_research_prompt(
             task,
             context,
             market_docs,
-            {},  # market_data — fetched by LLM via tools
+            source_bundle,
             {},  # competitor_data — fetched by LLM via tools
             {},  # trends_data — fetched by LLM via tools
         )
@@ -71,11 +122,98 @@ class MarketResearcherAgent(BaseAgent):
 
         system_prompt = self._build_system_prompt(best_practices, context)
 
-        # Generate research through gateway with tools (not direct llm.generate)
-        response = await self.generate_with_tools(prompt, system_prompt)
+        # Search has already run and source records are in the prompt. Keep
+        # synthesis tool-free so models without function calling still work.
+        try:
+            response = await self.generate_with_routed_fallback(prompt, system_prompt)
+        except Exception as exc:
+            return self._evidence_only_output(
+                sources, evidence_findings, start_time,
+                f"Model synthesis unavailable: {str(exc)[:300]}",
+            )
 
         try:
             research_data = self._parse_research_output(response["content"])
+            valid_source_ids = {source["id"] for source in sources}
+            source_by_id = {source["id"]: source for source in sources}
+            findings = research_data.get("findings", [])
+            evidence_gaps = research_data.get("evidence_gaps", [])
+            evidence_gaps = [
+                str(gap).strip()[:500]
+                for gap in evidence_gaps
+                if isinstance(gap, str) and gap.strip()
+            ][:8] if isinstance(evidence_gaps, list) else []
+            verified_findings = []
+            unsupported_findings = []
+            for finding in findings if isinstance(findings, list) else []:
+                if not isinstance(finding, dict):
+                    continue
+                source_ids = finding.get("source_ids", [])
+                source_ids = [source_ids] if isinstance(source_ids, str) else source_ids
+                source_ids = [source_id for source_id in source_ids if source_id in valid_source_ids]
+                if source_ids:
+                    finding["source_ids"] = source_ids
+                    finding["citations"] = [
+                        {
+                            "source_id": source_id,
+                            "title": source_by_id[source_id]["title"],
+                            "publisher": source_by_id[source_id]["publisher"],
+                            "published": source_by_id[source_id].get("published"),
+                            "url": source_by_id[source_id]["url"],
+                            "evidence_level": source_by_id[source_id]["evidence_level"],
+                        }
+                        for source_id in source_ids
+                    ]
+                    verified_findings.append(finding)
+                else:
+                    unsupported_findings.append(finding)
+
+            requested_count = self._requested_finding_count(task)
+            sufficiently_supported = len(verified_findings) >= requested_count and all(
+                source_by_id[source_id]["evidence_level"] == "page_text_retrieved"
+                for finding in verified_findings
+                for source_id in finding["source_ids"]
+            )
+            # Only source-linked findings cross the research-agent boundary. The
+            # legacy broad market schema encouraged the model to invent metrics,
+            # players, and recommendations without attaching citations.
+            research_data = {
+                "findings": verified_findings,
+                "sources": sources,
+                "evidence_findings": evidence_findings,
+                "source_count": len(sources),
+                "requested_finding_count": requested_count,
+                "page_text_source_count": sum(
+                    source["evidence_level"] == "page_text_retrieved" for source in sources
+                ),
+                "snippet_only_source_count": sum(
+                    source["evidence_level"] == "search_snippet_only" for source in sources
+                ),
+                "synthesis_status": "complete" if sufficiently_supported else "partial_unverified_synthesis",
+                "market_size": {"tam": None, "sam": None, "som": None, "growth_rate": None, "currency": "USD"},
+                "competitive_landscape": {"market_structure": "unknown", "key_players": [], "competitive_intensity": "unknown"},
+                "industry_trends": [],
+                "customer_segments": [],
+                "entry_barriers": [],
+                "growth_opportunities": [],
+                "market_risks": [],
+                "investment_thesis": "Not assessed: no source-linked investment thesis was established.",
+            }
+            if unsupported_findings:
+                research_data["unsupported_findings"] = unsupported_findings
+            if not sufficiently_supported:
+                research_data["provider_warning"] = (
+                    f"The model returned {len(verified_findings)} source-linked findings for {requested_count} requested. "
+                    f"{research_data['page_text_source_count']} of {len(sources)} sources had page text retrieved; "
+                    "snippet-only sources are leads, not verified page evidence."
+                )
+                research_data["data_gaps"] = [
+                    "Review source records and collect additional primary-source evidence before relying on this synthesis."
+                ] + evidence_gaps
+            elif evidence_gaps:
+                research_data["data_gaps"] = evidence_gaps
+            research_data["search_provider"] = search_data.get("provider", "unknown")
+            research_data["reasoning"] = self._render_findings(verified_findings, sufficiently_supported)
 
             execution_time = (datetime.now() - start_time).total_seconds() * 1000
 
@@ -83,19 +221,144 @@ class MarketResearcherAgent(BaseAgent):
                 success=True,
                 data=research_data,
                 reasoning=research_data.get("reasoning", ""),
-                confidence=self._calculate_confidence(research_data),
+                confidence=min(0.75, 0.25 + 0.1 * sum(
+                    citation["evidence_level"] == "page_text_retrieved"
+                    for finding in verified_findings
+                    for citation in finding["citations"]
+                )),
                 execution_time_ms=execution_time,
                 tool_calls=response.get("function_calls"),
             )
 
         except Exception as e:
             self.logger.error("Market research failed", error=str(e))
-            return AgentOutput(
-                success=False,
-                data={},
-                reasoning=f"Research failed: {str(e)}",
-                confidence=0.0,
+            return self._evidence_only_output(
+                sources, evidence_findings, start_time,
+                f"Model synthesis returned unusable output: {str(e)[:300]}",
             )
+
+    async def _collect_sources(self, rows: Any) -> List[Dict[str, Any]]:
+        """Normalize search hits and enrich a small, bounded set with page text."""
+        candidates = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            url = str(row.get("url") or "").strip()
+            if not url.lower().startswith(("https://", "http://")):
+                continue
+            host = urlsplit(url).hostname or "Unknown source"
+            reported_source = str(row.get("source") or "").strip()
+            search_labels = {"ddg", "duckduckgo", "serper", "searxng", "search"}
+            publisher = (
+                reported_source
+                if reported_source.casefold() not in search_labels
+                else host.removeprefix("www.")
+            )
+            candidates.append({
+                "title": str(row.get("title") or "Untitled search result")[:300],
+                "url": url,
+                "publisher": publisher[:160],
+                "published": row.get("published") or None,
+                "snippet": str(row.get("snippet") or "")[:1200],
+                "search_provider": row.get("search_provider") or "unknown",
+            })
+        candidates = candidates[:5]
+        if not candidates:
+            return []
+
+        async def scrape(source: Dict[str, Any]) -> Dict[str, Any]:
+            try:
+                result = await asyncio.wait_for(
+                    self.tools.execute("web_scraper", {"url": source["url"], "max_chars": 5000}),
+                    timeout=18,
+                )
+                data = result.data if result.success and isinstance(result.data, dict) else {}
+                text = str(data.get("text") or "").strip()
+                if text:
+                    source["title"] = str(data.get("title") or source["title"])[:300]
+                    source["excerpt"] = text[:4000]
+                    source["evidence_level"] = "page_text_retrieved"
+                else:
+                    source["evidence_level"] = "search_snippet_only"
+                    source["retrieval_note"] = (result.error or "Page text unavailable")[:300]
+            except Exception as exc:
+                source["evidence_level"] = "search_snippet_only"
+                source["retrieval_note"] = str(exc)[:300]
+            return source
+
+        # Keep network fan-out bounded and preserve search ranking.
+        enriched = await asyncio.gather(*(scrape(source) for source in candidates[:3]))
+        sources = enriched + candidates[3:]
+        retrieved_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        for index, source in enumerate(sources, start=1):
+            source["id"] = f"W{index}"
+            source["retrieved_at"] = retrieved_at
+            source.setdefault("evidence_level", "search_snippet_only")
+        return sources
+
+    @staticmethod
+    def _requested_finding_count(task: str) -> int:
+        """Extract an explicitly requested finding count, defaulting to one."""
+        text = str(task or "").lower()
+        words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+        match = re.search(
+            r"\b(?:at least\s+)?(\d+|one|two|three|four|five)\s+"
+            r"(?:(?:distinct|separate)[,\s]+)?"
+            r"(?:(?:current|recent|major|key|latest)[,\s]+)?(?:market\s+)?"
+            r"(?:developments?|findings?|updates?|trends?)\b",
+            text,
+        )
+        if not match:
+            return 1
+        value = match.group(1)
+        return min(10, int(value) if value.isdigit() else words[value])
+
+    @staticmethod
+    def _render_findings(findings: List[Dict[str, Any]], complete: bool) -> str:
+        if not findings:
+            return "No source-linked findings were produced. Review the retrieved web sources directly."
+        lines = [
+            f"Retrieved {len(findings)} source-linked finding(s). "
+            + ("" if complete else "Synthesis is incomplete; the requested evidence threshold was not met."),
+        ]
+        for index, finding in enumerate(findings, start=1):
+            source_refs = ", ".join(
+                f"[{citation['source_id']}] {citation['title']} ({citation['publisher']})"
+                for citation in finding.get("citations", [])
+            )
+            lines.append(f"{index}. {str(finding.get('text') or '').strip()} {source_refs}".strip())
+        return "\n\n".join(lines)
+
+    @staticmethod
+    def _evidence_only_output(
+        sources: List[Dict[str, Any]],
+        findings: List[Dict[str, Any]],
+        start_time: datetime,
+        warning: str,
+    ) -> AgentOutput:
+        data = {
+            "sources": sources,
+            "evidence_findings": findings,
+            "source_count": len(sources),
+            "synthesis_status": "partial_provider_unavailable",
+            "provider_warning": warning,
+            "data_gaps": ["No model synthesis was produced; review source excerpts directly."],
+            "market_size": {"tam": None, "sam": None, "som": None, "growth_rate": None, "currency": "USD"},
+            "competitive_landscape": {"market_structure": "unknown", "key_players": [], "competitive_intensity": "unknown"},
+            "industry_trends": [],
+            "customer_segments": [],
+            "entry_barriers": [],
+            "growth_opportunities": [],
+            "market_risks": [],
+            "investment_thesis": "Not assessed: model synthesis was unavailable.",
+        }
+        return AgentOutput(
+            success=True,
+            data=data,
+            reasoning=warning,
+            confidence=0.25,
+            execution_time_ms=(datetime.now() - start_time).total_seconds() * 1000,
+        )
 
     def _build_research_prompt(
         self,
@@ -107,77 +370,24 @@ class MarketResearcherAgent(BaseAgent):
         trends_data: Dict,
     ) -> str:
         """Build market research prompt"""
-        context_str = (
-            json.dumps(context, indent=2) if context else "No additional context"
-        )
-        docs_str = (
-            "\n".join([f"- {d['content'][:300]}..." for d in market_docs])
-            if market_docs
-            else "No market documents retrieved"
-        )
-
+        evidence = market_data.get("sources", []) if isinstance(market_data, dict) else []
+        requested_count = self._requested_finding_count(task)
         return f"""Task: {task}
 
-Context:
-{context_str}
+Produce a concise research brief from the retrieved evidence only. Target {requested_count} distinct, decision-relevant developments; do not repeat the same event as separate findings. Each finding must state what happened, the date or period when available, and why it matters only when the source supports that implication. Attach exact source IDs. Never invent dates, figures, causal explanations, forecasts, or implications.
 
-Market Data:
-{json.dumps(market_data, indent=2)}
+Evidence rules:
+- `page_text_retrieved` means the page text was fetched; cite it only for statements supported by its supplied text.
+- `search_snippet_only` is a lead, not verified page evidence. You may report it as an unverified lead, but do not present it as confirmed.
+- If the evidence does not support the requested count, return fewer findings and state the specific evidence gap.
+- Do not produce TAM/SAM/SOM, CAGR, a valuation, or an investment recommendation unless asked and directly supported.
+- Return JSON only. No markdown fences or prose outside the JSON.
 
-Competitor Data:
-{json.dumps(competitor_data, indent=2)}
+Retrieved web evidence (source IDs are the only permitted citations):
+{json.dumps(evidence, ensure_ascii=False, separators=(',', ':'))}
 
-Trends Data:
-{json.dumps(trends_data, indent=2)}
-
-Relevant Documents:
-{docs_str}
-
-Provide comprehensive market research:
-1. Market size and growth (TAM/SAM/SOM)
-2. Competitive landscape
-3. Industry trends and drivers
-4. Customer segments
-5. Entry barriers
-6. Growth opportunities
-7. Market risks
-
-Respond with structured JSON:
-{{
-    "market_size": {{
-        "tam": number,
-        "sam": number,
-        "som": number,
-        "growth_rate": number,
-        "currency": string
-    }},
-    "competitive_landscape": {{
-        "market_structure": string,
-        "key_players": [{{
-            "name": string,
-            "market_share": number,
-            "strengths": [string],
-            "weaknesses": [string]
-        }}],
-        "competitive_intensity": string
-    }},
-    "industry_trends": [{{
-        "trend": string,
-        "impact": string,
-        "timeframe": string
-    }}],
-    "customer_segments": [{{
-        "segment": string,
-        "size": string,
-        "needs": [string],
-        "willingness_to_pay": string
-    }}],
-    "entry_barriers": [string],
-    "growth_opportunities": [string],
-    "market_risks": [string],
-    "investment_thesis": string,
-    "reasoning": string
-}}"""
+JSON schema:
+{{"findings":[{{"text":"concise factual development","source_ids":["W1"]}}],"evidence_gaps":["specific missing evidence"]}}"""
 
     def _build_system_prompt(
         self, best_practices: List[str] = None, context: Dict = None
@@ -190,22 +400,7 @@ Respond with structured JSON:
             base_prompt
             + """
 
-You are an expert market researcher with deep experience in:
-- Market sizing and forecasting
-- Competitive intelligence
-- Industry analysis
-- Customer research
-- Growth strategy
-
-Additional Market Research Guidelines:
-- **CRITICAL: NEVER hallucinate market sizes, competitors, or trends. You must use your provided tools to fetch real data.**
-- Use `web_search` to find recent industry reports and competitor news.
-- Use `web_scraper` to read competitor websites and press releases.
-- Distinguish between TAM, SAM, and SOM based on real retrieved data.
-- Analyze both direct and indirect competitors.
-- Identify emerging trends and disruptions.
-- Be objective about market challenges.
-- Cite the explicit tool source (e.g., specific URLs) for every claim provided.
+You are a careful market-research analyst. The web evidence has already been retrieved and is included in the user prompt. Do not claim to browse or call tools. Use only that evidence, preserve uncertainty, and return the requested compact JSON. Source-ID existence is checked by the application; your citations must also genuinely support each claim.
 """
         )
         if best_practices:

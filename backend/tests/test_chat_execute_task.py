@@ -110,6 +110,58 @@ async def test_execute_task_propagates_original_user_prompt(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_market_research_runs_source_collection_without_llm_planning(monkeypatch):
+    class Agent:
+        llm = None
+
+        def is_input_only_request(self, _task):
+            return False
+
+        async def run(self, task, context=None):
+            self.task = task
+            self.context = context
+            return SimpleNamespace(
+                success=True,
+                data={"sources": [{"id": "W1", "url": "https://example.test"}]},
+                reasoning="Source retrieval completed; model synthesis unavailable.",
+                confidence=0.25,
+                execution_time_ms=10,
+            )
+
+        async def run_with_structure(self, *_args, **_kwargs):
+            raise AssertionError("Research should not require an LLM-generated issue tree first")
+
+    agent = Agent()
+
+    class Registry:
+        def get(self, agent_type):
+            assert agent_type == "market_researcher"
+            return agent
+
+    class Router:
+        async def get_provider_for_text(self, _agent_type, _task):
+            return "gemini", False
+
+    class Request:
+        async def json(self):
+            return {
+                "agent_type": "market_researcher",
+                "task": "Research U.S. grid-scale battery storage",
+                "company_name": "Target Company",
+            }
+
+    monkeypatch.setattr("app.agents.base.get_agent_registry", lambda: Registry())
+    monkeypatch.setattr("app.core.llm.model_router.get_model_router", lambda: Router())
+    monkeypatch.setattr("app.core.llm.get_llm_client", lambda _provider: object())
+
+    response = await main.chat_execute_task(Request())
+
+    assert response["success"] is True
+    assert response["data"]["sources"][0]["id"] == "W1"
+    assert agent.task == "Research U.S. grid-scale battery storage"
+
+
+@pytest.mark.asyncio
 async def test_market_risk_does_not_invent_industry_when_missing():
     agent = MarketRiskAgent.__new__(MarketRiskAgent)
 

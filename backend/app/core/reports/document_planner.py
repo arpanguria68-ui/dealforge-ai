@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List
@@ -26,7 +27,7 @@ _SECTION_ALIASES = {label.casefold(): key for key, label in ALLOWED_SECTIONS.ite
 _SECTION_ALIASES.update({key.casefold(): key for key in ALLOWED_SECTIONS})
 _SECTION_ALIASES.update({key.replace("_", " "): key for key in ALLOWED_SECTIONS})
 ALLOWED_VISUALS = {"deal_score", "historical_revenue", "valuation_range"}
-SYNTHESIS_TIMEOUT_SECONDS = 60
+SYNTHESIS_TIMEOUT_SECONDS = max(1, min(120, int(os.getenv("REPORT_SYNTHESIS_TIMEOUT_SECONDS", "20"))))
 
 
 def extract_chat_context(conversations: Iterable[Dict[str, Any]], deal_id: str) -> Dict[str, str]:

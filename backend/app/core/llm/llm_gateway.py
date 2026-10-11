@@ -602,7 +602,7 @@ class LLMGateway:
             "tokens_est": actual_tokens,
             "cached": False,
             "fallback_used": fallback_used,
-            "model_used": actual_model,
+            "model_used": result.get("model_used") or actual_model,
             # Callers can tell the model saw a shortened prompt.
             "context_truncated": was_truncated,
             "context_window": caps.context_window,

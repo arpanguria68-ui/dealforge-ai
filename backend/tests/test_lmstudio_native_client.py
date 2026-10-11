@@ -126,3 +126,64 @@ async def test_lmstudio_older_server_falls_back_to_compat_endpoint():
     assert len(client.native_client.calls) == 1
     assert result["content"] == "compat answer"
     assert completions.calls[0]["model"] == "qwen/qwen3.5-9b"
+
+
+class ModelListResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self.payload
+
+
+class ModelListClient:
+    def __init__(self, payload):
+        self.payload = payload
+        self.urls = []
+
+    async def get(self, url, **_kwargs):
+        self.urls.append(url)
+        return ModelListResponse(self.payload)
+
+
+@pytest.mark.asyncio
+async def test_lmstudio_placeholder_resolves_to_loaded_chat_model():
+    from app.core.llm.local_llm_client import resolve_lmstudio_model, _LMSTUDIO_MODEL_CACHE
+
+    _LMSTUDIO_MODEL_CACHE.clear()
+    client = ModelListClient({
+        "models": [
+            {"key": "text-embedding-nomic-embed-text-v1.5", "type": "embedding", "loaded_instances": [{}]},
+            {"key": "qwen/qwen3.5-9b", "type": "llm", "loaded_instances": [{"id": "loaded-qwen"}]},
+            {"key": "prism-ml/bonsai-27b", "type": "llm", "loaded_instances": []},
+        ],
+    })
+
+    selected = await resolve_lmstudio_model(
+        "local-model", "http://localhost:1234/v1", client
+    )
+
+    assert selected == "qwen/qwen3.5-9b"
+    assert client.urls == ["http://localhost:1234/api/v1/models"]
+
+
+@pytest.mark.asyncio
+async def test_lmstudio_model_discovery_prefers_loaded_model_over_stale_setting():
+    from app.core.llm.local_llm_client import resolve_lmstudio_model, _LMSTUDIO_MODEL_CACHE
+
+    _LMSTUDIO_MODEL_CACHE.clear()
+    client = ModelListClient({
+        "models": [
+            {"key": "qwen/qwen3.5-9b", "type": "llm", "loaded_instances": [{"id": "loaded-qwen"}]},
+            {"key": "prism-ml/bonsai-27b", "type": "llm", "loaded_instances": []},
+        ],
+    })
+
+    selected = await resolve_lmstudio_model(
+        "prism-ml/bonsai-27b", "http://localhost:1234/v1", client
+    )
+
+    assert selected == "qwen/qwen3.5-9b"

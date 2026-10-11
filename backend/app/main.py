@@ -98,10 +98,11 @@ def _explicit_company_name(text: str) -> Optional[str]:
 
 
 def _deal_identity_for_export(deal: Dict[str, Any], todo_list: Any) -> Dict[str, Any]:
-    """Recover explicit issuer identity for legacy exports created with placeholders."""
+    """Recover a useful report subject when legacy exports contain generic placeholders."""
     resolved = dict(deal)
     current = str(resolved.get("target_company") or "").strip().lower()
-    if current not in {"", "target company", "the target", "unknown"}:
+    placeholders = {"", "target company", "the target", "unknown", "synthesis", "analysis"}
+    if current not in placeholders:
         return resolved
     items = todo_list.get("items", []) if isinstance(todo_list, dict) else getattr(todo_list, "items", [])
     prompt_parts = []
@@ -120,6 +121,17 @@ def _deal_identity_for_export(deal: Dict[str, Any], todo_list: Any) -> Dict[str,
         resolved["target_company"] = company
     elif ticker:
         resolved["target_company"] = ticker
+    else:
+        subject_text = prompt or str(resolved.get("name") or "")
+        topic = re.search(
+            r"\b(?:developments|trends|outlook|market)\s+in\s+(.+?)(?:\s+(?:use|cite|do not)\b|$)",
+            subject_text,
+            re.IGNORECASE,
+        )
+        if topic:
+            resolved["target_company"] = topic.group(1).strip(" ,.;:")[:100]
+        elif re.search(r"\bmarket\s+research\b|\bresearch\s+(?:on|into|about)\b", subject_text, re.IGNORECASE):
+            resolved["target_company"] = "Market Research"
     if ticker:
         resolved["ticker"] = ticker
     return resolved
@@ -3048,7 +3060,7 @@ async def search_startup(company: str, depth: str = "standard"):
 async def chat_respond(request: Request):
     """Answer a direct question without creating a deal or launching agents."""
     from app.core.validation.chat_guard import check_prompt
-    from app.core.llm import get_llm_client
+    from app.core.llm.llm_gateway import get_llm_gateway
     from app.core.llm.model_router import LOCAL_PROVIDERS, get_model_router
 
     body = await request.json()
@@ -3086,10 +3098,11 @@ async def chat_respond(request: Request):
             est_tokens=max(1200, (len(prompt) + 2) // 3 + 900),
         )
 
-    client = get_llm_client(provider)
+    gateway = get_llm_gateway()
     try:
         response = await asyncio.wait_for(
-            client.generate(
+            gateway.call(
+                provider=provider,
                 prompt=prompt,
                 system_prompt=(
                     "Answer the user's direct question concisely. Do not create a deal plan, "
@@ -3098,6 +3111,8 @@ async def chat_respond(request: Request):
                 ),
                 temperature=0.2,
                 max_tokens=1000,
+                use_cache=False,
+                allow_fallback=not local_only,
             ),
             timeout=45,
         )
@@ -3107,6 +3122,12 @@ async def chat_respond(request: Request):
         logger.warning("direct_chat_generation_failed", provider=provider, error=str(exc))
         raise HTTPException(status_code=502, detail=f"The selected model could not answer ({provider}).") from exc
 
+    if (response or {}).get("error"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"The selected model could not answer ({provider}); fallback was {'disabled' if local_only else 'unavailable'}."
+        )
+
     content = str((response or {}).get("content") or "").strip()
     if not content:
         raise HTTPException(status_code=502, detail=f"The selected model returned an empty response ({provider}).")
@@ -3114,10 +3135,11 @@ async def chat_respond(request: Request):
     return {
         "success": True,
         "response": content,
-        "provider": provider,
-        "model": getattr(client, "model", None) or getattr(client, "model_name", None),
+        "provider": response.get("provider_used", provider),
+        "model": response.get("model_used"),
+        "tokens_est": response.get("tokens_est"),
         "route_tier": route_tier,
-        "used_fallback": used_fallback,
+        "used_fallback": used_fallback or bool(response.get("fallback_used")),
     }
 
 
@@ -3518,7 +3540,7 @@ async def chat_execute_task(request: Request):
                 except Exception as exc:
                     logger.debug("execute_task_graph_context_unavailable", error=str(exc))
             agent._current_context = agent_context
-            if input_only or resolved_type == "financial_analyst":
+            if input_only or resolved_type in {"financial_analyst", "market_researcher"}:
                 execution = agent.run(task_description, context=agent_context)
             else:
                 execution = agent.run_with_structure(task_description, context=agent_context)

@@ -2,6 +2,7 @@
 
 from typing import List, Dict, Any, Optional, AsyncGenerator
 import json
+import time
 import httpx
 import structlog
 from app.config import get_settings
@@ -12,6 +13,73 @@ logger = structlog.get_logger()
 # near-deterministic output; callers that want creativity pass temperature
 # explicitly (the gateway forwards its own default when set).
 LOCAL_DEFAULT_TEMPERATURE = 0.2
+_LMSTUDIO_MODEL_CACHE_TTL = 20.0
+_LMSTUDIO_MODEL_CACHE: Dict[str, tuple[float, str]] = {}
+_LMSTUDIO_PLACEHOLDERS = {"", "auto", "local-model", "default"}
+
+
+def _lmstudio_model_ids(payload: Dict[str, Any]) -> tuple[List[str], List[str]]:
+    """Return loaded and available chat model IDs from LM Studio's model list."""
+    models = payload.get("models") or payload.get("data") or []
+    loaded: List[str] = []
+    available: List[str] = []
+    if not isinstance(models, list):
+        return loaded, available
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        model_type = str(item.get("type") or "llm").lower()
+        model_id = str(item.get("key") or item.get("id") or "").strip()
+        if not model_id or model_type not in {"llm", "chat", "vlm"}:
+            continue
+        available.append(model_id)
+        if item.get("loaded_instances") or item.get("state") == "loaded":
+            loaded.append(model_id)
+    return loaded, available
+
+
+async def resolve_lmstudio_model(model: str, base_url: str, client) -> str:
+    """Resolve stale/placeholder config to a real LM Studio chat model ID."""
+    configured = str(model or "").strip()
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-3]
+    cache_key = root.lower()
+    cached = _LMSTUDIO_MODEL_CACHE.get(cache_key)
+    if cached and cached[0] > time.monotonic():
+        loaded_or_available = cached[1]
+        if configured not in _LMSTUDIO_PLACEHOLDERS and configured == loaded_or_available:
+            return configured
+        # A still-loaded model wins over a stale UI or environment selection.
+        return loaded_or_available
+
+    try:
+        response = await client.get(f"{root}/api/v1/models", timeout=3.0)
+        response.raise_for_status()
+        payload = response.json()
+        loaded, available = _lmstudio_model_ids(payload if isinstance(payload, dict) else {})
+    except Exception as exc:
+        logger.debug("lmstudio_model_discovery_failed", error_type=type(exc).__name__)
+        return configured if configured else "local-model"
+
+    if configured in loaded:
+        selected = configured
+    elif loaded:
+        selected = loaded[0]
+    elif configured in available:
+        selected = configured
+    elif "qwen/qwen3.5-9b" in available:
+        selected = "qwen/qwen3.5-9b"
+    elif available:
+        selected = available[0]
+    else:
+        selected = configured if configured else "local-model"
+
+    if selected not in _LMSTUDIO_PLACEHOLDERS:
+        _LMSTUDIO_MODEL_CACHE[cache_key] = (time.monotonic() + _LMSTUDIO_MODEL_CACHE_TTL, selected)
+    if selected != configured:
+        logger.info("lmstudio_model_resolved", configured_model=configured, selected_model=selected)
+    return selected
 
 
 def _clamp_temperature(temperature: float) -> float:
@@ -204,6 +272,15 @@ class LMStudioClient:
         **kwargs,
     ) -> Dict[str, Any]:
         """Generate with LM Studio, using native reasoning controls when possible."""
+
+        model_base_url = getattr(self, "base_url", None)
+        if not model_base_url and getattr(self, "native_base_url", None):
+            model_base_url = f"{self.native_base_url}/v1"
+        self.model = await resolve_lmstudio_model(
+            getattr(self, "model", ""),
+            model_base_url or "http://localhost:1234/v1",
+            self.native_client,
+        )
 
         if not tools and not json_mode:
             payload: Dict[str, Any] = {

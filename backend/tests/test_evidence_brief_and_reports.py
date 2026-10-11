@@ -101,6 +101,35 @@ def test_document_synthesis_receives_curated_evidence_not_raw_tool_payload():
     assert analyst_data["_document_qa"]["status"] == "ready_for_review"
 
 
+def test_document_synthesis_timeout_uses_deterministic_fallback(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from app.core.reports import document_planner
+
+    class SlowAgent:
+        async def run(self, task, context):
+            await asyncio.sleep(0.1)
+            return SimpleNamespace(success=True, data={})
+
+    class Registry:
+        def get(self, name):
+            return SlowAgent() if name == "business_analyst" else None
+
+    monkeypatch.setattr(document_planner, "SYNTHESIS_TIMEOUT_SECONDS", 0.01)
+    _, analyst_data, _ = asyncio.run(document_planner.prepare_document_payload(
+        Registry(), {"id": "timeout-test"},
+        [{"agent_type": "market_researcher", "success": True,
+          "data": {"findings": [{"title": "Finding", "description": "Recorded finding [S1]"}],
+                   "sources": [{"title": "Source", "url": "https://example.test/source"}]}}],
+    ))
+
+    assert analyst_data["_document_qa"]["synthesis_provider"] == "deterministic_fallback"
+    assert any(
+        warning.startswith("Report synthesis unavailable")
+        for warning in analyst_data["_document_qa"]["warnings"]
+    )
+
+
 def test_synthesis_curation_rejects_unsupported_recommendations_metrics_and_citations():
     from app.core.reports.document_planner import _curate_synthesis
 

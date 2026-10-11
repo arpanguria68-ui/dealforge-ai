@@ -36,6 +36,7 @@ class AgentQualityStore:
                     agent_name TEXT NOT NULL,
                     task_type TEXT NOT NULL,
                     deal_context_hash TEXT NOT NULL,
+                    deal_id TEXT,
                     action_payload TEXT NOT NULL,
                     score REAL,
                     feedback TEXT,
@@ -43,6 +44,10 @@ class AgentQualityStore:
                 )
                 """
             )
+            async with db.execute("PRAGMA table_info(agent_actions)") as cursor:
+                columns = {row[1] for row in await cursor.fetchall()}
+            if "deal_id" not in columns:
+                await db.execute("ALTER TABLE agent_actions ADD COLUMN deal_id TEXT")
 
             # Table for distilled "best practices" based on high-scoring actions
             await db.execute(
@@ -81,6 +86,9 @@ class AgentQualityStore:
         task_type: str,
         deal_context: Dict[str, Any],
         action_payload: Dict[str, Any],
+        deal_id: Optional[str] = None,
+        score: Optional[float] = None,
+        feedback: Optional[str] = None,
     ) -> int:
         """
         Log an agent's action BEFORE we know the final score.
@@ -94,13 +102,55 @@ class AgentQualityStore:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 """
-                INSERT INTO agent_actions (agent_name, task_type, deal_context_hash, action_payload)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO agent_actions
+                    (agent_name, task_type, deal_context_hash, deal_id, action_payload, score, feedback)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (agent_name, task_type, context_hash, json.dumps(action_payload)),
+                (
+                    agent_name,
+                    task_type,
+                    context_hash,
+                    deal_id or deal_context.get("deal_id"),
+                    json.dumps(action_payload),
+                    score,
+                    feedback,
+                ),
             )
             await db.commit()
             return cursor.lastrowid
+
+    async def get_deal_ratings(self, deal_id: str) -> List[Dict[str, Any]]:
+        """Return persisted user ratings for a deal, newest first."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT id, agent_name, action_payload, score, feedback, created_at
+                FROM agent_actions
+                WHERE deal_id = ? AND task_type = 'user_rated'
+                ORDER BY created_at DESC, id DESC
+                """,
+                (deal_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+        ratings = []
+        for row in rows:
+            try:
+                payload = json.loads(row["action_payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            rating = payload.get("rating")
+            if not isinstance(rating, (int, float)):
+                rating = (row["score"] or 0) * 5
+            ratings.append({
+                "id": row["id"],
+                "agent_type": row["agent_name"],
+                "rating": rating,
+                "feedback": row["feedback"] if row["feedback"] is not None else payload.get("feedback"),
+                "created_at": row["created_at"],
+            })
+        return ratings
 
     async def reward_action(self, action_id: int, score: float, feedback: str = ""):
         """

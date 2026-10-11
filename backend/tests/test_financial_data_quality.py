@@ -144,6 +144,20 @@ def test_legacy_export_identity_recovers_issuer_and_ticker_from_analysis_prompt(
     assert deal["target_company"] == "Target Company"
 
 
+def test_legacy_export_identity_uses_research_topic_instead_of_synthesis_placeholder():
+    from app.main import _deal_identity_for_export
+
+    resolved = _deal_identity_for_export(
+        {
+            "name": "Market research: retrieve three recent developments in U.S. grid-scale battery storage",
+            "target_company": "synthesis",
+        },
+        {"items": [{"description": "Market research: retrieve three recent developments in U.S. grid-scale battery storage. Cite direct sources."}]},
+    )
+
+    assert resolved["target_company"] == "U.S. grid-scale battery storage"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("placeholder", ["Target Company", "the target", "Unknown"])
 async def test_financial_data_tool_refuses_generic_company_placeholders(placeholder, monkeypatch):

@@ -232,8 +232,13 @@ function generateContextAwareFollowUps(completedResults: AgentResult[], taskList
 }
 
 function detectMissingData(dealText: string): string[] {
+    if (!isDealAnalysisRequest(dealText)) return [];
+
     const missing: string[] = [];
     const lower = dealText.toLowerCase();
+    const researchOnly = /\b(?:market research|industry research|market landscape|industry trends|competitor analysis)\b/.test(lower)
+        && !/\b(?:valuation|dcf|lbo|investment memo|financial statements?|cash flow|ebitda|revenue|acquisition|due diligence)\b/.test(lower);
+    if (researchOnly) return [];
     const factualPublicDataRequest = /\b(fetch|retrieve|report|show|list)\b/.test(lower)
         && /\b(revenue|financial statements?)\b/.test(lower)
         && /\b(sec|10-k|ticker|public company|filing)\b/.test(lower)
@@ -284,15 +289,22 @@ function normalizeCitations(raw: unknown): Citation[] {
 }
 
 function extractCompanyName(text: string): string {
+    const genericSubjects = new Set(['only', 'synthesis only', 'research only', 'market research only', 'synthesis']);
+    const usableName = (candidate: string | undefined) => {
+        const value = candidate?.trim();
+        return value && !genericSubjects.has(value.toLowerCase()) ? value : undefined;
+    };
     const tickerMatch = text.match(/\b([A-Z][\w&.'-]*(?:\s+[A-Z][\w&.'-]*){0,5})\s+\((?:(?:NASDAQ|NYSE|NYSEAMERICAN|AMEX|OTC)\s*:\s*)?[A-Z]{1,5}\)/);
     if (tickerMatch) {
         return tickerMatch[1].replace(/^(?:fetch|analyze|research|assess|review|screen)\s+/i, '').trim();
     }
     const explicit = text.match(/\bfictional\s+([A-Z][\w&.'-]*(?:\s+[A-Z][\w&.'-]*){0,3})(?=\s*(?:[:,.;]|$))/i)
         || text.match(/\b(?:for|of)\s+(?:the\s+)?([A-Z][\w&.'-]*(?:\s+[A-Z][\w&.'-]*){0,3})(?=\s*(?:[:,.;]|$))/i);
-    if (explicit) return explicit[1].trim();
+    const explicitName = usableName(explicit?.[1]);
+    if (explicitName) return explicitName;
     const subject = text.match(/\b(?:fetch|analyze|research|assess|review|screen|value|evaluate)\s+(?:the\s+)?([A-Z][\w&.'-]*(?:\s+[A-Z][\w&.'-]*){0,5}?)(?=\s+(?:using|with|from|for|based|and)\b|\s*[,;:]|\s*$)/i);
-    if (subject) return subject[1].trim();
+    const subjectName = usableName(subject?.[1]);
+    if (subjectName) return subjectName;
     const match = text.match(/(?:acquire|acquisition of|merge with|analyze|buy)\s+([A-Z][a-zA-Z\s]+(?:Corp|Inc|LLC|Ltd|Co)?)/i);
     return match ? match[1].trim() : 'Target Company';
 }
@@ -305,6 +317,11 @@ function formatAgentSummaryLine(agentLabel: string, result: Record<string, unkno
         const synthesis = data.synthesis_status === 'partial_provider_unavailable'
             ? '; model synthesis incomplete' : '';
         return `**${agentLabel}** — ${sourceLabel}${synthesis}; confidence not calibrated${time}`;
+    }
+    if (data.synthesis_status === 'partial_provider_unavailable') {
+        const sourceCount = Array.isArray(data.sources) ? data.sources.length : 0;
+        const time = typeof result.execution_time_ms === 'number' ? ` · ${Math.round(result.execution_time_ms as number)}ms` : '';
+        return `**${agentLabel}** — ${sourceCount} web sources collected; model synthesis incomplete; confidence not calibrated${time}`;
     }
     const calibrated = data.confidence_calibrated === true
         || data.confidence_basis === 'calibrated'
@@ -441,6 +458,20 @@ function formatAgentDetailBody(result: Record<string, unknown>): string {
                 output += `\n\n---\n\n### 📄 Generated ${label}\n\n${data[key]}`;
             }
         }
+
+        const sources = Array.isArray(data.sources) ? data.sources as Record<string, unknown>[] : [];
+        if (sources.length) {
+            const rows = sources.filter(source => typeof source.url === 'string' && /^https?:\/\//i.test(source.url))
+                .map(source => {
+                    const title = String(source.title || source.publisher || 'Source').replace(/[\[\]]/g, '');
+                    const publisher = source.publisher ? ` — ${String(source.publisher)}` : '';
+                    const published = source.published && source.published !== 'unknown' ? `, published ${String(source.published)}` : '';
+                    const level = source.evidence_level === 'page_text_retrieved' ? 'page text retrieved' : 'search snippet only';
+                    const excerpt = String(source.excerpt || source.snippet || '').trim().slice(0, 700);
+                    return `- [${title}](${source.url})${publisher}${published} (${level})${excerpt ? `\n  ${excerpt}` : ''}`;
+                });
+            if (rows.length) output += `\n\n### Web Sources\n\n${rows.join('\n')}`;
+        }
     }
     return output;
 }
@@ -453,6 +484,8 @@ function buildSynthesisMessage(completedResults: AgentResult[], taskList: TaskPl
     let recommendation = '';
     let dealScore: number | null = null;
     let sourceCount = 0;
+    let pageTextSourceCount = 0;
+    let snippetOnlySourceCount = 0;
     let synthesisIncomplete = false;
 
     const addMetric = (metric: string, value: unknown, period: unknown, source: string) => {
@@ -478,6 +511,17 @@ function buildSynthesisMessage(completedResults: AgentResult[], taskList: TaskPl
         const balance = data.balance_sheet && typeof data.balance_sheet === 'object'
             ? data.balance_sheet as Record<string, unknown> : {};
 
+        const sourceRows = Array.isArray(data.sources) ? data.sources : [];
+        const sourceById = new Map<string, Record<string, unknown>>();
+        for (const source of sourceRows) {
+            if (!source || typeof source !== 'object') continue;
+            const row = source as Record<string, unknown>;
+            if (typeof row.url === 'string') sourceCount += 1;
+            if (row.evidence_level === 'page_text_retrieved') pageTextSourceCount += 1;
+            if (row.evidence_level === 'search_snippet_only') snippetOnlySourceCount += 1;
+            if (typeof row.id === 'string') sourceById.set(row.id, row);
+        }
+
         if (agent.includes('financial')) {
             addMetric('Revenue', revenue.annual_revenue ?? latest.revenue, latest.fiscal_year || latest.period, label);
             addMetric('Revenue growth', revenue.growth_rate ?? latest.revenue_yoy_percent, latest.fiscal_year || latest.period, label);
@@ -488,8 +532,6 @@ function buildSynthesisMessage(completedResults: AgentResult[], taskList: TaskPl
             addMetric('Free cash flow', cashFlow.free_cash_flow, cashFlow.free_cash_flow_fiscal_year, label);
             addMetric('Cash', balance.cash, balance.cash_fiscal_year, label);
             addMetric('Long-term debt', balance.long_term_debt, balance.debt_fiscal_year, label);
-            const sourceRows = Array.isArray(data.sources) ? data.sources : [];
-            sourceCount += sourceRows.filter(source => source && typeof source === 'object' && 'url' in source).length;
         }
 
         const riskRows = [data.risks, data.key_risks, data.top_risks].filter(Array.isArray).flat() as unknown[];
@@ -505,11 +547,40 @@ function buildSynthesisMessage(completedResults: AgentResult[], taskList: TaskPl
                 ? String((item as Record<string, unknown>).text || '') : '';
             if (text && !findings.includes(text)) findings.push(text);
         }
+        for (const item of Array.isArray(data.findings) ? data.findings : []) {
+            if (!item || typeof item !== 'object') continue;
+            const finding = item as Record<string, unknown>;
+            const text = typeof finding.text === 'string' ? finding.text.trim() : '';
+            if (!text) continue;
+            const rawIds = Array.isArray(finding.source_ids) ? finding.source_ids : [];
+            const links = rawIds.flatMap(id => {
+                const source = typeof id === 'string' ? sourceById.get(id) : undefined;
+                return source && typeof source.url === 'string'
+                    ? [`[${String(source.title || source.id)}](${source.url})`]
+                    : [];
+            });
+            const citedText = `${text}${links.length ? ` (${[...new Set(links)].join(', ')})` : ''}`;
+            if (!findings.includes(citedText)) findings.push(citedText);
+        }
         for (const gap of [...(Array.isArray(data.data_limitations) ? data.data_limitations : []), ...(Array.isArray(data.data_gaps) ? data.data_gaps : [])]) {
             if (typeof gap === 'string' && gap.trim()) limitations.add(gap.trim());
         }
-        if (data.synthesis_status === 'partial_provider_unavailable' || data.synthesis_status === 'deterministic_source_report') synthesisIncomplete = true;
-        if (typeof data.provider_warning === 'string' && data.provider_warning) limitations.add(`Model synthesis unavailable: ${data.provider_warning}`);
+        if (data.synthesis_status === 'partial_provider_unavailable'
+            || data.synthesis_status === 'partial_unverified_synthesis'
+            || data.synthesis_status === 'failed_retrieval'
+            || data.synthesis_status === 'deterministic_source_report') synthesisIncomplete = true;
+        if (typeof data.provider_warning === 'string' && data.provider_warning) {
+            const warningLabel = data.synthesis_status === 'partial_provider_unavailable'
+                ? 'Model synthesis unavailable'
+                : data.synthesis_status === 'failed_retrieval'
+                    ? 'Web research unavailable'
+                    : data.synthesis_status === 'deterministic_source_report'
+                        ? 'Deterministic source report'
+                        : data.synthesis_status === 'partial_unverified_synthesis'
+                            ? 'Research quality note'
+                            : 'Analysis note';
+            limitations.add(`${warningLabel}: ${data.provider_warning}`);
+        }
         if (typeof data.recommendation === 'string' && data.recommendation.trim()) recommendation ||= data.recommendation;
         if (agent.includes('scoring')) {
             const candidate = Number(data.deal_score ?? data.score ?? data.total_score);
@@ -528,7 +599,7 @@ function buildSynthesisMessage(completedResults: AgentResult[], taskList: TaskPl
     md += `**Review status:** ${failedCount || synthesisIncomplete ? 'Incomplete — human review required' : 'Analysis tasks completed; findings remain subject to source verification'}. `;
     md += `${completedResults.length}/${taskList.length} tasks returned results`;
     if (failedCount) md += `; ${failedCount} failed or were blocked`;
-    md += `; ${sourceCount} financial source records captured.\n\n`;
+    md += `; ${sourceCount} source records captured (${pageTextSourceCount} page text retrieved, ${snippetOnlySourceCount} snippet only).\n\n`;
     md += `**Decision:** ${recommendation ? recommendation.slice(0, 500) : 'No supported transaction recommendation recorded.'}`;
     if (dealScore !== null) md += `\n\n**Recorded score:** ${dealScore}/100 (model/agent output; not independently calibrated).`;
     else md += `\n\n**Score:** Not scored.`;
@@ -1065,7 +1136,12 @@ export function ChatWindow() {
                         content: result.response,
                         status: 'done',
                         provider: result.provider,
-                        metadata: { model: result.model, route_tier: result.route_tier },
+                        metadata: {
+                            model: result.model,
+                            route_tier: result.route_tier,
+                            tokens_est: result.tokens_est,
+                            used_fallback: result.used_fallback,
+                        },
                     });
                 } catch (error) {
                     const detail = error instanceof Error ? error.message : 'Direct chat request failed';
@@ -1818,10 +1894,10 @@ export function ChatWindow() {
 
                 <div className={`max-w-[85%] flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
                     {/* Agent Header with Rating Buttons */}
-                    {!isUser && msg.agentName && (
+                    {!isUser && (msg.agentName || msg.provider) && (
                         <div className="flex items-center justify-between w-full mb-1.5">
                             <div className="flex items-center gap-2">
-                                <span className="text-xs font-semibold text-white/60">{msg.agentName}</span>
+                                <span className="text-xs font-semibold text-white/60">{msg.agentName || 'Assistant'}</span>
                             {msg.status === 'thinking' && (
                                 <span className="flex items-center gap-1 text-xs text-violet-400">
                                     <Loader2 className="h-3 w-3 animate-spin" />
@@ -1838,6 +1914,21 @@ export function ChatWindow() {
                                 <span className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-white/5 text-white/40 font-medium">
                                     {msg.provider === 'ollama' || msg.provider === 'lmstudio' ? <Cpu className="h-2.5 w-2.5" /> : <Cloud className="h-2.5 w-2.5" />}
                                     {msg.provider}
+                                </span>
+                            )}
+                            {typeof msg.metadata?.model === 'string' && msg.metadata.model && (
+                                <span className="text-[10px] text-white/35" title="Selected model">
+                                    {msg.metadata.model}
+                                </span>
+                            )}
+                            {typeof msg.metadata?.tokens_est === 'number' && (
+                                <span className="text-[10px] text-white/35" title="Estimated tokens; provider billing may differ">
+                                    ~{msg.metadata.tokens_est} tokens
+                                </span>
+                            )}
+                            {msg.metadata?.used_fallback === true && (
+                                <span className="text-[10px] text-amber-300" title="A different provider than the preferred route handled this request">
+                                    rerouted
                                 </span>
                             )}
                             </div>

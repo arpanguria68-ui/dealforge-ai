@@ -74,7 +74,10 @@ async def rate_agent_output(request: RatingRequest):
                 "rating": request.rating,
                 "feedback": request.feedback,
                 "normalized_score": normalized_score
-            }
+            },
+            deal_id=request.deal_id,
+            score=normalized_score,
+            feedback=request.feedback,
         )
         
         # If rating is high (4-5), consider updating best practices
@@ -104,15 +107,18 @@ async def rate_agent_output(request: RatingRequest):
 
 @router.get("/deal/{deal_id}")
 async def get_deal_ratings(deal_id: str):
-    """
-    Get all ratings for a specific deal.
-    """
-    # This would query the quality store for ratings associated with a deal
-    # For now, return a placeholder
+    """Get persisted user ratings for a specific deal."""
+    await _ensure_quality_store_initialized()
+    ratings = await quality_store.get_deal_ratings(deal_id)
+    average_score = (
+        round(sum(item["rating"] for item in ratings) / len(ratings), 2)
+        if ratings else None
+    )
     return {
         "deal_id": deal_id,
-        "ratings": [],
-        "average_score": None
+        "ratings": ratings,
+        "rating_count": len(ratings),
+        "average_score": average_score,
     }
 
 

@@ -262,8 +262,11 @@ class ModelRouter:
                 )
 
             try:
+                from app.core.llm.local_llm_client import resolve_lmstudio_model
+
                 model = settings.get("lmstudio_model", "")
                 async with httpx.AsyncClient(timeout=20.0) as client:
+                    model = await resolve_lmstudio_model(model, url, client)
                     resp = await client.post(
                         f"{url}/chat/completions",
                         json={"model": model, "messages": [{"role": "user", "content": "Reply with the single word OK."}],
