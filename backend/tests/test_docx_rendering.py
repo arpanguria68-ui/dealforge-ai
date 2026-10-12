@@ -78,3 +78,43 @@ def test_unsourced_statement_figures_are_flagged_and_sourced_ones_are_not():
     assert "unverified" not in lines["Annual Revenue"].lower()
     assert "unverified" in lines["Net Income"].lower()
     assert "unverified" not in lines["Gross Margin"].lower()  # derived ratio, not a statement line
+
+
+def test_json_string_answers_and_tool_requests_render_meaningfully():
+    from app.core.reports.docx_rendering import payload_lines
+
+    assert ("b", 2, "TAM: $18.00B") in payload_lines({"reasoning": '{"market_size": {"tam": 18000000000}}'})
+    note = payload_lines({"tool": "get_financial_data", "arguments": {"ticker": "SPT"}, "risk_metrics": {"x": 1}})
+    assert len(note) == 1 and "instead of an analysis" in note[0][2]
+
+
+def test_report_inputs_are_derived_from_chat_run_results():
+    from app.core.reports.result_views import enrich_deal_from_results, revenue_bridge
+
+    results = [
+        {"agent_type": "financial_analyst", "data": {"historical_financials": [
+            {"fiscal_year": "FY2024", "revenue": 405_910_000}, {"fiscal_year": "FY2025", "revenue": 457_547_000}]}},
+        {"agent_type": "valuation_agent", "data": {
+            "valuations": {"dcf": {"value": 713_575_460}},
+            "audit": {"inputs": {
+                "financial_data": {"revenue": 457_547_000, "wacc": 0.0958,
+                                   "projected_cash_flows": [44e6, 49e6, 53e6, 56e6, 58e6]},
+                "market_data": {"peers": [{"ev_revenue": m} for m in (1.75, 1.96, 2.0, 3.18, 3.83, 8.96)]}}}}},
+    ]
+    deal = enrich_deal_from_results({}, results)
+    rows = deal["valuation_output"]["valuations"]
+    dcf, comps = rows
+    assert dcf["low"] < dcf["mid"] == 713_575_460 / 1e9 < dcf["high"]
+    assert comps["low"] < comps["mid"] < comps["high"] and "6 peers" in comps["method"]
+    assert [p["year"] for p in deal["fact_base"]["metrics"]["historical_revenue"]] == ["FY2024", "FY2025"]
+    labels, values = revenue_bridge(deal["fact_base"]["metrics"]["historical_revenue"])
+    assert labels == ["FY2024", "+FY2025", "FY2025 total"] and abs(values[1] - 51.637) < 0.01
+    assert enrich_deal_from_results({"valuation_output": {"valuations": [{"method": "x"}]}}, results)["valuation_output"]["valuations"] == [{"method": "x"}]
+
+
+def test_football_field_renders_without_kaleido():
+    from app.core.reports.infographic_engine import InfographicEngine
+
+    png = InfographicEngine.football_field_chart(
+        [{"method": "DCF", "low": 0.62, "mid": 0.71, "high": 0.83}, {"method": "Comps", "low": 0.88, "high": 1.6}], unit="$B")
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"

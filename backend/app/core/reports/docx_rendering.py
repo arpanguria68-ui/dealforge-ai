@@ -6,7 +6,7 @@ Agents return either markdown prose (the IC memo, the chat synthesis) or nested 
 """
 
 import re
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.shared import Pt, RGBColor
@@ -167,7 +167,7 @@ def add_markdown(doc, text: str, heading_offset: int = 2, max_heading: int = 4) 
 def label(key: str) -> str:
     text = re.sub(r"[_\-]+", " ", str(key)).strip()
     text = re.sub(r"\byoy\b", "YoY", text, flags=re.IGNORECASE)
-    words = [w.upper() if w.lower() in {"dcf", "lbo", "ebitda", "wacc", "irr", "moic", "fcf", "sec", "ev", "sbc", "eps", "api"}
+    words = [w.upper() if w.lower() in {"dcf", "lbo", "ebitda", "wacc", "irr", "moic", "fcf", "sec", "ev", "sbc", "eps", "api", "tam", "sam", "som", "arr", "nrr", "ttm", "ipo", "ceo"}
              else w.capitalize() for w in text.split()]
     return " ".join(words)
 
@@ -269,6 +269,31 @@ def _render_list(doc, key: str, items: List[Any], depth: int, verified: Optional
             add_inline(doc.add_paragraph(style="List Bullet"), str(item))
 
 
+def maybe_json(text: str) -> Any:
+    """A dict/list when an agent returned its JSON answer as a string (optionally fenced)."""
+    candidate = text.strip()
+    fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", candidate, re.DOTALL)
+    if fenced:
+        candidate = fenced.group(1).strip()
+    if not candidate.startswith(("{", "[")):
+        return None
+    try:
+        import json
+
+        parsed = json.loads(candidate)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, (dict, list)) and parsed else None
+
+
+def tool_request_note(data: Any) -> Optional[str]:
+    """Explain an agent whose final answer was an unexecuted tool request, not an analysis."""
+    if isinstance(data, dict) and isinstance(data.get("tool"), str) and isinstance(data.get("arguments"), dict):
+        return (f"This agent returned a request to call '{data['tool']}' instead of an analysis, "
+                "so it recorded no findings. Re-run it to obtain a risk assessment.")
+    return None
+
+
 def render_payload(
     doc, data: Any, depth: int = 0, bullets: bool = False, skip: Iterable[str] = (),
     verified: Optional[Set[float]] = None,
@@ -282,11 +307,20 @@ def render_payload(
         if not _empty(data):
             add_markdown(doc, str(data), heading_offset=3)
         return
+    note = tool_request_note(data) if depth == 0 else None
+    if note:
+        para = doc.add_paragraph()
+        run = para.add_run(note)
+        run.italic = True
+        run.font.color.rgb = RGBColor(0xB0, 0x60, 0x00)
+        return
     skip = set(skip) | SKIP_KEYS
     for key, value in data.items():
         if key in skip or _empty(value):
             continue
         style = "List Bullet" if bullets else None
+        if isinstance(value, str) and maybe_json(value) is not None:
+            value = maybe_json(value)
         if _is_scalar(value):
             text = str(value)
             if isinstance(value, str) and (len(text) > 220 or "\n" in text):
@@ -315,3 +349,86 @@ def render_payload(
 def summarize_results(data: Dict[str, Any]) -> Dict[str, Any]:
     """Pick the fields an agent's section should lead with (kept for tests/callers)."""
     return {k: v for k, v in data.items() if k not in SKIP_KEYS and not _empty(v)}
+
+
+# ───────────────────────── plain lines (PDF / PPTX / XLSX) ─────────────────────────
+
+def _strip_inline(text: str) -> str:
+    return re.sub(r"(\*\*|__|`)", "", re.sub(r"(?<!\*)\*(?!\*)([^*\n]+)\*(?!\*)", r"\1", clean(text))).strip()
+
+
+def markdown_lines(text: str) -> List[Tuple[str, int, str]]:
+    """(kind, depth, text) from markdown: kind is 'h' (heading), 'b' (bullet) or 'p'."""
+    out: List[Tuple[str, int, str]] = []
+    in_code = False
+    for raw in _WIDGET.sub("", clean(text)).splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code or not stripped or re.fullmatch(r"[-*_]{3,}", stripped) or _TABLE_SEP.match(stripped):
+            continue
+        heading = _HEADING.match(stripped)
+        bullet = _BULLET.match(line) or _NUMBERED.match(line)
+        if heading:
+            out.append(("h", 0, _strip_inline(heading.group(2))))
+        elif bullet:
+            depth = min(len(bullet.group(1).replace("\t", "    ")) // 2, 2)
+            out.append(("b", depth, _strip_inline(bullet.group(2))))
+        elif _TABLE_ROW.match(stripped):
+            out.append(("p", 0, " | ".join(_strip_inline(c) for c in stripped.strip("|").split("|"))))
+        else:
+            out.append(("p", 0, _strip_inline(stripped)))
+    return out
+
+
+def payload_lines(data: Any, verified: Optional[Set[float]] = None, depth: int = 0) -> List[Tuple[str, int, str]]:
+    """(kind, depth, text) lines for a nested agent payload, same skipping/formatting as Word."""
+    out: List[Tuple[str, int, str]] = []
+    if not isinstance(data, dict):
+        return markdown_lines(str(data)) if not _empty(data) else out
+    note = tool_request_note(data) if depth == 0 else None
+    if note:
+        return [("p", 0, note)]
+    for key, value in data.items():
+        if key in SKIP_KEYS or _empty(value):
+            continue
+        if isinstance(value, str) and maybe_json(value) is not None:
+            value = maybe_json(value)
+        if _is_scalar(value):
+            text = str(value)
+            if isinstance(value, str) and (len(text) > 220 or "\n" in text):
+                out.append(("h" if depth == 0 else "b", depth, label(key)))
+                out.extend((kind, d + depth + 1, t) for kind, d, t in markdown_lines(text)[:12])
+            else:
+                note = UNVERIFIED_NOTE if str(key).lower() in _STATEMENT_KEYS and not _is_verified(value, verified) else ""
+                out.append(("b" if depth else "p", depth, f"{label(key)}: {format_value(key, value)}{note}"))
+        elif isinstance(value, dict):
+            out.append(("h" if depth == 0 else "b", depth, label(key)))
+            if depth < 3:
+                out.extend(payload_lines(value, verified, depth + 1))
+        elif isinstance(value, list):
+            out.append(("h" if depth == 0 else "b", depth, label(key)))
+            for item in [i for i in value if not _empty(i)][:15]:
+                if isinstance(item, dict):
+                    parts = [f"{label(k)}: {format_value(k, v)}" for k, v in item.items()
+                             if k not in SKIP_KEYS and _is_scalar(v) and not _empty(v)]
+                    out.append(("b", depth + 1, "; ".join(parts)[:400]))
+                else:
+                    out.append(("b", depth + 1, format_value(key, item) if not isinstance(item, str) else _strip_inline(item)))
+    return out
+
+
+def agent_lines(result: Dict[str, Any], verified: Optional[Set[float]] = None, limit: int = 60) -> List[Tuple[str, int, str]]:
+    """What a report should say about one agent: the memo, else its payload, else its reasoning."""
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    if isinstance(data.get("memo"), str) and data["memo"].strip():
+        lines = markdown_lines(data["memo"])
+    elif data:
+        lines = payload_lines(data, verified)
+    else:
+        lines = markdown_lines(result.get("reasoning") or result.get("summary") or "No analysis data available.")
+    if len(lines) > limit:
+        lines = lines[:limit] + [("p", 0, f"... {len(lines) - limit} more lines in the Word report.")]
+    return lines

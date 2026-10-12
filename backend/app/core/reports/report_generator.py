@@ -32,7 +32,8 @@ def _safe_get(data: Dict, *keys, default="N/A"):
     return current if current is not None else default
 
 
-from app.core.reports.docx_rendering import add_markdown, render_payload  # noqa: E402
+from app.core.reports.docx_rendering import add_markdown, agent_lines, render_payload  # noqa: E402
+from app.core.reports.result_views import enrich_deal_from_results, revenue_bridge  # noqa: E402
 
 
 def _clean_text(text: Any) -> str:
@@ -167,6 +168,7 @@ def generate_pptx(
     from pptx.dml.color import RGBColor
     from pptx.enum.text import PP_ALIGN
 
+    deal = enrich_deal_from_results(deal, agent_results)
     prs = Presentation()
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
@@ -241,7 +243,7 @@ def generate_pptx(
         Inches(2),
         Inches(11),
         Inches(1.5),
-        deal.get("name", "Deal Analysis"),
+        deal.get("target_company") or deal.get("name", "Deal Analysis"),
         font_size=36,
         bold=True,
         color=WHITE,
@@ -325,19 +327,36 @@ def generate_pptx(
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     add_title_bar(slide, "Recorded Financial Metrics & Evidence", f"Target: {deal.get('target_company', 'N/A')}")
     recorded_metrics = _prioritize_financial_points(_curated_financial_points(analyst_data))
-    metrics_text = "\n".join(
-        f"{point.get('metric', 'Metric').replace('_', ' ').title()}: "
-        f"{_report_percent(point['value']) if str(point.get('metric', '')).endswith('_percent') else _report_currency(point['value'])}"
-        f" | {point.get('period') or 'Period not established'}"
-        f" | {point.get('basis', 'unverified')}"
-        f" | {point.get('source_id') or 'No citation'}"
-        for point in recorded_metrics[:14]
-    )
-    add_text_box(
-        slide, Inches(0.8), Inches(1.6), Inches(11.8), Inches(4.8),
-        metrics_text or "No structured financial data points were recorded. Forecasts are omitted rather than estimated.",
-        font_size=14,
-    )
+    metric_rows = recorded_metrics[:12]
+    if metric_rows:
+        shape = slide.shapes.add_table(
+            len(metric_rows) + 1, 5, Inches(0.6), Inches(1.45), Inches(12.1), Inches(0.36) * (len(metric_rows) + 1)
+        )
+        table = shape.table
+        for col, head in enumerate(("Metric", "Value", "Period", "Evidence basis", "Source")):
+            table.cell(0, col).text = head
+        for row_index, point in enumerate(metric_rows, 1):
+            metric = str(point.get("metric", "Metric"))
+            cells = (
+                metric.replace("_", " ").replace("yoy", "YoY").title(),
+                _report_percent(point["value"]) if metric.endswith("_percent") else _report_currency(point["value"]),
+                str(point.get("period") or "Not established"),
+                str(point.get("basis", "unverified")).replace("_", " "),
+                str(point.get("source_id") or "No citation"),
+            )
+            for col, value in enumerate(cells):
+                table.cell(row_index, col).text = value
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.text_frame.paragraphs:
+                    for run in para.runs:
+                        run.font.size = Pt(11)
+    else:
+        add_text_box(
+            slide, Inches(0.8), Inches(1.6), Inches(11.8), Inches(4.8),
+            "No structured financial data points were recorded. Forecasts are omitted rather than estimated.",
+            font_size=14,
+        )
     add_text_box(
         slide, Inches(0.8), Inches(6.5), Inches(11.8), Inches(0.5),
         "Recorded values are not verified unless a source citation is shown.",
@@ -346,7 +365,6 @@ def generate_pptx(
 
     # ─── Slide 3b: Infographic Financials (Waterfall) ───
     try:
-        from app.core.reports.infographic_engine import InfographicEngine
         fact_base = deal.get("fact_base", {})
         metrics_fb = fact_base.get("metrics", {})
         if metrics_fb.get("historical_revenue"):
@@ -354,10 +372,9 @@ def generate_pptx(
             add_title_bar(slide, "Revenue Bridge & Growth Trajectory", f"Target: {deal.get('target_company', 'N/A')}")
             
             rev_data = metrics_fb.get("historical_revenue", [])
-            labels_wf = [r.get("year", f"Y{i}") for i, r in enumerate(rev_data)]
-            values_wf = [r.get("amount", 0) for i, r in enumerate(rev_data)]
+            labels_wf, values_wf = revenue_bridge(rev_data)
             
-            chart_bytes = InfographicEngine.revenue_waterfall(labels_wf, values_wf, "Revenue Trajectory")
+            chart_bytes = InfographicEngine.revenue_waterfall(labels_wf, values_wf, "Revenue Trajectory ($M)")
             slide.shapes.add_picture(io.BytesIO(chart_bytes), Inches(2), Inches(1.5), Inches(9), Inches(5))
     except Exception as e:
         logger.error("pptx_waterfall_error", error=str(e))
@@ -366,7 +383,6 @@ def generate_pptx(
     valuations = deal.get("valuation_output", {}).get("valuations", []) or deal.get("financial_output", {}).get("valuations", [])
     if valuations:
         try:
-            from app.core.reports.infographic_engine import InfographicEngine
             slide = prs.slides.add_slide(prs.slide_layouts[6])
             add_title_bar(slide, "Valuation Summary (Football Field)", f"Implied EV Range")
             
@@ -375,12 +391,41 @@ def generate_pptx(
             
             chart_bytes = InfographicEngine.football_field_chart(
                 valuations=valuations,
+                unit=(deal.get("valuation_output") or {}).get("unit", "$B"),
                 title="Valuation Range Analysis",
                 current_price=deal.get("current_price")
             )
             slide.shapes.add_picture(io.BytesIO(chart_bytes), Inches(2), Inches(1.5), Inches(9), Inches(5))
         except Exception as e:
             logger.error("pptx_football_field_error", error=str(e))
+
+    # ─── Slide 3d: Valuation summary table ───
+    val_rows = (deal.get("valuation_output") or {}).get("valuations") or []
+    val_unit = (deal.get("valuation_output") or {}).get("unit", "$B")
+    val_audit = next((
+        (r.get("data") or {}).get("audit") for r in reversed(agent_results)
+        if r.get("agent_type") == "valuation_agent" and isinstance((r.get("data") or {}).get("audit"), dict)
+    ), None)
+    if isinstance(val_rows, list) and val_rows and all(isinstance(v, dict) and {"low", "high"} <= set(v) for v in val_rows):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        add_title_bar(slide, "Valuation Summary", f"Enterprise value ranges ({val_unit}) from recorded agent output")
+        shape = slide.shapes.add_table(len(val_rows) + 1, 4, Inches(0.6), Inches(1.5), Inches(12.1), Inches(0.45) * (len(val_rows) + 1))
+        table = shape.table
+        for col, head in enumerate(("Method", "Low", "Mid", "High")):
+            table.cell(0, col).text = head
+        for row_index, row in enumerate(val_rows, 1):
+            mid = row.get("mid", (row["low"] + row["high"]) / 2)
+            for col, value in enumerate((str(row.get("method", "Method")), row["low"], mid, row["high"])):
+                table.cell(row_index, col).text = value if isinstance(value, str) else f"{val_unit[:1]}{value:,.2f}{val_unit[1:]}"
+        if val_audit:
+            notes = []
+            if val_audit.get("sources"):
+                notes.append("Data: " + "; ".join(map(str, val_audit["sources"])))
+            if val_audit.get("assumptions"):
+                notes.append("Assumptions (not observed data): " + "; ".join(map(str, val_audit["assumptions"][:6])))
+            if val_audit.get("missing"):
+                notes.append("Not retrieved: " + "; ".join(map(str, val_audit["missing"])))
+            add_text_box(slide, Inches(0.6), Inches(4.2), Inches(12.1), Inches(2.6), "\n".join(notes), font_size=12, color=SECONDARY)
 
     # ─── Slide 4: Risk Matrix ───
     risk_matrix = []
@@ -541,7 +586,6 @@ def generate_pptx(
         scoring_data = deal.get("scoring_output", {})
         if scoring_data and scoring_data.get("components"):
             try:
-                from app.core.reports.infographic_engine import InfographicEngine
                 slide = prs.slides.add_slide(prs.slide_layouts[6])
                 add_title_bar(slide, "Deal Score Analysis (Quantitative Bridge)", "Score Build-up & Risk Impact")
                 
@@ -725,6 +769,7 @@ def generate_excel(
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
 
+    deal = enrich_deal_from_results(deal, agent_results)
     wb = Workbook()
 
     # ─── Styles ───
@@ -843,33 +888,105 @@ def generate_excel(
     ws3["A1"] = "DCF Assumptions & Valuation"
     ws3["A1"].font = section_font
     
-    ws3["A3"] = "Model status"
-    ws3["B3"] = "Not calculated"
-    ws3["A4"] = "Required inputs"
-    ws3["B4"] = "Source-backed forecast free cash flows, WACC, terminal growth, net debt, valuation date"
-    ws3["B4"].alignment = Alignment(wrap_text=True)
-    ws3["A6"] = "No valuation is presented until transaction-specific assumptions and source data are supplied."
+    val_audit = val_data.get("audit") if isinstance(val_data.get("audit"), dict) else {}
+    val_methods = val_data.get("valuations") if isinstance(val_data.get("valuations"), dict) else {}
+    dcf_point = (val_methods.get("dcf") or {}).get("value")
+    if isinstance(dcf_point, (int, float)):
+        ws3.column_dimensions["A"].width = 46
+        ws3.column_dimensions["B"].width = 22
+        row = 3
+        for name, value in (
+            ("Model status", "Calculated by the valuation agent from recorded inputs"),
+            ("DCF enterprise value", dcf_point),
+            ("Comparable-companies enterprise value", (val_methods.get("comparable_companies") or {}).get("value")),
+            ("Weighted estimate", val_data.get("weighted_estimate")),
+        ):
+            if value is None:
+                continue
+            ws3.cell(row=row, column=1, value=name)
+            cell = ws3.cell(row=row, column=2, value=value)
+            if isinstance(value, (int, float)):
+                cell.number_format = '$#,##0'
+            row += 1
+        wacc_build = val_audit.get("wacc_build") or {}
+        if wacc_build:
+            row += 1
+            ws3.cell(row=row, column=1, value="WACC build").font = section_font
+            row += 1
+            for key, value in wacc_build.items():
+                ws3.cell(row=row, column=1, value=key.replace("_", " ").title())
+                cell = ws3.cell(row=row, column=2, value=value)
+                if key != "beta":
+                    cell.number_format = '0.00%'
+                row += 1
+        flows = ((val_audit.get("inputs") or {}).get("financial_data") or {}).get("projected_cash_flows") or []
+        if flows:
+            row += 1
+            ws3.cell(row=row, column=1, value="Projected free cash flow").font = section_font
+            row += 1
+            for year, flow in enumerate(flows, 1):
+                ws3.cell(row=row, column=1, value=f"Year {year}")
+                ws3.cell(row=row, column=2, value=flow).number_format = '$#,##0'
+                row += 1
+        for title, key in (("Assumptions (not observed data)", "assumptions"), ("Data sources", "sources"), ("Not retrieved", "missing")):
+            items = val_audit.get(key) or []
+            if items:
+                row += 1
+                ws3.cell(row=row, column=1, value=title).font = section_font
+                row += 1
+                for item in items:
+                    ws3.cell(row=row, column=1, value=str(item))
+                    row += 1
+    else:
+        ws3["A3"] = "Model status"
+        ws3["B3"] = "Not calculated"
+        ws3["A4"] = "Required inputs"
+        ws3["B4"] = "Source-backed forecast free cash flows, WACC, terminal growth, net debt, valuation date"
+        ws3["B4"].alignment = Alignment(wrap_text=True)
+        ws3["A6"] = "No valuation is presented until transaction-specific assumptions and source data are supplied."
 
     # ─── Sheet 4: Comparable Companies ───
     ws4 = wb.create_sheet("Comps")
-    headers4 = ["Company", "Revenue ($M)", "EBITDA ($M)", "EV/Rev", "EV/EBITDA", "P/E"]
-    for col, h in enumerate(headers4, 1):
-        ws4.cell(row=1, column=col, value=h)
-    style_header(ws4, 1, len(headers4))
-    
     comps = val_data.get("comparables", [])
-    r = 2
-    for c in comps:
-        ws4.cell(row=r, column=1, value=c.get("name", "Unspecified peer"))
-        ws4.cell(row=r, column=2, value=c.get("revenue"))
-        ws4.cell(row=r, column=3, value=c.get("ebitda"))
-        ws4.cell(row=r, column=4, value=c.get("ev_rev"))
-        ws4.cell(row=r, column=5, value=c.get("ev_ebitda"))
-        ws4.cell(row=r, column=6, value=c.get("pe"))
-        r += 1
-
-    if not comps:
-        ws4.cell(row=2, column=1, value="No sourced comparable-company data recorded")
+    market_inputs = ((val_data.get("audit") or {}).get("inputs") or {}).get("market_data") or {}
+    peers = market_inputs.get("peers") or []
+    if not comps and peers:
+        headers4 = ["Ticker", "EV/Revenue (TTM)", "EV/FCF (TTM)", "Source"]
+        for col, h in enumerate(headers4, 1):
+            ws4.cell(row=1, column=col, value=h)
+            ws4.column_dimensions[get_column_letter(col)].width = 22
+        style_header(ws4, 1, len(headers4))
+        r = 2
+        for peer in peers:
+            ws4.cell(row=r, column=1, value=peer.get("ticker"))
+            ws4.cell(row=r, column=2, value=peer.get("ev_revenue")).number_format = '0.00"x"'
+            ws4.cell(row=r, column=3, value=peer.get("ev_fcf")).number_format = '0.00"x"'
+            ws4.cell(row=r, column=4, value="Finnhub stock/metric")
+            r += 1
+        median_multiple = market_inputs.get("ev_revenue_median")
+        if median_multiple:
+            ws4.cell(row=r, column=1, value="Median").font = bold_font
+            ws4.cell(row=r, column=2, value=median_multiple).number_format = '0.00"x"'
+            revenue = ((val_data.get("audit") or {}).get("inputs") or {}).get("financial_data", {}).get("revenue")
+            if isinstance(revenue, (int, float)):
+                ws4.cell(row=r + 1, column=1, value="Implied EV (median x revenue)").font = bold_font
+                ws4.cell(row=r + 1, column=2, value=revenue * median_multiple).number_format = '$#,##0'
+    else:
+        headers4 = ["Company", "Revenue ($M)", "EBITDA ($M)", "EV/Rev", "EV/EBITDA", "P/E"]
+        for col, h in enumerate(headers4, 1):
+            ws4.cell(row=1, column=col, value=h)
+        style_header(ws4, 1, len(headers4))
+        r = 2
+        for c in comps:
+            ws4.cell(row=r, column=1, value=c.get("name", "Unspecified peer"))
+            ws4.cell(row=r, column=2, value=c.get("revenue"))
+            ws4.cell(row=r, column=3, value=c.get("ebitda"))
+            ws4.cell(row=r, column=4, value=c.get("ev_rev"))
+            ws4.cell(row=r, column=5, value=c.get("ev_ebitda"))
+            ws4.cell(row=r, column=6, value=c.get("pe"))
+            r += 1
+        if not comps:
+            ws4.cell(row=2, column=1, value="No sourced comparable-company data recorded")
 
     # ─── Sheet 5: LBO Returns ───
     ws5 = wb.create_sheet("LBO Returns")
@@ -947,7 +1064,9 @@ def generate_excel(
         ws7.cell(row=r, column=1, value=result.get("agent_type", "unknown").replace("_", " ").title())
         ws7.cell(row=r, column=2, value=_confidence_label(result))
         ws7.cell(row=r, column=3, value=result.get("execution_time_ms", 0))
-        ws7.cell(row=r, column=4, value=result.get("reasoning", "")[:500])
+        lines = agent_lines(result, limit=25)
+        detail = "\n".join(("  " * depth) + ("- " if kind == "b" else "") + text for kind, depth, text in lines)
+        ws7.cell(row=r, column=4, value=detail[:3000]).alignment = Alignment(wrap_text=True, vertical="top")
 
     # ─── Sheet 8: Sources & References ───
     ws8 = wb.create_sheet("Sources & References")
@@ -1032,6 +1151,7 @@ def generate_pdf(
     - Embedded Infographics (Football Field, Waterfall, etc.)
     - Agent-by-agent findings
     """
+    deal = enrich_deal_from_results(deal, agent_results)
     buf = io.BytesIO()
     
     # Load Branding
@@ -1107,7 +1227,7 @@ def generate_pdf(
 
     # --- COVER PAGE ---
     Story.append(Spacer(1, 200))
-    Story.append(Paragraph(_clean_text(deal.get("name", "Deal Analysis Report")), styles["CoverTitle"]))
+    Story.append(Paragraph(_clean_text(deal.get("target_company") or deal.get("name", "Deal Analysis Report")), styles["CoverTitle"]))
     Story.append(Paragraph("Strategic Investment Analysis", styles["CoverSubtitle"]))
     Story.append(Spacer(1, 40))
     
@@ -1219,7 +1339,6 @@ def generate_pdf(
         Story.append(Spacer(1, 10))
         Story.append(Paragraph("Deal Score Components (Score Waterfall)", styles["AgentHeader"]))
         try:
-            from app.core.reports.infographic_engine import InfographicEngine
             comp_list = scoring_data.get("components", [])
             labels_sw = [c.get("name") for c in comp_list]
             values_sw = [c.get("score") for c in comp_list]
@@ -1250,13 +1369,12 @@ def generate_pdf(
             # Prepare data for Revenue Waterfall or Trend
             rev_data = metrics.get("historical_revenue", [])
             if len(rev_data) >= 2:
-                labels = [r.get("year", f"Y{i}") for i, r in enumerate(rev_data)]
-                values = [r.get("amount", 0) for r in rev_data]
+                labels, values = revenue_bridge(rev_data)
                 
                 chart_bytes = InfographicEngine.revenue_waterfall(
                     labels=labels,
                     values=values,
-                    title=f"{target} Revenue Trend"
+                    title=f"{target} Revenue Trend ($M)"
                 )
                 img = Image(io.BytesIO(chart_bytes), width=450, height=250)
                 Story.append(img)
@@ -1285,6 +1403,7 @@ def generate_pdf(
             if valuations:
                 chart_bytes = InfographicEngine.football_field_chart(
                     valuations=valuations,
+                    unit=(deal.get("valuation_output") or {}).get("unit", "$B"),
                     title="Valuation Range Analysis",
                     current_price=deal.get("current_price")
                 )
@@ -1297,24 +1416,27 @@ def generate_pdf(
     Story.append(PageBreak())
 
     # --- AGENT FINDINGS ---
+    sourced_values = {
+        float(point["value"]) for point in analyst_data.get("_evidence_brief", {}).get("data_points", [])
+        if point.get("source_id") and isinstance(point.get("value"), (int, float))
+    }
+
+    def _pdf_escape(text: str) -> str:
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
     for result in agent_results:
-        agent_type = result.get("agent_type", "Agent")
-        label = agent_type.replace("_", " ").title()
-        reasoning = _clean_text(result.get("summary") or result.get("reasoning", "No analysis available."))[:1200]
-
-        Story.append(Paragraph(label, styles["AgentHeader"]))
-
-        # Format reasoning into paragraphs
-        paragraphs = [p for p in reasoning.split("\n") if p.strip()]
-        for p in paragraphs:
-            clean_p = p.replace("<", "&lt;").replace(">", "&gt;")
-            if clean_p.startswith("#"):
-                Story.append(Paragraph("<b>" + clean_p.lstrip("#").strip() + "</b>", styles["BodyTextCustom"]))
-            elif clean_p.startswith("-") or clean_p.startswith("*"):
-                Story.append(Paragraph("• " + clean_p[1:].strip(), styles["BodyTextBullet"]))
+        agent_label = result.get("agent_type", "Agent").replace("_", " ").title()
+        Story.append(Paragraph(agent_label, styles["AgentHeader"]))
+        if result.get("task_title"):
+            Story.append(Paragraph(f"<i>Task: {_pdf_escape(_clean_text(result['task_title']))}</i>", styles["BodyTextCustom"]))
+        for kind, depth, text in agent_lines(result, verified=sourced_values, limit=45):
+            text = _pdf_escape(_clean_text(text))
+            if kind == "h":
+                Story.append(Paragraph(f"<b>{text}</b>", styles["BodyTextCustom"]))
+            elif kind == "b":
+                Story.append(Paragraph(("&nbsp;" * 4 * depth) + "&bull; " + text, styles["BodyTextBullet"]))
             else:
-                Story.append(Paragraph(clean_p, styles["BodyTextCustom"]))
-
+                Story.append(Paragraph(text, styles["BodyTextCustom"]))
         Story.append(Spacer(1, 15))
 
     # --- PROVENANCE & FOOTNOTES ---
@@ -1451,6 +1573,7 @@ def generate_docx(
             "Install it with: pip install python-docx"
         )
 
+    deal = enrich_deal_from_results(deal, agent_results)
     doc = DocxDocument()
 
     blueprint = analyst_data.get("_report_blueprint", {})
@@ -1730,7 +1853,6 @@ def generate_docx(
     scoring_data = deal.get("scoring_output", {})
     if scoring_data and scoring_data.get("components"):
         try:
-            from app.core.reports.infographic_engine import InfographicEngine
             doc.add_heading("Deal Score Composition", level=2)
             comp_list = scoring_data.get("components", [])
             labels_sw = [c.get("name") for c in comp_list]
@@ -1874,7 +1996,6 @@ def generate_docx(
     if has_visuals:
         doc.add_page_break()
         doc.add_heading(f"{section_numbers['Visual Analysis']}. Visual Analysis", level=1)
-        from app.core.reports.infographic_engine import InfographicEngine
     
     if valuations:
         try:
@@ -1884,6 +2005,7 @@ def generate_docx(
             
             chart_bytes = InfographicEngine.football_field_chart(
                 valuations=valuations,
+                unit=(deal.get("valuation_output") or {}).get("unit", "$B"),
                 title="Valuation Range Analysis",
                 current_price=deal.get("current_price")
             )
@@ -1901,10 +2023,9 @@ def generate_docx(
         try:
             doc.add_heading(f"{section_numbers.get('Visual Analysis', 5)}.2 Financial Growth Trajectory", level=2)
             rev_data = metrics_fb.get("historical_revenue", [])
-            labels_wf = [r.get("year", f"Y{i}") for i, r in enumerate(rev_data)]
-            values_wf = [r.get("amount", 0) for i, r in enumerate(rev_data)]
+            labels_wf, values_wf = revenue_bridge(rev_data)
             
-            chart_bytes = InfographicEngine.revenue_waterfall(labels_wf, values_wf, "Revenue Trajectory")
+            chart_bytes = InfographicEngine.revenue_waterfall(labels_wf, values_wf, "Revenue Trajectory ($M)")
             from io import BytesIO
             img_stream = BytesIO(chart_bytes)
             doc.add_picture(img_stream, width=DocxInches(6))

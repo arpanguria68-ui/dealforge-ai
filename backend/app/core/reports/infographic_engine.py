@@ -87,13 +87,16 @@ class InfographicEngine:
         Returns:
             PNG bytes
         """
-        _ensure_plotly()
-        import plotly.graph_objects as go
-
         methods = [v["method"] for v in valuations]
         lows = [v["low"] for v in valuations]
         mids = [v.get("mid", (v["low"] + v["high"]) / 2) for v in valuations]
         highs = [v["high"] for v in valuations]
+        try:
+            _ensure_plotly()
+            import plotly.graph_objects as go
+        except Exception as exc:  # no kaleido: Plotly cannot render a PNG here
+            logger.warning("football_field_plotly_unavailable", error=str(exc))
+            return InfographicEngine._football_field_mpl(methods, lows, mids, highs, title, unit, current_price)
 
         fig = go.Figure()
 
@@ -152,7 +155,37 @@ class InfographicEngine:
             font=dict(family="Liberation Sans, Helvetica, Arial"),
         )
 
-        return fig.to_image(format="png", scale=2)
+        try:
+            return fig.to_image(format="png", scale=2)
+        except Exception as exc:  # Plotly image export needs kaleido; fall back to matplotlib
+            logger.warning("football_field_plotly_export_failed", error=str(exc))
+            return InfographicEngine._football_field_mpl(methods, lows, mids, highs, title, unit, current_price)
+
+    @staticmethod
+    def _football_field_mpl(methods, lows, mids, highs, title, unit, current_price=None) -> bytes:
+        _ensure_matplotlib()
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(10, 1.2 + 0.9 * len(methods)), dpi=150)
+        for i, (m, lo, mi, hi) in enumerate(zip(methods, lows, mids, highs)):
+            color = CHART_COLORS[i % len(CHART_COLORS)]
+            ax.barh(i, max(hi - lo, (hi or 1) * 0.004), left=lo, color=color, alpha=0.35, edgecolor=color, linewidth=2)
+            ax.plot([mi], [i], marker="D", color=color, markersize=9)
+            ax.text(hi, i, f"  {lo:,.2f} - {hi:,.2f} {unit}", va="center", fontsize=9, color=PALETTE["text"])
+        if current_price is not None:
+            ax.axvline(current_price, linestyle="--", color=PALETTE["negative"])
+        ax.set_yticks(range(len(methods)))
+        ax.set_yticklabels(methods)
+        ax.invert_yaxis()
+        ax.set_xlabel(f"Enterprise value ({unit})")
+        ax.set_title(title, color=PALETTE["text"], fontsize=13)
+        ax.grid(axis="x", color=PALETTE["grid"])
+        ax.set_xlim(left=0, right=max(highs) * 1.35)
+        fig.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png")
+        plt.close(fig)
+        return buf.getvalue()
 
     # ── 2. Revenue Waterfall Chart ───────────────────────────
     @staticmethod
