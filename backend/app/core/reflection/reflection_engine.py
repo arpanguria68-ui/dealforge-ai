@@ -81,6 +81,7 @@ Agent Output:
 {json.dumps(agent_output, indent=2)}
 
 {f"Expected Format: {json.dumps(expected_format)}" if expected_format else ""}
+{self._grounding_prompt(agent_output)}
 
 Provide your evaluation in the following JSON format:
 {{
@@ -109,6 +110,7 @@ Provide your evaluation in the following JSON format:
             data = json.loads(response["content"].strip().strip("```json").strip("```").strip())
             
             scores = data.get("scores", {})
+            scores = self._cap_accuracy_by_grounding(scores, agent_output)
             total_score = sum(
                 scores.get(criterion, 0.5) * weight 
                 for criterion, weight in self.evaluation_criteria.items()
@@ -124,6 +126,33 @@ Provide your evaluation in the following JSON format:
         except Exception as e:
             logger.warning("LLM reflection failed, falling back to heuristics", error=str(e))
             return self._evaluate_heuristics(task, agent_output, expected_format)
+
+    @staticmethod
+    def _grounding_prompt(agent_output: Dict[str, Any]) -> str:
+        """Ground truth from the deterministic memo check, so the judge can't be fooled."""
+        grounding = agent_output.get("grounding") if isinstance(agent_output, dict) else None
+        if not isinstance(grounding, dict) or grounding.get("status") in (None, "no_sources"):
+            return ""
+        return (
+            "DETERMINISTIC CHECKS (authoritative; the judge cannot verify figures itself): "
+            f"{grounding.get('figures_grounded')} of {grounding.get('figures_total')} figures match the "
+            f"recorded agent outputs. Not found in evidence: {grounding.get('ungrounded', [])[:15]}. "
+            f"Cited sources with no tool output: {grounding.get('unsupported_sources', [])}. "
+            "Score accuracy accordingly.\n"
+        )
+
+    @staticmethod
+    def _cap_accuracy_by_grounding(scores: Dict[str, Any], agent_output: Dict[str, Any]) -> Dict[str, Any]:
+        """A fluent but unsourced output cannot score high on accuracy."""
+        grounding = agent_output.get("grounding") if isinstance(agent_output, dict) else None
+        if not isinstance(grounding, dict) or grounding.get("status") in (None, "no_sources"):
+            return scores
+        ceiling = 0.4 + 0.6 * float(grounding.get("grounded_ratio", 0.0))
+        if grounding.get("unsupported_sources"):
+            ceiling = min(ceiling, 0.6)
+        capped = dict(scores)
+        capped["accuracy"] = min(float(capped.get("accuracy", 0.5)), ceiling)
+        return capped
 
     def _evaluate_heuristics(
         self,
