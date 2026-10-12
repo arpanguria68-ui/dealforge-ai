@@ -478,6 +478,20 @@ async def prepare_document_payload(registry: Any, deal: Dict[str, Any], activiti
 
     analyst_data = _curate_synthesis(analyst_data, evidence)
 
+    # Editor stage: decide what the report says (key messages, <=5 grounded points per agent).
+    from app.core.reports.report_editor import edit_report
+
+    sourced_values = {
+        float(point["value"]) for point in evidence.get("data_points", [])
+        if point.get("source_id") and isinstance(point.get("value"), (int, float))
+    }
+    editorial = await edit_report(
+        agent_results, evidence, str(deal.get("user_prompt") or deal.get("name") or ""), sourced_values
+    )
+    analyst_data["_editorial"] = editorial
+    if editorial.get("editor") != "llm":
+        qa_warnings.append("Report editor model unavailable; rule-based selection of findings used.")
+
     analyst_data["_evidence_brief"] = evidence
     analyst_data["_report_blueprint"] = fallback
     uncited_financial_points = any(

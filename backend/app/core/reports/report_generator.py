@@ -32,7 +32,8 @@ def _safe_get(data: Dict, *keys, default="N/A"):
     return current if current is not None else default
 
 
-from app.core.reports.docx_rendering import add_markdown, agent_lines, render_payload  # noqa: E402
+from app.core.reports.docx_rendering import add_inline, add_markdown, agent_lines, render_payload  # noqa: E402
+from app.core.reports.report_editor import deterministic_edit, section_for  # noqa: E402
 from app.core.reports.result_views import enrich_deal_from_results, revenue_bridge  # noqa: E402
 
 
@@ -426,6 +427,28 @@ def generate_pptx(
             if val_audit.get("missing"):
                 notes.append("Not retrieved: " + "; ".join(map(str, val_audit["missing"])))
             add_text_box(slide, Inches(0.6), Inches(4.2), Inches(12.1), Inches(2.6), "\n".join(notes), font_size=12, color=SECONDARY)
+
+    # ─── Key messages and edited findings (full output lives in the Word report) ───
+    editorial_ppt = analyst_data.get("_editorial") or deterministic_edit(
+        agent_results, None, analyst_data.get("_evidence_brief", {})
+    )
+    if editorial_ppt.get("key_messages"):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        add_title_bar(slide, "Key Messages", f"Target: {deal.get('target_company', 'Unknown')}")
+        add_text_box(
+            slide, Inches(0.7), Inches(1.5), Inches(12), Inches(5.5),
+            "\n\n".join(f"\u2022 {m}" for m in editorial_ppt["key_messages"]), font_size=16,
+        )
+    edited_sections = [sec for sec in editorial_ppt.get("sections", []) if sec.get("points")]
+    for start in range(0, len(edited_sections), 2):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        add_title_bar(slide, "Key Findings by Agent", "Edited summary; full agent output is in the Word report appendix")
+        for col, sec in enumerate(edited_sections[start:start + 2]):
+            left = Inches(0.6 + col * 6.2)
+            add_text_box(slide, left, Inches(1.45), Inches(5.9), Inches(0.5),
+                         str(sec["agent"]).replace("_", " ").title(), font_size=16, bold=True, color=SECONDARY)
+            add_text_box(slide, left, Inches(2.05), Inches(5.9), Inches(5.0),
+                         "\n\n".join(f"\u2022 {pt}" for pt in sec["points"][:4]), font_size=12)
 
     # ─── Slide 4: Risk Matrix ───
     risk_matrix = []
@@ -1112,6 +1135,24 @@ def generate_excel(
     if row == 2:
         ws8.cell(row=row, column=5, value="No source references or provenance records captured")
 
+    editorial_x = analyst_data.get("_editorial") or deterministic_edit(
+        agent_results, None, analyst_data.get("_evidence_brief", {})
+    )
+    wsb = wb.create_sheet("Editor Brief", 1)
+    wsb.column_dimensions["A"].width = 26
+    wsb.column_dimensions["B"].width = 110
+    wsb.append(["Section", "Point"])
+    style_header(wsb, 1, 2)
+    for message in editorial_x.get("key_messages", []):
+        wsb.append(["Key message", message])
+    for sec in editorial_x.get("sections", []):
+        for point in sec.get("points", []):
+            wsb.append([str(sec.get("agent", "")).replace("_", " ").title(), point])
+    wsb.append(["Editor", "Model editor, figures checked against agent output" if editorial_x.get("editor") == "llm"
+                else "Rule-based selection (model editor unavailable)"])
+    for row in wsb.iter_rows(min_row=2):
+        row[1].alignment = Alignment(wrap_text=True, vertical="top")
+
     ws9 = wb.create_sheet("Evidence Brief")
     ws9.column_dimensions["A"].width = 24
     ws9.column_dimensions["B"].width = 100
@@ -1424,12 +1465,23 @@ def generate_pdf(
     def _pdf_escape(text: str) -> str:
         return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+    editorial_pdf = analyst_data.get("_editorial") or deterministic_edit(
+        agent_results, sourced_values, analyst_data.get("_evidence_brief", {})
+    )
+    if editorial_pdf.get("key_messages"):
+        Story.append(Paragraph("Key Messages", styles["AgentHeader"]))
+        for message in editorial_pdf["key_messages"]:
+            Story.append(Paragraph("&bull; " + _pdf_escape(_clean_text(message)), styles["BodyTextBullet"]))
+        Story.append(Spacer(1, 12))
+
     for result in agent_results:
         agent_label = result.get("agent_type", "Agent").replace("_", " ").title()
         Story.append(Paragraph(agent_label, styles["AgentHeader"]))
         if result.get("task_title"):
             Story.append(Paragraph(f"<i>Task: {_pdf_escape(_clean_text(result['task_title']))}</i>", styles["BodyTextCustom"]))
-        for kind, depth, text in agent_lines(result, verified=sourced_values, limit=45):
+        points = section_for(editorial_pdf, result.get("agent_type"))
+        lines = [("b", 0, point) for point in points] if points else agent_lines(result, verified=sourced_values, limit=12)
+        for kind, depth, text in lines:
             text = _pdf_escape(_clean_text(text))
             if kind == "h":
                 Story.append(Paragraph(f"<b>{text}</b>", styles["BodyTextCustom"]))
@@ -1714,6 +1766,8 @@ def generate_docx(
         toc_sections.append("Risk Assessment")
     if has_visuals:
         toc_sections.append("Visual Analysis")
+    if agent_results:
+        toc_sections.append("Appendix: Full Agent Output")
     toc_sections.append("References and Provenance")
     section_numbers = {name: n for n, name in enumerate(toc_sections, 1)}
     for section in toc_sections:
@@ -1783,6 +1837,13 @@ def generate_docx(
                 run.font.size = DocxPt(11)
 
     doc.add_paragraph()  # spacer
+
+    # Editor stage: a short, de-duplicated brief instead of every agent payload.
+    editorial = analyst_data.get("_editorial") or deterministic_edit(agent_results, {float(point["value"]) for point in analyst_data.get("_evidence_brief", {}).get("data_points", []) if point.get("source_id") and isinstance(point.get("value"), (int, float))}, evidence_brief)
+    if editorial.get("key_messages"):
+        doc.add_heading("Key Messages", level=2)
+        for message in editorial["key_messages"]:
+            add_inline(doc.add_paragraph(style="List Bullet"), message)
 
     chat_context = analyst_data.get("_chat_context", {})
     if chat_context.get("mandate") or chat_context.get("chat_summary"):
@@ -1935,29 +1996,14 @@ def generate_docx(
             run_task.font.size = DocxPt(10)
             run_task.font.italic = True
 
-        payload = result.get("data") if isinstance(result.get("data"), dict) else {}
-        memo_text = payload.get("memo") if isinstance(payload.get("memo"), str) else ""
-        if memo_text:
-            add_markdown(doc, memo_text, heading_offset=3)
-            check = payload.get("grounding") if isinstance(payload.get("grounding"), dict) else None
-            if check and check.get("status") == "low_grounding":
-                p_check = doc.add_paragraph()
-                run_check = p_check.add_run(
-                    f"Figure check: {check.get('figures_grounded')} of {check.get('figures_total')} figures match "
-                    "recorded evidence; verify the rest before relying on them."
-                )
-                run_check.italic = True
-        elif payload:
-            sourced_values = {
-                float(point["value"]) for point in evidence_brief.get("data_points", [])
-                if point.get("source_id") and isinstance(point.get("value"), (int, float))
-            }
-            render_payload(doc, payload, verified=sourced_values)
+        points = section_for(editorial, agent_type)
+        if points:
+            for point in points:
+                add_inline(doc.add_paragraph(style="List Bullet"), point)
         else:
-            add_markdown(
-                doc, result.get("reasoning") or result.get("summary") or "No analysis data available.",
-                heading_offset=3,
-            )
+            p_none = doc.add_paragraph()
+            run_none = p_none.add_run("No decision-relevant findings selected; the full output is in the appendix.")
+            run_none.italic = True
 
     # ═══════════════════════════════════════════
     #  RISK MATRIX
@@ -2033,6 +2079,46 @@ def generate_docx(
         except Exception as e:
             logger.error("docx_waterfall_error", error=str(e))
     doc.add_page_break()
+
+    # ═══════════════════════════════════════════
+    #  APPENDIX: FULL AGENT OUTPUT (the findings above are the edited summary)
+    # ═══════════════════════════════════════════
+    if agent_results:
+        doc.add_page_break()
+        appendix_no = section_numbers["Appendix: Full Agent Output"]
+        doc.add_heading(f"{appendix_no}. Appendix: Full Agent Output", level=1)
+        p_app = doc.add_paragraph()
+        run_app = p_app.add_run(
+            "Complete recorded output of each agent, kept for verification. The Agent Findings section is the edited summary."
+        )
+        run_app.italic = True
+        for idx, result in enumerate(agent_results, 1):
+            agent_type = result.get("agent_type", "Agent")
+            doc.add_heading(f"{appendix_no}.{idx}  {agent_type.replace('_', ' ').title()}", level=2)
+            payload = result.get("data") if isinstance(result.get("data"), dict) else {}
+            memo_text = payload.get("memo") if isinstance(payload.get("memo"), str) else ""
+            if memo_text:
+                add_markdown(doc, memo_text, heading_offset=3)
+                check = payload.get("grounding") if isinstance(payload.get("grounding"), dict) else None
+                if check and check.get("status") == "low_grounding":
+                    p_check = doc.add_paragraph()
+                    run_check = p_check.add_run(
+                        f"Figure check: {check.get('figures_grounded')} of {check.get('figures_total')} figures match "
+                        "recorded evidence; verify the rest before relying on them."
+                    )
+                    run_check.italic = True
+            elif payload:
+                sourced_values = {
+                    float(point["value"]) for point in evidence_brief.get("data_points", [])
+                    if point.get("source_id") and isinstance(point.get("value"), (int, float))
+                }
+                render_payload(doc, payload, verified=sourced_values)
+            else:
+                add_markdown(
+                    doc, result.get("reasoning") or result.get("summary") or "No analysis data available.",
+                    heading_offset=3,
+                )
+
 
     # ═══════════════════════════════════════════
     #  REFERENCES / PROVENANCE

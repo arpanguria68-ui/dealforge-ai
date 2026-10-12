@@ -43,9 +43,19 @@ def _tokens(key: Any) -> Set[str]:
     return set(re.split(r"[^a-z0-9]+", str(key).lower()))
 
 
+def _fix_mojibake(text: str) -> str:
+    """Repair UTF-8 text that was decoded as cp1252 upstream ("â€”" -> "—")."""
+    if "â€" not in text and "Ã" not in text:
+        return text
+    try:
+        return text.encode("cp1252").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text.replace("â€”", "—").replace("â€“", "–").replace("â€™", "’").replace("â€œ", "“").replace("â€", "”")
+
+
 def clean(text: Any) -> str:
     """Printable text; unlike the PDF path, Word handles Unicode so it is kept."""
-    return _CONTROL.sub("", "" if text is None else str(text))
+    return _CONTROL.sub("", _fix_mojibake("" if text is None else str(text)))
 
 
 def add_inline(paragraph, text: str, size: Optional[float] = None) -> None:
