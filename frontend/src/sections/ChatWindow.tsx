@@ -1409,7 +1409,15 @@ export function ChatWindow() {
                     role: 'agent', agentName: agentLabel,
                     content: `⏳ **${task.title}** — Analyzing...`, status: 'thinking',
                 });
-                const unmetDependencies = (task.depends_on || []).filter(id => taskOutcomes.get(id) !== 'done');
+                let unmetDependencies = (task.depends_on || []).filter(id => taskOutcomes.get(id) !== 'done');
+                if (task.assigned_agent === 'investment_memo_agent' && unmetDependencies.length) {
+                    // Final synthesis may run on partial inputs once every prerequisite
+                    // has finished and at least one succeeded.
+                    const deps = task.depends_on || [];
+                    const allFinished = deps.every(id => taskOutcomes.has(id));
+                    const anyDone = deps.some(id => taskOutcomes.get(id) === 'done');
+                    if (allFinished && anyDone) unmetDependencies = [];
+                }
                 if (unmetDependencies.length) {
                     failedCount++;
                     taskResult = { error: 'blocked_by_failed_dependencies', blocked_by: unmetDependencies };

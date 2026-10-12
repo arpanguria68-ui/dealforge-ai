@@ -3,6 +3,7 @@
 from typing import Dict, Any, Optional, List
 import asyncio
 import json
+import re
 import math
 import re
 from datetime import datetime
@@ -1717,6 +1718,33 @@ class ValuationAgent(BaseAgent):
         if fact_base:
             financial_data = {**financial_data, **deal_terms}
 
+        # The UI path passes earlier tasks' outputs as free-form agent_outputs;
+        # map their explicit figures, then fill gaps from sourced market data.
+        from app.core.valuation_inputs import derive_valuation_inputs, gather_market_inputs
+
+        derived = derive_valuation_inputs((context or {}).get("agent_outputs") or {})
+        financial_data = {**derived["financial_data"], **(financial_data or {})}
+        market_data = {**derived["market_data"], **(market_data or {})}
+        audit: Dict[str, Any] = {"assumptions": [], "sources": [], "missing": []}
+        ticker = str((context or {}).get("ticker") or "").strip().upper()
+        needs_market = not (
+            financial_data.get("wacc")
+            and financial_data.get("projected_cash_flows")
+            and market_data.get("ev_revenue_median")
+        )
+        if needs_market and re.fullmatch(r"[A-Z][A-Z.\-]{0,5}", ticker):
+            gathered = await gather_market_inputs(ticker, self._finnhub_fetch, financial_data)
+            for key, value in gathered["financial_data"].items():
+                financial_data.setdefault(key, value)
+            for key, value in gathered["market_data"].items():
+                market_data.setdefault(key, value)
+            audit = {k: gathered[k] for k in ("assumptions", "sources", "missing")}
+            if gathered.get("wacc_build"):
+                audit["wacc_build"] = gathered["wacc_build"]
+        elif needs_market:
+            audit["missing"].append("public ticker (needed to fetch peer multiples, beta)")
+        audit["inputs"] = {"financial_data": financial_data, "market_data": market_data}
+
         # Run multiple valuation methods
         methods = ["dcf", "comparable_companies", "precedent_transactions"]
         valuations = {}
@@ -1737,17 +1765,20 @@ class ValuationAgent(BaseAgent):
             execution_time = (datetime.now() - start_time).total_seconds() * 1000
             return AgentOutput(
                 success=False,
-                data={"valuations": valuations},
-                reasoning="All valuation methods returned insufficient data",
+                data={"valuations": valuations, "audit": audit},
+                reasoning=(
+                    "All valuation methods returned insufficient data. Missing: "
+                    + ("; ".join(audit["missing"]) or "structured financial inputs")
+                ),
                 confidence=0.0,
                 execution_time_ms=execution_time,
             )
 
-        weighted_value = sum(
-            valuations[m]["value"] * weights[m]
-            for m in methods
-            if valuations[m].get("value")
-        )
+        # Renormalise over the methods that produced a value, otherwise a missing
+        # method drags the estimate below every individual result.
+        used = [m for m in methods if valuations[m].get("value")]
+        total_weight = sum(weights[m] for m in used)
+        weighted_value = sum(valuations[m]["value"] * weights[m] for m in used) / total_weight
 
         execution_time = (datetime.now() - start_time).total_seconds() * 1000
 
@@ -1755,6 +1786,7 @@ class ValuationAgent(BaseAgent):
             success=True,
             data={
                 "valuations": valuations,
+                "audit": audit,
                 "weighted_estimate": weighted_value,
                 "valuation_range": {
                     "low": min(valid_values),
@@ -1765,6 +1797,16 @@ class ValuationAgent(BaseAgent):
             confidence=0.75,
             execution_time_ms=execution_time,
         )
+
+    async def _finnhub_fetch(self, endpoint: str, symbol: str) -> Any:
+        """Finnhub JSON for ``endpoint`` or None (tool errors are non-fatal)."""
+        try:
+            result = await self.tools.execute(
+                "finnhub_data", {"symbol": symbol, "endpoint": endpoint}
+            )
+            return result.data if result.success else None
+        except Exception:
+            return None
 
     async def _run_valuation_method(
         self, method: str, financial_data: Dict, market_data: Dict

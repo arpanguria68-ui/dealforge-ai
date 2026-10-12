@@ -3413,6 +3413,13 @@ async def chat_execute_task(request: Request):
             raise HTTPException(status_code=404, detail="Task is not part of the approved plan")
         completed_ids = {item.id for item in todo.items if item.status == "done"}
         unmet_dependencies = [dependency for dependency in planned_task.depends_on if dependency not in completed_ids]
+        if unmet_dependencies and planned_task.assigned_agent == "investment_memo_agent":
+            # The IC memo is the final synthesis step: it may run on partial
+            # inputs (and must say what is missing) once every prerequisite has
+            # finished and at least one produced a result.
+            finished = {item.id for item in todo.items if item.status in {"done", "blocked", "failed"}}
+            if completed_ids & set(planned_task.depends_on) and set(unmet_dependencies) <= finished:
+                unmet_dependencies = []
         if unmet_dependencies:
             raise HTTPException(
                 status_code=409,
@@ -3438,16 +3445,18 @@ async def chat_execute_task(request: Request):
     if not ticker and company_name.strip().lower() not in {"target company", "the target", "unknown"}:
         ticker = company_name
 
-    # Fallback to todo_list metadata if ticker is missing
+    # Fallback to todo_list metadata if ticker is missing, or if all we have is
+    # a company-name hint (not a symbol) and the approved plan stored the real one.
     deal_id = body.get("deal_id")
-    if not ticker and deal_id:
+    _is_symbol = lambda t: bool(re.fullmatch(r"[A-Z][A-Z.\-]{0,5}", str(t or "").strip()))  # noqa: E731
+    if (not ticker or not _is_symbol(ticker)) and deal_id:
         tm = get_task_manager()
         lists = await tm.get_lists_for_deal(deal_id)
         if lists:
             # Use the most recent list
             latest_list = sorted(lists, key=lambda x: x.created_at, reverse=True)[0]
-            if not ticker:
-                ticker = latest_list.ticker
+            if not ticker or _is_symbol(latest_list.ticker):
+                ticker = latest_list.ticker or ticker
             if not company_name:
                 company_name = latest_list.company_name
 

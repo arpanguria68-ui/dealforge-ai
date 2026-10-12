@@ -132,7 +132,11 @@ def wire_stage_dependencies(items: List[Any]) -> None:
     # Data-curator tasks can either gather source inputs or synthesize completed
     # analyses. Only the latter belong at the end of the dependency graph.
     collection_terms = ("collect", "collection", "gather", "fetch", "retrieve", "ingest")
-    source_terms = ("financial data", "financial statement", "financial records", "source data")
+    source_terms = (
+        "financial data", "financial statement", "financial records", "source data",
+        "financial metrics", "market data", "share price", "market cap", "comparable compan",
+        "peer multiples", "valuation multiples", "filings",
+    )
     data_collection_ids = []
     for item in items:
         title = str(getattr(item, "title", "")).casefold()
