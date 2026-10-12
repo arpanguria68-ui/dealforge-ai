@@ -40,11 +40,18 @@ def _strings(value: Any) -> Iterable[str]:
             yield from _strings(item)
 
 
+# Notes about the narrative step ("LLM unavailable") sit beside intact tool-sourced data;
+# they must not make the whole analysis, and its SEC-linked figures, disappear.
+_ADVISORY_KEYS = frozenset({"provider_warning", "warnings", "warning", "data_limitations", "limitations"})
+
+
 def _contains_execution_error(value: Any) -> bool:
     if isinstance(value, dict):
         if value.get("error"):
             return True
-        return any(_contains_execution_error(item) for item in value.values())
+        return any(
+            _contains_execution_error(item) for key, item in value.items() if key not in _ADVISORY_KEYS
+        )
     if isinstance(value, list):
         return any(_contains_execution_error(item) for item in value)
     if isinstance(value, str):

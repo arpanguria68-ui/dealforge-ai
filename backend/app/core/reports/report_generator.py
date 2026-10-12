@@ -32,6 +32,9 @@ def _safe_get(data: Dict, *keys, default="N/A"):
     return current if current is not None else default
 
 
+from app.core.reports.docx_rendering import add_markdown, render_payload  # noqa: E402
+
+
 def _clean_text(text: Any) -> str:
     """Sanitize text for PDF/PPTX (handle smart quotes, non-ASCII chars)."""
     if text is None:
@@ -1589,10 +1592,11 @@ def generate_docx(
     if has_visuals:
         toc_sections.append("Visual Analysis")
     toc_sections.append("References and Provenance")
+    section_numbers = {name: n for n, name in enumerate(toc_sections, 1)}
     for section in toc_sections:
-        entry = doc.add_paragraph(style="List Bullet")
+        entry = doc.add_paragraph()
         entry.paragraph_format.space_after = DocxPt(2)
-        entry.add_run(section).font.size = DocxPt(10)
+        entry.add_run(f"{section_numbers[section]}.  {section}").font.size = DocxPt(10)
 
     doc.add_page_break()
 
@@ -1665,7 +1669,7 @@ def generate_docx(
             doc.add_paragraph(_clean_text(chat_context["mandate"]))
         if chat_context.get("chat_summary"):
             doc.add_paragraph("DealForge chat synthesis (not independently verified):", style="Heading 3")
-            doc.add_paragraph(_clean_text(chat_context["chat_summary"]))
+            add_markdown(doc, chat_context["chat_summary"], heading_offset=4)
         doc.add_paragraph(
             "Chat text is included for scope and continuity only. It is not a primary source; "
             "verify every factual claim against the cited records below."
@@ -1756,7 +1760,7 @@ def generate_docx(
 
     if evidence_brief.get("data_points"):
         doc.add_page_break()
-        doc.add_heading("2. Financial Metrics and Source Status", level=1)
+        doc.add_heading(f"{section_numbers['Financial Metrics and Source Status']}. Financial Metrics and Source Status", level=1)
         metrics_table = doc.add_table(rows=1, cols=5, style="Table Grid")
         metrics_table.alignment = WD_TABLE_ALIGNMENT.CENTER
         for cell, label in zip(metrics_table.rows[0].cells, ("Metric", "Value", "Period", "Evidence basis", "Source")):
@@ -1787,40 +1791,51 @@ def generate_docx(
 
     if agent_results:
         doc.add_page_break()
-        doc.add_heading("3. Agent Findings", level=1)
+        doc.add_heading(f"{section_numbers['Agent Findings']}. Agent Findings", level=1)
 
     for idx, result in enumerate(agent_results, 1):
         agent_type = result.get("agent_type", "Agent")
-        label = agent_type.replace("_", " ").title()
+        agent_label = agent_type.replace("_", " ").title()
         confidence_pct = _confidence_label(result)
         provider = result.get("provider", "unknown")
-        reasoning = _clean_text(result.get("summary") or result.get("reasoning", "No analysis data available."))[:1200]
 
-        doc.add_heading(
-            f"3.{idx}  {label}", level=2
-        )
+        doc.add_heading(f"{section_numbers['Agent Findings']}.{idx}  {agent_label}", level=2)
 
-        # Confidence & provider metadata
         p_meta = doc.add_paragraph()
-        run_meta = p_meta.add_run(
-            f"Confidence: {confidence_pct}  |  Provider: {provider}"
-        )
+        run_meta = p_meta.add_run(f"Confidence: {confidence_pct}  |  Provider: {provider}")
         run_meta.font.size = DocxPt(10)
         run_meta.font.italic = True
         run_meta.font.color.rgb = DocxRGBColor(0x60, 0x60, 0x60)
         run_meta.font.name = "Calibri"
+        if result.get("task_title"):
+            p_task = doc.add_paragraph()
+            run_task = p_task.add_run(f"Task: {result['task_title']}")
+            run_task.font.size = DocxPt(10)
+            run_task.font.italic = True
 
-        # Reasoning body — split into paragraphs
-        paragraphs = [p for p in reasoning.split("\n") if p.strip()]
-        for para_text in paragraphs:
-            clean_para = para_text.strip()
-            if clean_para.startswith("#"):
-                # Sub-heading within agent output
-                doc.add_heading(
-                    clean_para.lstrip("#").strip(), level=3
+        payload = result.get("data") if isinstance(result.get("data"), dict) else {}
+        memo_text = payload.get("memo") if isinstance(payload.get("memo"), str) else ""
+        if memo_text:
+            add_markdown(doc, memo_text, heading_offset=3)
+            check = payload.get("grounding") if isinstance(payload.get("grounding"), dict) else None
+            if check and check.get("status") == "low_grounding":
+                p_check = doc.add_paragraph()
+                run_check = p_check.add_run(
+                    f"Figure check: {check.get('figures_grounded')} of {check.get('figures_total')} figures match "
+                    "recorded evidence; verify the rest before relying on them."
                 )
-            else:
-                doc.add_paragraph(clean_para)
+                run_check.italic = True
+        elif payload:
+            sourced_values = {
+                float(point["value"]) for point in evidence_brief.get("data_points", [])
+                if point.get("source_id") and isinstance(point.get("value"), (int, float))
+            }
+            render_payload(doc, payload, verified=sourced_values)
+        else:
+            add_markdown(
+                doc, result.get("reasoning") or result.get("summary") or "No analysis data available.",
+                heading_offset=3,
+            )
 
     # ═══════════════════════════════════════════
     #  RISK MATRIX
@@ -1828,7 +1843,7 @@ def generate_docx(
 
     if risk_matrix:
         doc.add_page_break()
-        doc.add_heading("4. Risk Assessment", level=1)
+        doc.add_heading(f"{section_numbers['Risk Assessment']}. Risk Assessment", level=1)
         # Create table with Evidence column
         risk_table = doc.add_table(rows=1, cols=4, style="Table Grid")
         risk_table.alignment = WD_TABLE_ALIGNMENT.CENTER
@@ -1858,12 +1873,12 @@ def generate_docx(
     # ═══════════════════════════════════════════
     if has_visuals:
         doc.add_page_break()
-        doc.add_heading("5. Visual Analysis", level=1)
+        doc.add_heading(f"{section_numbers['Visual Analysis']}. Visual Analysis", level=1)
         from app.core.reports.infographic_engine import InfographicEngine
     
     if valuations:
         try:
-            doc.add_heading("5.1 Valuation Range Analysis (Football Field)", level=2)
+            doc.add_heading(f"{section_numbers.get('Visual Analysis', 5)}.1 Valuation Range Analysis (Football Field)", level=2)
             if isinstance(valuations, dict):
                 valuations = [{"method": k, **v} for k, v in valuations.items() if isinstance(v, dict)]
             
@@ -1884,7 +1899,7 @@ def generate_docx(
     metrics_fb = fact_base.get("metrics", {})
     if metrics_fb.get("historical_revenue"):
         try:
-            doc.add_heading("5.2 Financial Growth Trajectory", level=2)
+            doc.add_heading(f"{section_numbers.get('Visual Analysis', 5)}.2 Financial Growth Trajectory", level=2)
             rev_data = metrics_fb.get("historical_revenue", [])
             labels_wf = [r.get("year", f"Y{i}") for i, r in enumerate(rev_data)]
             values_wf = [r.get("amount", 0) for i, r in enumerate(rev_data)]
@@ -1902,7 +1917,7 @@ def generate_docx(
     #  REFERENCES / PROVENANCE
     # ═══════════════════════════════════════════
 
-    doc.add_heading("References and Provenance", level=1)
+    doc.add_heading(f"{section_numbers['References and Provenance']}. References and Provenance", level=1)
 
     evidence_sources = analyst_data.get("_evidence_brief", {}).get("sources", [])
     if evidence_sources:

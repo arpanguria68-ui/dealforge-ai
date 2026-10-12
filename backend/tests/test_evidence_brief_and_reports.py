@@ -248,7 +248,9 @@ def test_docx_omits_unavailable_risk_and_visual_sections_and_uncurated_raw_metri
 
     assert "Risk Matrix" not in text and "Risk Assessment" not in text
     assert "Visual Analytics Annex" not in text and "Visual Analysis" not in text
-    assert "900.0" not in text and "$900.0m" not in text
+    # Uncited agent figures may be shown for context, but never as established facts.
+    assert all("unverified" in line for line in text.splitlines() if "900.0" in line)
+    assert "$900.0m" not in text
 
 
 def test_cash_flow_points_without_citations_are_not_labeled_reported():
