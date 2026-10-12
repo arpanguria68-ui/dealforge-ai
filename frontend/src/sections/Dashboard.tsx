@@ -302,10 +302,13 @@ function DealDetailPanel({
         }
     };
 
-    const handleDownload = async (format: 'pdf' | 'pptx' | 'xlsx' | 'docx') => {
+    const handleDownload = async (format: 'pdf' | 'pptx' | 'xlsx' | 'docx', draft = false) => {
         try {
-            // Hit the new download endpoint
-            const res = await fetch(`${API_BASE}/api/v1/deals/${deal.id}/documents/${format}`, withAdminAuth());
+            // Hit the new download endpoint (draft=true: internal copy of a report not yet approved)
+            const res = await fetch(
+                `${API_BASE}/api/v1/deals/${deal.id}/documents/${format}${draft ? '?draft=true' : ''}`,
+                withAdminAuth(),
+            );
             
             // Fallback to old endpoint if 404 (optional, but new system is better)
             if (res.status === 404) {
@@ -799,7 +802,7 @@ function DealDetailPanel({
                                 size="sm" 
                                 className="w-full gap-2 shadow-lg shadow-primary/20"
                                 onClick={handleGenerate}
-                                disabled={isGenerating || deal.status !== 'completed' && deal.status !== 'ready'}
+                                disabled={isGenerating || !['completed', 'ready', 'needs_review'].includes(deal.status)}
                             >
                                 {isGenerating ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
                                 {isGenerating ? 'Generating Artifacts...' : docRequest.trim() ? 'Generate Document' : 'Generate All Reports'}
@@ -811,7 +814,7 @@ function DealDetailPanel({
                                 <div className="flex items-start justify-between gap-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
                                     <div>
                                         <p className="text-sm font-medium text-amber-700 dark:text-amber-400">Client delivery locked · review required</p>
-                                        <p className="text-xs text-muted-foreground">Downloads remain blocked until a reviewer attests to the evidence and caveats.</p>
+                                        <p className="text-xs text-muted-foreground">You can download a DRAFT of each file for internal review now. Client copies unlock after a reviewer approves.</p>
                                     </div>
                                     <Button size="sm" variant="outline" onClick={handleApproveReports}>Approve</Button>
                                 </div>
@@ -837,9 +840,8 @@ function DealDetailPanel({
                                             variant="ghost" 
                                             size="icon" 
                                             className="h-8 w-8 hover:bg-primary hover:text-white transition-colors"
-                                            onClick={() => handleDownload(doc.format)}
-                                            disabled={doc.release_status !== 'approved'}
-                                            title={doc.release_status !== 'approved' ? 'Reviewer approval required before download' : `Download ${doc.format.toUpperCase()}`}
+                                            onClick={() => handleDownload(doc.format, doc.release_status !== 'approved')}
+                                            title={doc.release_status !== 'approved' ? `Download ${doc.format.toUpperCase()} DRAFT (not approved for client release)` : `Download ${doc.format.toUpperCase()}`}
                                         >
                                             <Download className="h-4 w-4" />
                                         </Button>

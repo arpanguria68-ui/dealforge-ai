@@ -998,17 +998,20 @@ async def _load_report_inputs(deal_id: str):
     deal = await redis_store.get_deal(deal_id)
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
-    if deal.get("status") not in {"completed", "ready"}:
+    # needs_review = the run finished but some tasks failed or were blocked. Deliverables can still
+    # be built (marked as drafts); client release stays gated on reviewer approval.
+    if deal.get("status") not in {"completed", "ready", "needs_review"}:
         raise HTTPException(status_code=409, detail="Complete the analysis before generating deliverables.")
     from app.core.tasks.task_manager import get_task_manager
     from app.core.reports.document_planner import build_report_agent_results
 
     task_lists = await get_task_manager().get_lists_for_deal(deal_id)
     saved_tasks = [item for task_list in task_lists for item in task_list.items]
-    if task_lists and (
-        not any(item.status == "done" and isinstance(item.result, dict) for item in saved_tasks)
-        or any(item.status != "done" or not isinstance(item.result, dict) for item in saved_tasks)
-    ):
+    has_results = any(item.status == "done" and isinstance(item.result, dict) for item in saved_tasks)
+    all_finished = not any(item.status != "done" or not isinstance(item.result, dict) for item in saved_tasks)
+    # A needs_review run is allowed to have failed/blocked tasks (it still needs one real result);
+    # any other status must have every task finished.
+    if task_lists and (not has_results or not (all_finished or deal.get("status") == "needs_review")):
         raise HTTPException(
             status_code=409,
             detail="Saved analysis still has unfinished or unpersisted tasks; finish or review the run before generating deliverables.",
@@ -1445,7 +1448,9 @@ async def download_deal_bundle(deal_id: str, _: bool = Depends(require_admin_tok
 
 
 @app.get("/api/v1/deals/{deal_id}/documents/{fmt}")
-async def download_deal_document(deal_id: str, fmt: str, _: bool = Depends(require_admin_token)):
+async def download_deal_document(
+    deal_id: str, fmt: str, draft: bool = False, _: bool = Depends(require_admin_token)
+):
     """
     Download a single cached document by format (pdf, pptx, xlsx).
     Returns cached bytes instantly — no regeneration.
@@ -1471,14 +1476,20 @@ async def download_deal_document(deal_id: str, fmt: str, _: bool = Depends(requi
         )
 
     meta = await doc_store.get_document_meta(deal_id, fmt)
-    _require_approved_report(meta)
+    is_draft = bool(draft) and bool(meta) and (meta or {}).get("release_status") != "approved"
+    if not is_draft:
+        _require_approved_report(meta)
     safe_name = (meta or {}).get("safe_filename", "report")
-    filename = f"DealForge_{safe_name}.{fmt}"
+    # A draft is for internal review only: the name says so and the header lets clients detect it.
+    filename = f"DealForge_{safe_name}{'_DRAFT_not_approved' if is_draft else ''}.{fmt}"
+    headers = {**REPORT_DOWNLOAD_HEADERS, "Content-Disposition": f'attachment; filename="{filename}"'}
+    if is_draft:
+        headers["X-Release-Status"] = "draft-not-approved"
 
     return Response(
         content=content,
         media_type=DocumentStore.get_content_type(fmt),
-        headers={**REPORT_DOWNLOAD_HEADERS, "Content-Disposition": f'attachment; filename="{filename}"'},
+        headers=headers,
     )
 
 
