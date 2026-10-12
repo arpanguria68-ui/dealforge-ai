@@ -601,6 +601,8 @@ PROTOCOL
 - You may emit several blocks in one reply when the calls are independent.
 - After the results arrive, either call more tools or give your final answer in the format
   the task asks for. If the task needs no outside data, answer directly without a tool call.
+- If a tool returns an error, say which tool failed and that the data was not retrieved. Never
+  claim a source you did not call and never fill the gap from memory.
 """.format(
                 json.dumps([t.get("function") for t in tools], indent=2)
             )
