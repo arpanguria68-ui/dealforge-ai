@@ -4,8 +4,10 @@ An LLM judge cannot tell a sourced number from a fluent invented one, so this
 compares the figures written in a memo ($ amounts, percentages, multiples)
 with the numbers the agents actually produced, and flags data vendors the memo
 cites that appear nowhere in the evidence. Figures the memo derives itself
-(scenario IRRs, sensitivities) will legitimately be absent from the sources,
-so the result is a ratio and a list for review, not a pass/fail on each number.
+(scenario IRRs, implied multiples) are legitimately absent from the sources and are
+listed too: the result is a ratio and a list for review, not a pass/fail per number.
+A generic "is it a ratio of two evidence numbers" rule was tried and dropped: with
+dozens of numbers it excuses almost any invented figure.
 """
 
 import json
@@ -23,7 +25,7 @@ _UNIT_TO_MILLIONS = {"b": 1000.0, "bn": 1000.0, "billion": 1000.0,
 # Vendors/publishers an LLM tends to cite without having used them.
 _VENDORS = ("bloomberg", "capital iq", "factset", "gartner", "idc", "pitchbook",
             "refinitiv", "morningstar", "forrester")
-LOW_GROUNDING_RATIO = 0.5
+LOW_GROUNDING_RATIO = 0.7  # the memo's own implied ratios are not in the evidence, so not 1.0
 
 
 def _leaves(node: Any) -> Iterator[Any]:
@@ -37,8 +39,8 @@ def _leaves(node: Any) -> Iterator[Any]:
         yield node
 
 
-def _source_numbers(agent_results: List[Dict[str, Any]]) -> Set[float]:
-    """Every number in the evidence, in raw, thousands, millions and billions."""
+def _source_numbers(agent_results: List[Dict[str, Any]]) -> tuple:
+    """Evidence numbers: (as written, rescaled to thousands/millions/billions/percent)."""
     base: Set[float] = set()
     for result in agent_results or []:
         for leaf in _leaves(result.get("data") if isinstance(result, dict) else result):
@@ -57,12 +59,15 @@ def _source_numbers(agent_results: List[Dict[str, Any]]) -> Set[float]:
         for scale in (1.0, 1e3, 1e6, 1e9):
             variants.add(value / scale)
         variants.add(value * 100)  # 0.1272 stored, "12.72%" written
-    return variants
+    return base, variants
+
+
+def _close(figure: float, candidate: float) -> bool:
+    return abs(figure - candidate) <= max(0.011, abs(figure) * 0.005)  # rounding only
 
 
 def _matches(figure: float, sources: Set[float]) -> bool:
-    tolerance = max(0.011, abs(figure) * 0.005)  # rounding, not different numbers
-    return any(abs(figure - candidate) <= tolerance for candidate in sources)
+    return any(_close(figure, candidate) for candidate in sources)
 
 
 def _memo_figures(memo: str) -> List[Dict[str, Any]]:
@@ -86,9 +91,17 @@ def _memo_figures(memo: str) -> List[Dict[str, Any]]:
     return figures
 
 
-def check_memo_grounding(memo: str, agent_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Return how many memo figures are found in the agents' outputs."""
-    sources = _source_numbers(agent_results)
+def check_memo_grounding(
+    memo: str, agent_results: List[Dict[str, Any]], user_text: str = ""
+) -> Dict[str, Any]:
+    """Return how many memo figures are found in (or derive from) the agents' outputs.
+
+    ``user_text`` is the request itself: targets the user stated (a 20% IRR, 6x
+    leverage) are inputs, not claims the model made up.
+    """
+    _, sources = _source_numbers(agent_results)
+    if user_text:
+        sources |= {float(m.replace(",", "")) for m in _NUMBER.findall(user_text) if m.strip("-,.")}
     evidence_text = json.dumps(
         [r.get("data") if isinstance(r, dict) else r for r in agent_results or []],
         default=str,
@@ -99,7 +112,10 @@ def check_memo_grounding(memo: str, agent_results: List[Dict[str, Any]]) -> Dict
                 "grounded_ratio": 0.0, "ungrounded": [], "unsupported_sources": unsupported}
 
     figures = _memo_figures(memo or "")
-    ungrounded = [f["text"] for f in figures if not _matches(f["value"], sources)]
+    ungrounded = [
+        f["text"] for f in figures
+        if not _matches(f["value"], sources)
+    ]
     total = len(figures)
     grounded = total - len(ungrounded)
     ratio = round(grounded / total, 3) if total else 1.0
@@ -114,7 +130,7 @@ def grounding_notice(report: Dict[str, Any]) -> str:
     lines = ["", "---", "", "## Data provenance warning",
              f"{report['figures_grounded']} of {report['figures_total']} figures in this memo "
              "match the agents' recorded outputs; the rest were not found in the evidence "
-             "(they may be model-derived scenarios or unverified) and need review before use."]
+             "(they may be figures the memo computed itself, or unverified) and need review before use."]
     if report.get("ungrounded"):
         lines.append("Figures not found in the evidence: " + ", ".join(report["ungrounded"][:15]) + ".")
     if report.get("unsupported_sources"):

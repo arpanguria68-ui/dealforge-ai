@@ -58,3 +58,17 @@ def test_judge_accuracy_is_capped_by_grounding():
     assert ReflectionEngine._cap_accuracy_by_grounding({"accuracy": 0.96}, vendors)["accuracy"] == 0.6
     assert ReflectionEngine._cap_accuracy_by_grounding({"accuracy": 0.96}, {})["accuracy"] == 0.96
     assert "DETERMINISTIC CHECKS" in ReflectionEngine._grounding_prompt(low)
+
+
+def test_user_stated_targets_are_inputs_not_claims():
+    results = [{"agent": "a", "data": {"free_cash_flow": 39_321_000}}]
+    report = check_memo_grounding("A 20% IRR hurdle and 6x leverage on $39.3M FCF.", results,
+                                  user_text="assume 6x leverage and a 20% IRR target")
+    assert report["ungrounded"] == [] and report["status"] == "ok"
+
+
+def test_invented_figures_are_not_excused_by_coincidental_ratios():
+    # Many evidence numbers: a generic ratio rule would excuse nearly anything.
+    data = {f"n{i}": 100.0 * (i + 3) * 1.37 for i in range(60)}
+    report = check_memo_grounding("Net cash of $65M, retention 110%, gross margin 76%.", [{"agent": "a", "data": data}])
+    assert {"$65M", "110%", "76%"} <= set(report["ungrounded"]) and report["status"] == "low_grounding"

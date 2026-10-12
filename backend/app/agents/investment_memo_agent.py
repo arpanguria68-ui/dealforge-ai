@@ -150,7 +150,7 @@ RULES:
             content = result.get("content", "")
 
             # Deterministic check: do the memo's figures trace to agent outputs?
-            grounding = check_memo_grounding(content, agent_results)
+            grounding = check_memo_grounding(content, agent_results, str(context.get("user_prompt") or ""))
             if grounding["status"] == "low_grounding":
                 content += grounding_notice(grounding)
 
