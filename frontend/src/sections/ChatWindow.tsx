@@ -8,12 +8,15 @@ import {
     Download, ChevronRight, HelpCircle, Cpu, Cloud,
     ListChecks, CheckCircle2, Copy, Check, RotateCcw, Edit2,
     Zap, Sliders, Star, Globe, BookOpen, Database, ChevronDown, ChevronUp,
-    ThumbsUp, ThumbsDown, Quote
+    ThumbsUp, ThumbsDown, Square
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { CodeBlock } from '@/components/chat/CodeBlock';
 import { StarterPrompts } from '@/components/chat/EmptyState';
+import { CitationPill, SourceCards } from '@/components/chat/Sources';
+import { citationIndex, linkCitations, type SourceItem } from '@/lib/citations';
+import { ProvenanceBar } from '@/components/chat/Provenance';
 import { useDealForgeStore } from '@/lib/dealforge-store';
 import { API_BASE, withAdminAuth } from '@/lib/api-base';
 import { isDealAnalysisRequest } from '@/lib/chat-intent';
@@ -281,6 +284,32 @@ function normalizeCitations(raw: unknown): Citation[] {
             source: String(entry.source || entry.citation || entry.chunk_id || ''),
         };
     }).filter(c => c.label || c.source);
+}
+
+// Evidence behind an agent result: tool-call sources (SEC filings, vendor APIs) and the
+// valuation audit's data sources, so agent messages show what they were built from.
+function deriveEvidenceCitations(meta: Record<string, unknown> | undefined): Citation[] {
+    if (!meta) return [];
+    const out: Citation[] = [];
+    const seen = new Set<string>();
+    const add = (label: string, source: string) => {
+        const key = `${label}|${source}`;
+        if (!label || seen.has(key)) return;
+        seen.add(key);
+        out.push({ label, source });
+    };
+    const calls = Array.isArray(meta.calculations) ? meta.calculations as unknown[] : [];
+    for (const call of calls) {
+        const entry = call && typeof call === 'object' ? call as Record<string, unknown> : {};
+        const data = entry.data && typeof entry.data === 'object' ? entry.data as Record<string, unknown> : {};
+        const url = typeof data.source_url === 'string' ? data.source_url : '';
+        if (url) add(String(data.entity_name || data.source || entry.name || 'Source'), url);
+    }
+    const audit = meta.audit && typeof meta.audit === 'object' ? meta.audit as Record<string, unknown> : null;
+    if (audit && Array.isArray(audit.sources)) {
+        for (const src of audit.sources) if (typeof src === 'string') add(src, '');
+    }
+    return out.slice(0, 8);
 }
 
 function extractCompanyName(text: string): string {
@@ -693,6 +722,9 @@ export function ChatWindow() {
     const [activeDealId, setActiveDealId] = useState<string | null>(activeConv?.dealId || null);
     const [dealCompleted, setDealCompleted] = useState(false);
     const completedResultsRef = useRef<AgentResult[]>([]);
+    // Stop button: cancels in-flight requests and skips the remaining work.
+    const abortRef = useRef<AbortController | null>(null);
+    const stopRequestedRef = useRef(false);
     const taskListRef = useRef<TaskPlanItem[]>([]);
     const [collapsedAgents, setCollapsedAgents] = useState<Record<string, boolean>>({});
     const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
@@ -969,6 +1001,8 @@ export function ChatWindow() {
         setInput('');
         setFollowUps([]);
         setCollapsedAgents({});
+        stopRequestedRef.current = false;
+        abortRef.current = new AbortController();
         setPhase('brainstorming');
 
         const lastAgentMsg = messages.slice().reverse().find(m => m.role === 'agent' || m.role === 'assistant');
@@ -1052,6 +1086,7 @@ export function ChatWindow() {
                 });
                 try {
                     const response = await fetch(`${API_BASE}/api/v1/chat/respond`, {
+                    signal: abortRef.current?.signal,
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -1103,6 +1138,7 @@ export function ChatWindow() {
                 });
 
                 const clarifyRes = await fetch(`${API_BASE}/api/v1/chat/clarify`, {
+                    signal: abortRef.current?.signal,
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         prompt: currentPrompt,
@@ -1205,6 +1241,7 @@ export function ChatWindow() {
             let planRecovered = false;
             try {
                 planRes = await fetch(`${API_BASE}/api/v1/chat/plan`, {
+                    signal: abortRef.current?.signal,
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         prompt: currentPrompt, deal_id: dealId,
@@ -1397,6 +1434,7 @@ export function ChatWindow() {
 
             const taskOutcomes = new Map<string, 'done' | 'blocked'>();
             for (const taskWave of executionWaves) {
+                if (stopRequestedRef.current) break;
                 const priorOutputs: Record<string, unknown> = {};
                 for (const result of completedResults) {
                     if (result._agent_type && result.data) priorOutputs[result._agent_type] = result.data;
@@ -1429,6 +1467,7 @@ export function ChatWindow() {
                   try {
                     await new Promise(resolve => setTimeout(resolve, 500));
                     const taskRes = await fetch(`${API_BASE}/api/v1/chat/execute-task`, {
+                    signal: abortRef.current?.signal,
                         method: 'POST', headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             agent_type: task.assigned_agent, task: task.description,
@@ -1603,6 +1642,12 @@ export function ChatWindow() {
                 ).catch(() => { });
             }
 
+            if (stopRequestedRef.current) {
+                addMessage({ role: 'system', content: 'Stopped. Results from agents that already finished are kept above.' });
+                setPhase('idle');
+                return;
+            }
+
             // ─── Synthesis (Perplexity-style) ───
             setPhase('synthesizing');
             const companyName = extractCompanyName(userText);
@@ -1624,6 +1669,11 @@ export function ChatWindow() {
             setFollowUps(suggestions);
 
         } catch (err) {
+            if (stopRequestedRef.current || (err instanceof DOMException && err.name === 'AbortError')) {
+                addMessage({ role: 'system', content: 'Stopped. Anything already completed is kept above.' });
+                setPhase('idle');
+                return;
+            }
             addMessage({
                 role: 'system',
                 content: `❌ Error: ${err instanceof Error ? err.message : 'Connection failed'}. Make sure the backend is running.`,
@@ -1690,6 +1740,12 @@ export function ChatWindow() {
 
     const handleRegenerate = (msg: Message) => handleSend(msg.content, true);
 
+    const handleStop = () => {
+        stopRequestedRef.current = true;
+        abortRef.current?.abort();
+        approvalRequest?.resolve(false);
+    };
+
     // Handle rating agent output (thumbs up/down) — selection persists per action
     const handleRateOutput = async (actionId: number | undefined, rating: number) => {
         if (!actionId) return;
@@ -1712,7 +1768,8 @@ export function ChatWindow() {
 
     // ─── Markdown renderer ───
 
-    function renderMarkdown(text: string) {
+    function renderMarkdown(text: string, cite?: { msgId: string; items: SourceItem[] }) {
+        const source = cite ? linkCitations(text, cite.items.length) : text;
         return (
             <ReactMarkdown
                 remarkPlugins={[remarkGfm]}
@@ -1743,10 +1800,14 @@ export function ChatWindow() {
                     th: ({ children }) => <th className="border border-white/10 px-2 py-1 bg-white/5 font-semibold text-left text-white/80">{children}</th>,
                     td: ({ children }) => <td className="border border-white/10 px-2 py-1 text-white/70">{children}</td>,
                     blockquote: ({ children }) => <blockquote className="border-l-4 border-cyan-500/30 pl-3 italic text-white/50 my-2">{children}</blockquote>,
-                    a: ({ href, children }) => <a href={href} className="text-cyan-400 underline hover:text-cyan-300" target="_blank" rel="noreferrer">{children}</a>,
+                    a: ({ href, children }) => {
+                        const n = cite ? citationIndex(href) : null;
+                        if (cite && n) return <CitationPill n={n} msgId={cite.msgId} item={cite.items[n - 1]} />;
+                        return <a href={href} className="text-cyan-400 underline hover:text-cyan-300" target="_blank" rel="noreferrer">{children}</a>;
+                    },
                 }}
             >
-                {text}
+                {source}
             </ReactMarkdown>
         );
     }
@@ -1764,6 +1825,11 @@ export function ChatWindow() {
         const agentStyle = AGENT_STYLES[agentKey] || AGENT_STYLES.system;
         const AgentIcon = agentStyle.icon;
         const isEditing = editingMsgId === msg.id;
+        // A 'thinking' message with nothing running is left over from an interrupted run.
+        const isLive = msg.status === 'thinking' && isProcessing;
+        const isStale = msg.status === 'thinking' && !isProcessing;
+        const explicitCites = normalizeCitations(msg.metadata?.citations);
+        const messageCites = explicitCites.length ? explicitCites : deriveEvidenceCitations(msg.metadata);
         const sourcePrompt = messages.find(message => message.role === 'user')?.content || '';
         const conversationCompany = sourcePrompt ? extractCompanyName(sourcePrompt) : 'Target Company';
         const isSummaryMessage = msg.metadata?._isSynthesis || msg.agentName === 'DealForge Summary';
@@ -1830,7 +1896,10 @@ export function ChatWindow() {
                         <div className="flex items-center justify-between w-full mb-1.5">
                             <div className="flex items-center gap-2">
                                 <span className="text-xs font-semibold text-white/60">{msg.agentName}</span>
-                            {msg.status === 'thinking' && (
+                            {isStale && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-300 font-medium">Interrupted</span>
+                            )}
+                            {isLive && (
                                 <span className="flex items-center gap-1 text-xs text-violet-400">
                                     <Loader2 className="h-3 w-3 animate-spin" />
                                     <span>Thinking<AnimatedDots /></span>
@@ -1912,8 +1981,8 @@ export function ChatWindow() {
                             ${isUser
                                 ? 'bg-gradient-to-r from-indigo-600/80 to-purple-600/80 text-white rounded-br-md border border-indigo-500/20 shadow-lg shadow-indigo-500/10'
                                 : 'bg-white/[0.04] backdrop-blur-sm rounded-bl-md border border-white/[0.06] text-white/80 hover:border-white/10'
-                            } ${msg.status === 'thinking' ? 'animate-pulse' : ''}`}>
-                            {renderMarkdown(displayedContent)}
+                            } ${isLive ? 'animate-pulse' : ''}`}>
+                            {renderMarkdown(displayedContent, messageCites.length ? { msgId: msg.id, items: messageCites } : undefined)}
                             
                             {/* Scrum Master QA Controls (Tier 1 Enhancement) */}
                             {msg.metadata?.pending_clarification === true && (
@@ -1981,13 +2050,12 @@ export function ChatWindow() {
                     )}
 
 
-                    {/* Sources / citations (RAG v2) + confidence */}
+                    {/* Sources (numbered cards the inline [n] pills point at), verification, confidence */}
                     {!isUser && !isEditing && (() => {
-                        const cites = normalizeCitations(msg.metadata?.citations);
                         const conf = isUncalibratedSourceReport
                             ? undefined
                             : msg.metadata?.confidence;
-                        if (cites.length === 0 && typeof conf !== 'number') return null;
+                        if (messageCites.length === 0 && typeof conf !== 'number' && !msg.metadata?.grounding && !msg.metadata?.audit) return null;
                         return (
                             <div className="mt-2 w-full space-y-1.5">
                                 {typeof conf === 'number' && (
@@ -1996,25 +2064,8 @@ export function ChatWindow() {
                                         Confidence {Math.round(conf * 100)}%
                                     </span>
                                 )}
-                                {cites.length > 0 && (
-                                    <details className="rounded-xl border border-white/[0.06] bg-white/[0.02] overflow-hidden">
-                                        <summary className="flex items-center gap-1.5 px-3 py-2 text-[11px] font-medium text-white/50 hover:text-white/80 cursor-pointer list-none">
-                                            <Quote className="h-3 w-3 text-cyan-400" />
-                                            Sources ({cites.length})
-                                        </summary>
-                                        <ul className="px-3 pb-2.5 space-y-1.5">
-                                            {cites.map((c, i) => (
-                                                <li key={i} className="flex items-start gap-1.5 text-[11px] leading-relaxed text-white/60">
-                                                    <span className="flex-shrink-0 w-4 h-4 rounded bg-cyan-500/15 text-cyan-400 text-[9px] font-bold flex items-center justify-center mt-0.5">{i + 1}</span>
-                                                    <span>
-                                                        <span className="font-semibold text-white/75">{c.label}</span>
-                                                        {c.source && <span className="text-white/40"> — {c.source}</span>}
-                                                    </span>
-                                                </li>
-                                            ))}
-                                        </ul>
-                                    </details>
-                                )}
+                                <SourceCards items={messageCites} msgId={msg.id} />
+                                <ProvenanceBar data={msg.metadata} />
                             </div>
                         );
                     })()}
@@ -2200,17 +2251,28 @@ export function ChatWindow() {
                             disabled={isProcessing}
                         />
 
-                        {/* Send button inside textarea */}
-                        <button
-                            onClick={() => handleSend()}
-                            aria-label={isProcessing ? 'Working' : 'Send message'}
-                            disabled={isProcessing || (!input.trim() && uploadedFiles.length === 0)}
-                            className="absolute right-3 bottom-3 w-8 h-8 rounded-lg flex items-center justify-center transition-all duration-200
-                                disabled:opacity-30 disabled:cursor-not-allowed
-                                bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white shadow-lg shadow-cyan-500/20"
-                        >
-                            {isProcessing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-                        </button>
+                        {/* Send / Stop */}
+                        {isProcessing ? (
+                            <button
+                                onClick={handleStop}
+                                aria-label="Stop generating"
+                                title="Stop"
+                                className="absolute right-3 bottom-3 w-8 h-8 rounded-lg flex items-center justify-center transition-all duration-200 bg-white/10 hover:bg-white/20 text-white border border-white/15"
+                            >
+                                <Square className="h-3.5 w-3.5 fill-current" />
+                            </button>
+                        ) : (
+                            <button
+                                onClick={() => handleSend()}
+                                aria-label="Send message"
+                                disabled={!input.trim() && uploadedFiles.length === 0}
+                                className="absolute right-3 bottom-3 w-8 h-8 rounded-lg flex items-center justify-center transition-all duration-200
+                                    disabled:opacity-30 disabled:cursor-not-allowed
+                                    bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white shadow-lg shadow-cyan-500/20"
+                            >
+                                <Send className="h-4 w-4" />
+                            </button>
+                        )}
                     </div>
 
                     {/* Toolbar Row */}
