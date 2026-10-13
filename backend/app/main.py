@@ -3472,7 +3472,9 @@ async def chat_execute_task(request: Request):
     # Fallback to todo_list metadata if ticker is missing, or if all we have is
     # a company-name hint (not a symbol) and the approved plan stored the real one.
     deal_id = body.get("deal_id")
-    _is_symbol = lambda t: bool(re.fullmatch(r"[A-Z][A-Z.\-]{0,5}", str(t or "").strip()))  # noqa: E731
+    from app.core.valuation_inputs import normalize_ticker
+
+    _is_symbol = lambda t: bool(normalize_ticker(t))  # noqa: E731
     if (not ticker or not _is_symbol(ticker)) and deal_id:
         tm = get_task_manager()
         lists = await tm.get_lists_for_deal(deal_id)
@@ -3480,7 +3482,7 @@ async def chat_execute_task(request: Request):
             # Use the most recent list
             latest_list = sorted(lists, key=lambda x: x.created_at, reverse=True)[0]
             if not ticker or _is_symbol(latest_list.ticker):
-                ticker = latest_list.ticker or ticker
+                ticker = normalize_ticker(latest_list.ticker) or latest_list.ticker or ticker
             if not company_name:
                 company_name = latest_list.company_name
 

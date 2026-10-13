@@ -1757,7 +1757,9 @@ class ValuationAgent(BaseAgent):
         financial_data = {**derived["financial_data"], **(financial_data or {})}
         market_data = {**derived["market_data"], **(market_data or {})}
         audit: Dict[str, Any] = {"assumptions": [], "sources": [], "missing": []}
-        ticker = str((context or {}).get("ticker") or "").strip().upper()
+        from app.core.valuation_inputs import normalize_ticker
+
+        ticker = normalize_ticker((context or {}).get("ticker"))
         needs_market = not (
             financial_data.get("wacc")
             and financial_data.get("projected_cash_flows")

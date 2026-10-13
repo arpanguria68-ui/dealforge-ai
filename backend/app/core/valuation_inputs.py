@@ -19,6 +19,16 @@ import re
 from statistics import median
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional
 
+_SYMBOL = re.compile(r"[A-Z][A-Z.\-]{0,5}")
+
+
+def normalize_ticker(value: Any) -> str:
+    """"NASDAQ: SPT", "(NYSE:SPT)", "spt" -> "SPT"; "" when the value is not a ticker symbol."""
+    text = re.sub(r"[()\s]", "", str(value or "")).upper()
+    text = re.sub(r"^[A-Z]+:", "", text)  # drop an exchange prefix
+    return text if _SYMBOL.fullmatch(text) else ""
+
+
 _MULTIPLE_KEYS = ("ev_revenue_multiple", "ev_revenue", "ev_to_revenue")
 MAX_PEERS = 6
 MAX_SANE_EV_REVENUE = 30.0  # drops data errors / hyper-valuation outliers

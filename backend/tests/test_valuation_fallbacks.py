@@ -57,3 +57,12 @@ def test_a_failed_filing_fetch_changes_nothing():
     financial, audit = {}, {"sources": [], "assumptions": [], "missing": []}
     asyncio.run(agent._fill_from_filings(financial, "SPT", audit))
     assert financial == {} and audit["sources"] == []
+
+
+def test_exchange_prefixed_and_decorated_tickers_are_normalised():
+    from app.core.valuation_inputs import normalize_ticker
+
+    assert normalize_ticker("NASDAQ: SPT") == "SPT"
+    assert normalize_ticker("(NYSE:BRK.B)") == "BRK.B"
+    assert normalize_ticker(" spt ") == "SPT"
+    assert normalize_ticker("Sprout Social") == "" and normalize_ticker(None) == "" and normalize_ticker("") == ""
