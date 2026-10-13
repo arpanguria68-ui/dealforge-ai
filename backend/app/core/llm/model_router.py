@@ -63,7 +63,7 @@ TASK_TYPE_ROUTING = {
 }
 
 # Cloud providers that can serve as fallback
-CLOUD_PROVIDERS = {"gemini", "vertex", "openai", "openrouter", "mistral", "nvidia", "claude", "groq"}
+CLOUD_PROVIDERS = {"gemini", "vertex", "openai", "openrouter", "mistral", "nvidia", "claude", "groq", "custom_endpoint"}
 LOCAL_PROVIDERS = {"ollama", "lmstudio"}
 
 
@@ -108,6 +108,7 @@ _PROVIDER_MODEL_SETTINGS = {
     "vertex": ("vertex_model", "VERTEX_MODEL"),
     "claude": ("anthropic_model", "ANTHROPIC_MODEL"),
     "groq": ("groq_model", "GROQ_MODEL"),
+    "custom_endpoint": ("custom_endpoint_model", "CUSTOM_ENDPOINT_MODEL"),
 }
 
 
@@ -138,6 +139,7 @@ _PROVIDER_KEY_HINTS = {
     "vertex": ("vertex_api_key", "VERTEX_API_KEY"),
     "claude": ("anthropic_api_key", "ANTHROPIC_API_KEY"),
     "groq": ("groq_api_key", "GROQ_API_KEY"),
+    "custom_endpoint": ("custom_endpoint_api_key", "CUSTOM_ENDPOINT_API_KEY"),
 }
 
 
@@ -378,6 +380,13 @@ class ModelRouter:
         """True if a cloud provider has an API key in settings or env."""
         if provider in LOCAL_PROVIDERS:
             return True
+        if provider == "custom_endpoint":
+            # Usable when a URL and model are set; the key is optional for local proxies.
+            settings = SettingsService.get_instance()
+            return bool(
+                str(settings.get("custom_endpoint_base_url", "") or "").strip()
+                and str(settings.get("custom_endpoint_model", "") or "").strip()
+            )
         hints = _PROVIDER_KEY_HINTS.get(provider)
         if not hints:
             return True
@@ -465,6 +474,11 @@ class ModelRouter:
                 return await self.get_provider_with_fallback(agent_name, est_tokens)
 
             assigned = self.get_provider_for_agent(agent_name)
+
+            # A custom endpoint assignment is an explicit operator choice: keep it pinned
+            # instead of switching providers by task complexity.
+            if assigned == "custom_endpoint":
+                return assigned, False
 
             if tier == "simple":
                 for local in [assigned] if assigned in LOCAL_PROVIDERS else []:

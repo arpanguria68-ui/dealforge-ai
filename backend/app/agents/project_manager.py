@@ -131,7 +131,8 @@ def wire_stage_dependencies(items: List[Any]) -> None:
     curator_agent_ids = ids_by_agent.get("data_curator", []) + ids_by_agent.get("data_curator_agent", [])
     # Data-curator tasks can either gather source inputs or synthesize completed
     # analyses. Only the latter belong at the end of the dependency graph.
-    collection_terms = ("collect", "collection", "gather", "fetch", "retrieve", "ingest")
+    # Stems, so "retrieval" / "gathering" / "extraction" count like the verb forms.
+    collection_terms = ("collect", "gather", "fetch", "retriev", "ingest", "pull", "extract", "acquisition of data")
     source_terms = (
         "financial data", "financial statement", "financial records", "source data",
         "financial metrics", "market data", "share price", "market cap", "comparable compan",

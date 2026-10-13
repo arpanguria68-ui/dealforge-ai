@@ -15,6 +15,7 @@ reader can audit and override it. Nothing is silently invented: if a required
 observed input is missing the method is skipped and listed in ``missing``.
 """
 
+import re
 from statistics import median
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional
 
@@ -60,16 +61,87 @@ def _first_number(outputs: Dict[str, Any], keys: tuple) -> Optional[float]:
     return None
 
 
+_MONEY_KEYS = frozenset({
+    "revenue", "annual_revenue", "free_cash_flow", "operating_cash_flow", "operating_income", "net_income",
+    "ebitda", "gross_profit", "capital_expenditures", "cash", "long_term_debt", "total_debt",
+})
+
+
+def _unit_scale(hint: Any) -> float:
+    text = str(hint or "").lower()
+    if "billion" in text or re.search(r"bn|\$b|usd_b", text):
+        return 1e9
+    if "million" in text or re.search(r"mm|\$m|usd_m|m", text):
+        return 1e6
+    if "thousand" in text or re.search(r"\$k|usd_k", text):
+        return 1e3
+    return 1.0
+
+
+def normalize_units(node: Any, scale: float = 1.0) -> Any:
+    """Copy with money figures converted to raw dollars where a ``unit`` says millions etc.
+
+    Agents often write ``{"unit": "millions USD", "years": [{"revenue": 405}]}``; reading
+    405 as dollars would make every downstream valuation off by a million.
+    """
+    if isinstance(node, list):
+        return [normalize_units(item, scale) for item in node]
+    if not isinstance(node, dict):
+        return node
+    own = None
+    for key in ("unit", "units", "currency_unit"):
+        if isinstance(node.get(key), str):
+            own = _unit_scale(node[key])
+    local = own if own and own != 1.0 else scale
+    out: Dict[str, Any] = {}
+    for key, value in node.items():
+        lowered = str(key).lower()
+        key_scale = local
+        if lowered.endswith(("_m", "_millions", "_usd_m")):
+            key_scale = 1e6
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and (
+            lowered in _MONEY_KEYS or lowered.rstrip("m_") in _MONEY_KEYS
+        ) and key_scale != 1.0:
+            out[key] = float(value) * key_scale
+        else:
+            out[key] = normalize_units(value, local)
+    return out
+
+
+def _latest_year_value(outputs: Dict[str, Any], key: str) -> Optional[float]:
+    """Newest fiscal-year value of ``key`` from year-by-year records (FY2025 beats FY2024)."""
+    best: Optional[tuple] = None
+    for data in outputs.values():
+        stack = [data]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                year = node.get("fiscal_year") or node.get("year")
+                number = _num(node.get(key))
+                digits = re.search(r"\d{4}", str(year)) if year is not None else None
+                if number is not None and digits:
+                    candidate = (int(digits.group(0)), number)
+                    if best is None or candidate[0] > best[0]:
+                        best = candidate
+                stack.extend(v for v in node.values() if isinstance(v, (dict, list)))
+            elif isinstance(node, list):
+                stack.extend(node)
+    return best[1] if best else None
+
+
 def derive_valuation_inputs(prior_outputs: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """Map earlier agents' explicit outputs to ``financial_data``/``market_data``."""
-    outputs = {k: v for k, v in (prior_outputs or {}).items() if isinstance(v, dict)}
+    outputs = {k: normalize_units(v) for k, v in (prior_outputs or {}).items() if isinstance(v, dict)}
     financial: Dict[str, Any] = {}
     market: Dict[str, Any] = {}
 
-    revenue = _first_number(outputs, ("annual_revenue",))
+    revenue = _first_number(outputs, ("annual_revenue",)) or _latest_year_value(outputs, "revenue")
     if revenue:
         financial["revenue"] = revenue
     fcf = _first_number(outputs, ("free_cash_flow",))
+    latest_fcf = _latest_year_value(outputs, "free_cash_flow")
+    if latest_fcf is not None:
+        fcf = latest_fcf  # the newest fiscal year, not whichever entry came first
     if fcf is not None:
         financial["free_cash_flow"] = fcf
     for data in outputs.values():

@@ -89,6 +89,7 @@ class Settings(BaseSettings):
     # Agent Settings
     MAX_AGENT_ITERATIONS: int = 10
     AGENT_TIMEOUT_SECONDS: int = 180
+    CUSTOM_ENDPOINT_TIMEOUT_SECONDS: int = 155
     AGENT_MODEL_MAP: Optional[str] = None
 
     # Deal Scoring

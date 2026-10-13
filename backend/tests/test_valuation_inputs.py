@@ -120,3 +120,33 @@ def test_curator_gathering_market_metrics_runs_before_modeling():
     assert items[0].depends_on == []          # data collection first
     assert "d" in items[1].depends_on         # modeling waits for data
     assert set(items[2].depends_on) == {"d", "v"}
+
+
+def test_curator_retrieval_wording_still_counts_as_data_collection():
+    from types import SimpleNamespace as NS
+    from app.agents.project_manager import wire_stage_dependencies
+
+    for title in ("Historical Financials and Market Data Retrieval", "Extraction of Filings", "Pull share price and peers"):
+        items = [
+            NS(id="d", assigned_agent="data_curator", depends_on=[], title=title,
+               description="Historical financials, share price and market data for the target."),
+            NS(id="v", assigned_agent="valuation_agent", depends_on=[], title="DCF", description="Build DCF"),
+        ]
+        wire_stage_dependencies(items)
+        assert items[0].depends_on == [] and "d" in items[1].depends_on, title
+
+
+def test_figures_reported_in_millions_are_converted_to_dollars():
+    prior = {"data_curator": {"curated_deal_metrics": {"historical_financials": {
+        "unit": "millions USD",
+        "years": [{"fiscal_year": 2023, "revenue": 331, "free_cash_flow": 15},
+                  {"fiscal_year": 2024, "revenue": 405, "free_cash_flow": 26},
+                  {"fiscal_year": 2022, "revenue": 254, "free_cash_flow": 8}]}}}}
+    fin = derive_valuation_inputs(prior)["financial_data"]
+    assert fin["revenue"] == 405_000_000 and fin["free_cash_flow"] == 26_000_000   # latest year, in dollars
+
+
+def test_dollar_figures_are_left_alone_and_unit_hints_do_not_leak():
+    prior = {"financial_analyst": {"revenue_analysis": {"annual_revenue": 457_547_000}},
+             "other": {"unit": "millions", "notes": {"revenue": 5}}}
+    assert derive_valuation_inputs(prior)["financial_data"]["revenue"] == 457_547_000

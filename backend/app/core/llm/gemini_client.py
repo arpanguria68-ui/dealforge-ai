@@ -291,17 +291,32 @@ Respond ONLY with the JSON, no other text.
 class OpenAIClient:
     """Client for OpenAI API (GPT-4, Codex)"""
 
-    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        provider: str = "openai",
+    ):
         from openai import AsyncOpenAI
 
         settings = get_settings()
-        self.client = AsyncOpenAI(
-            api_key=api_key or settings.OPENAI_API_KEY,
-            timeout=60.0,
-            max_retries=0,
-        )
+        request_timeout = 60.0
+        if provider == "custom_endpoint":
+            # A proxy in front of a chat product can be slow; stay inside the agent deadline.
+            configured_timeout = max(30.0, float(getattr(settings, "CUSTOM_ENDPOINT_TIMEOUT_SECONDS", 155)))
+            agent_timeout = max(30.0, float(getattr(settings, "AGENT_TIMEOUT_SECONDS", 180)))
+            request_timeout = min(configured_timeout, agent_timeout - 25.0)
+        options = {
+            "api_key": api_key or ("local-endpoint" if provider == "custom_endpoint" else settings.OPENAI_API_KEY),
+            "timeout": request_timeout,
+            "max_retries": 0,
+        }
+        if base_url:
+            options["base_url"] = base_url.rstrip("/")
+        self.client = AsyncOpenAI(**options)
         self.model = model or settings.OPENAI_MODEL
-        self.provider = "openai"
+        self.provider = provider
         self.max_context = 128000
 
     async def generate(

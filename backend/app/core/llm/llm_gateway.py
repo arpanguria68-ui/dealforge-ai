@@ -239,6 +239,7 @@ DEFAULT_VENDOR_LIMITS = {
     ),  # Default to Flash limits
     "openai": VendorLimits(max_rpm=50, max_tpm=150_000, max_rpd=8_000),
     "openrouter": VendorLimits(max_rpm=50, max_tpm=200_000, max_rpd=10_000),
+    "custom_endpoint": VendorLimits(max_rpm=60, max_tpm=500_000, max_rpd=10_000),
     "mistral": VendorLimits(max_rpm=5, max_tpm=400_000, max_rpd=4_000),
     "ollama": VendorLimits(max_rpm=999, max_tpm=999_999, max_rpd=999_999),
     "lmstudio": VendorLimits(max_rpm=999, max_tpm=999_999, max_rpd=999_999),
@@ -478,7 +479,12 @@ class LLMGateway:
         result = None
         failures = []
         try:
-            candidate = await exponential_backoff_retry(do_call)
+            # The custom proxy does its own bounded retry; repeating would overrun the agent deadline.
+            candidate = (
+                await do_call()
+                if actual_provider == "custom_endpoint"
+                else await exponential_backoff_retry(do_call)
+            )
             if not has_output(candidate):
                 raise ValueError("Provider returned an empty completion")
             result = candidate
@@ -500,8 +506,9 @@ class LLMGateway:
             )
             failures.append({"provider": actual_provider, "reason": failure_reason(e)})
             if not allow_fallback:
+                provider_label = "Custom endpoint" if actual_provider == "custom_endpoint" else "Local provider"
                 raise RuntimeError(
-                    f"Local provider {actual_provider} failed ({failure_reason(e)}); fallback is disabled for this request."
+                    f"{provider_label} {actual_provider} failed ({failure_reason(e)}); fallback is disabled for this request."
                 ) from e
             # Walk the full fallback chain (not just ollama)
             for fallback_provider in self._fallback_candidates(actual_provider, est_total):
