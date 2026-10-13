@@ -956,7 +956,7 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
 
             <div className="flex items-center justify-between">
                 <div className="flex flex-col space-y-1">
-                    <h2 className="text-3xl font-bold tracking-tight bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent dark:from-blue-400 dark:to-indigo-400">
+                    <h2 className="text-2xl font-semibold tracking-tight text-foreground">
                         Overview
                     </h2>
                     <p className="text-muted-foreground text-sm">
@@ -986,7 +986,7 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
 
             {/* KPI Cards */}
             <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-                <Card className="hover:shadow-md transition-all duration-200">
+                <Card className="transition-shadow hover:shadow-fluent">
                     <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                         <CardTitle className="text-sm font-medium">Active Deals</CardTitle>
                         <Briefcase className="h-4 w-4 text-blue-500" />
@@ -1001,7 +1001,7 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
                     </CardContent>
                 </Card>
 
-                <Card className="hover:shadow-md transition-all duration-200">
+                <Card className="transition-shadow hover:shadow-fluent">
                     <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                         <CardTitle className="text-sm font-medium">Mean Agent Score</CardTitle>
                         <Target className="h-4 w-4 text-green-500" />
@@ -1014,7 +1014,7 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
                     </CardContent>
                 </Card>
 
-                <Card className="hover:shadow-md transition-all duration-200">
+                <Card className="transition-shadow hover:shadow-fluent">
                     <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                         <CardTitle className="text-sm font-medium">Needs Review</CardTitle>
                         <AlertTriangle className="h-4 w-4 text-red-500" />
@@ -1027,7 +1027,7 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
                     </CardContent>
                 </Card>
 
-                <Card className="hover:shadow-md transition-all duration-200">
+                <Card className="transition-shadow hover:shadow-fluent">
                     <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                         <CardTitle className="text-sm font-medium">Completed</CardTitle>
                         <CheckCircle className="h-4 w-4 text-amber-500" />
@@ -1071,7 +1071,7 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
                                             <XAxis dataKey="name" tick={{ fontSize: 10 }} />
                                             <YAxis tick={{ fontSize: 10 }} />
                                             <Tooltip formatter={(v: number, n: string) => [`$${v}M`, n === 'weighted' ? 'Weighted valuation' : 'Market EV']} contentStyle={{ fontSize: 12 }} />
-                                            <Bar dataKey="weighted" fill="#6366f1" radius={[4, 4, 0, 0]} />
+                                            <Bar dataKey="weighted" fill="#0f6cbd" radius={[4, 4, 0, 0]} />
                                             <Bar dataKey="market" fill="#94a3b8" radius={[4, 4, 0, 0]} />
                                         </BarChart>
                                     </ResponsiveContainer>
@@ -1109,7 +1109,7 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
                                     <XAxis type="number" tick={{ fontSize: 10 }} allowDecimals={false} />
                                     <YAxis type="category" dataKey="name" tick={{ fontSize: 9 }} width={100} />
                                     <Tooltip formatter={(v: number) => [v, 'Runs']} contentStyle={{ fontSize: 12 }} />
-                                    <Bar dataKey="count" fill="#6366f1" radius={[0, 4, 4, 0]} />
+                                    <Bar dataKey="count" fill="#0f6cbd" radius={[0, 4, 4, 0]} />
                                 </BarChart>
                             </ResponsiveContainer>
                         </CardContent>
@@ -1119,7 +1119,7 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
 
             <div className="grid gap-4 md:grid-cols-7">
                 {/* Deal List */}
-                <Card className="col-span-4 md:col-span-5 hover:shadow-lg transition-all duration-300 border-t-4 border-t-primary">
+                <Card className="col-span-4 md:col-span-5 transition-shadow hover:shadow-fluent">
                     <CardHeader className="pb-3">
                         <div className="flex items-center justify-between">
                             <div>

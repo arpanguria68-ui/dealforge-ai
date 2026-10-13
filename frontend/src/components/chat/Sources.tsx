@@ -26,7 +26,7 @@ export function CitationPill({ n, msgId, item }: { n: number; msgId: string; ite
             onClick={jump}
             title={item ? `${item.label}${item.source ? ` — ${item.source}` : ''}` : `Source ${n}`}
             aria-label={`Source ${n}${item ? `: ${item.label}` : ''}`}
-            className="mx-0.5 inline-flex h-4 min-w-4 -translate-y-0.5 items-center justify-center rounded bg-cyan-500/15 px-1 align-baseline text-[10px] font-semibold text-cyan-300 transition-colors hover:bg-cyan-500/30 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400"
+            className="mx-0.5 inline-flex h-4 min-w-4 -translate-y-0.5 items-center justify-center rounded bg-cyan-500/15 px-1 align-baseline text-[10px] font-semibold text-cyan-700 transition-colors hover:bg-cyan-500/30 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400"
         >
             {n}
         </button>
@@ -37,9 +37,9 @@ export function CitationPill({ n, msgId, item }: { n: number; msgId: string; ite
 export function SourceCards({ items, msgId }: { items: SourceItem[]; msgId: string }) {
     if (items.length === 0) return null;
     return (
-        <details open className="rounded-xl border border-white/[0.06] bg-white/[0.02] overflow-hidden">
-            <summary className="flex cursor-pointer list-none items-center gap-1.5 px-3 py-2 text-[11px] font-medium text-white/50 hover:text-white/80">
-                <Quote className="h-3 w-3 text-cyan-400" />
+        <details open className="rounded-xl border border-border bg-muted/60 overflow-hidden">
+            <summary className="flex cursor-pointer list-none items-center gap-1.5 px-3 py-2 text-[11px] font-medium text-muted-foreground hover:text-foreground">
+                <Quote className="h-3 w-3 text-cyan-700" />
                 Sources ({items.length})
             </summary>
             <ol className="grid gap-2 px-3 pb-3 sm:grid-cols-2">
@@ -49,15 +49,15 @@ export function SourceCards({ items, msgId }: { items: SourceItem[]; msgId: stri
                         <li
                             key={i}
                             id={sourceDomId(msgId, i + 1)}
-                            className="flex items-start gap-2 rounded-lg border border-white/[0.06] bg-white/[0.03] p-2.5 text-[11px] leading-relaxed text-white/60 transition-shadow"
+                            className="flex items-start gap-2 rounded-lg border border-border bg-muted/60 p-2.5 text-[11px] leading-relaxed text-muted-foreground transition-shadow"
                         >
-                            <span className="mt-0.5 flex h-4 w-4 flex-shrink-0 items-center justify-center rounded bg-cyan-500/15 text-[9px] font-bold text-cyan-400">{i + 1}</span>
+                            <span className="mt-0.5 flex h-4 w-4 flex-shrink-0 items-center justify-center rounded bg-cyan-500/15 text-[9px] font-bold text-cyan-700">{i + 1}</span>
                             <span className="min-w-0">
-                                <span className="block truncate font-semibold text-white/80" title={item.label}>{item.label}</span>
+                                <span className="block truncate font-semibold text-foreground" title={item.label}>{item.label}</span>
                                 {host ? (
-                                    <a href={item.source} target="_blank" rel="noreferrer" className="block truncate text-cyan-400/80 hover:text-cyan-300 hover:underline">{host}</a>
+                                    <a href={item.source} target="_blank" rel="noreferrer" className="block truncate text-cyan-700 hover:text-cyan-700 hover:underline">{host}</a>
                                 ) : (
-                                    item.source && <span className="block break-words text-white/40">{item.source}</span>
+                                    item.source && <span className="block break-words text-muted-foreground/70">{item.source}</span>
                                 )}
                             </span>
                         </li>

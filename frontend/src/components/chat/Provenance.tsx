@@ -53,48 +53,48 @@ export function ProvenanceBar({ data }: { data: unknown }) {
     return (
         <div className="mt-2 w-full space-y-1.5 text-[11px]">
             {reconciliation.length > 0 && (
-                <div className="rounded-xl border border-amber-500/25 bg-amber-500/[0.05] px-3 py-2 text-amber-200/90" role="alert">
-                    <p className="flex items-center gap-1.5 font-medium text-amber-300">
+                <div className="rounded-xl border border-amber-500/25 bg-amber-500/[0.05] px-3 py-2 text-amber-700" role="alert">
+                    <p className="flex items-center gap-1.5 font-medium text-amber-700">
                         <AlertTriangle className="h-3.5 w-3.5" /> Agents disagree: resolve before relying on these figures
                     </p>
-                    <ul className="mt-1 list-disc pl-5 text-white/60">
+                    <ul className="mt-1 list-disc pl-5 text-muted-foreground">
                         {reconciliation.map((issue, i) => <li key={i}>{issue.message}</li>)}
                     </ul>
                 </div>
             )}
             {hasGrounding && grounding && (
                 <details className={`rounded-xl border ${ok ? 'border-emerald-500/20 bg-emerald-500/[0.04]' : 'border-amber-500/25 bg-amber-500/[0.05]'} overflow-hidden`}>
-                    <summary className={`flex cursor-pointer list-none items-center gap-1.5 px-3 py-2 font-medium ${ok ? 'text-emerald-300' : 'text-amber-300'}`}>
+                    <summary className={`flex cursor-pointer list-none items-center gap-1.5 px-3 py-2 font-medium ${ok ? 'text-emerald-700' : 'text-amber-700'}`}>
                         {ok ? <ShieldCheck className="h-3.5 w-3.5" /> : <AlertTriangle className="h-3.5 w-3.5" />}
                         {grounding.figures_grounded} of {grounding.figures_total} figures match recorded evidence
-                        {!ok && <span className="text-amber-300/70"> — review before relying on it</span>}
+                        {!ok && <span className="text-amber-700"> — review before relying on it</span>}
                     </summary>
-                    <div className="space-y-1 px-3 pb-2.5 text-white/55">
-                        {ungrounded.length > 0 && <p><span className="text-white/75">Not found in evidence:</span> {ungrounded.slice(0, 15).join(', ')}</p>}
-                        {vendors.length > 0 && <p><span className="text-white/75">Cited with no tool output:</span> {vendors.join(', ')}</p>}
+                    <div className="space-y-1 px-3 pb-2.5 text-muted-foreground">
+                        {ungrounded.length > 0 && <p><span className="text-foreground">Not found in evidence:</span> {ungrounded.slice(0, 15).join(', ')}</p>}
+                        {vendors.length > 0 && <p><span className="text-foreground">Cited with no tool output:</span> {vendors.join(', ')}</p>}
                         {ungrounded.length === 0 && vendors.length === 0 && <p>Every figure traces to an agent output.</p>}
                     </div>
                 </details>
             )}
             {hasAudit && (
-                <details className="rounded-xl border border-white/[0.06] bg-white/[0.02] overflow-hidden">
-                    <summary className="flex cursor-pointer list-none items-center gap-1.5 px-3 py-2 font-medium text-white/50 hover:text-white/80">
-                        <ShieldCheck className="h-3.5 w-3.5 text-cyan-400" />
+                <details className="rounded-xl border border-border bg-muted/60 overflow-hidden">
+                    <summary className="flex cursor-pointer list-none items-center gap-1.5 px-3 py-2 font-medium text-muted-foreground hover:text-foreground">
+                        <ShieldCheck className="h-3.5 w-3.5 text-cyan-700" />
                         Inputs &amp; assumptions
                     </summary>
-                    <div className="space-y-1.5 px-3 pb-2.5 text-white/55">
-                        {auditSources.length > 0 && <p><span className="text-white/75">Data sources:</span> {auditSources.join('; ')}</p>}
+                    <div className="space-y-1.5 px-3 pb-2.5 text-muted-foreground">
+                        {auditSources.length > 0 && <p><span className="text-foreground">Data sources:</span> {auditSources.join('; ')}</p>}
                         {audit?.wacc_build && (
-                            <p><span className="text-white/75">WACC build:</span>{' '}
+                            <p><span className="text-foreground">WACC build:</span>{' '}
                                 {Object.entries(audit.wacc_build).map(([k, v]) => `${k.replace(/_/g, ' ')} ${typeof v === 'number' ? v : ''}`).join(' · ')}
                             </p>
                         )}
                         {assumptions.length > 0 && (
-                            <div><span className="text-white/75">Assumptions (not observed data):</span>
+                            <div><span className="text-foreground">Assumptions (not observed data):</span>
                                 <ul className="mt-0.5 list-disc pl-4">{assumptions.map((a, i) => <li key={i}>{a}</li>)}</ul>
                             </div>
                         )}
-                        {missing.length > 0 && <p className="text-amber-300/80"><span className="text-amber-300">Not retrieved:</span> {missing.join('; ')}</p>}
+                        {missing.length > 0 && <p className="text-amber-700"><span className="text-amber-700">Not retrieved:</span> {missing.join('; ')}</p>}
                     </div>
                 </details>
             )}

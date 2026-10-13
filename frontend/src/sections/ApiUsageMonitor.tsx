@@ -131,7 +131,7 @@ export function ApiUsageMonitor() {
         : [];
 
     return (
-        <Card className="border-t-4 border-t-violet-500">
+        <Card>
             <CardHeader className="pb-3">
                 <div className="flex items-center justify-between">
                     <div>

@@ -39,12 +39,16 @@ export function ChatSidebar({ collapsed, onToggle }: ChatSidebarProps) {
     const [searchQuery, setSearchQuery] = useState('');
     const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
 
+    // Empty drafts (a welcome message and nothing else) only add noise; the open one stays visible.
+    const visibleConversations = conversations.filter(
+        c => c.id === activeConversationId || c.dealId || c.messages.length > 1
+    );
     const filtered = searchQuery
-        ? conversations.filter(c =>
+        ? visibleConversations.filter(c =>
             c.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
             c.dealId?.toLowerCase().includes(searchQuery.toLowerCase())
         )
-        : conversations;
+        : visibleConversations;
 
     const handleNewChat = () => {
         createConversation();
@@ -195,7 +199,7 @@ export function ChatSidebar({ collapsed, onToggle }: ChatSidebarProps) {
             {/* Footer */}
             {!isCollapsed && (
                 <div className="p-2 border-t text-[10px] text-muted-foreground text-center">
-                    {conversations.length} conversation{conversations.length !== 1 ? 's' : ''}
+                    {visibleConversations.length} conversation{conversations.length !== 1 ? 's' : ''}
                 </div>
             )}
 

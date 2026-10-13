@@ -218,7 +218,7 @@ export function TaskBoardPage() {
             {/* Header */}
             <div className="flex items-center justify-between">
                 <div>
-                    <h2 className="text-2xl font-bold text-primary flex items-center gap-2">
+                    <h2 className="text-2xl font-semibold tracking-tight text-foreground flex items-center gap-2">
                         <ListTodo className="h-6 w-6" /> Task Board
                     </h2>
                     <p className="text-sm text-muted-foreground mt-1">
@@ -232,7 +232,7 @@ export function TaskBoardPage() {
 
             {/* Create New Todo List */}
             <div className="border rounded-lg p-4 bg-white shadow-sm">
-                <h3 className="text-sm font-semibold mb-3 text-slate-700">🚀 Create New Analysis Pipeline</h3>
+                <h3 className="text-sm font-semibold mb-3 text-slate-700">Create new analysis pipeline</h3>
                 <div className="flex gap-3 items-end">
                     <div className="flex-1">
                         <label className="text-xs text-muted-foreground">Deal / Company ID</label>
@@ -284,7 +284,10 @@ export function TaskBoardPage() {
                         <div className="flex items-center gap-3">
                             {expandedList === list.id ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
                             <div>
-                                <h3 className="font-semibold text-sm">{list.title}</h3>
+                                <h3 className="font-semibold text-sm">
+                                    {list.title}
+                                    <span className="ml-2 font-normal text-muted-foreground">Deal {String(list.deal_id || '').slice(0, 8)}</span>
+                                </h3>
                                 <p className="text-xs text-muted-foreground">{list.description}</p>
                             </div>
                         </div>

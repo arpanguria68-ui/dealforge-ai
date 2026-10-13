@@ -2,66 +2,75 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * Theme: a Microsoft 365 / Fluent-style workspace.
+ * Neutral canvas, white surfaces with hairline borders and soft elevation, Segoe UI type,
+ * and one brand blue. Every screen reads these tokens, so changing them re-themes the app.
+ */
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 240 10% 3.9%;
+    --background: 0 0% 96%;            /* canvas #f5f5f5 */
+    --foreground: 0 0% 14%;            /* #242424 */
     --card: 0 0% 100%;
-    --card-foreground: 240 10% 3.9%;
+    --card-foreground: 0 0% 14%;
     --popover: 0 0% 100%;
-    --popover-foreground: 240 10% 3.9%;
-    --primary: 240 5.9% 10%;
-    --primary-foreground: 0 0% 98%;
-    --secondary: 240 4.8% 95.9%;
-    --secondary-foreground: 240 5.9% 10%;
-    --muted: 240 4.8% 95.9%;
-    --muted-foreground: 240 3.8% 46.1%;
-    --accent: 240 4.8% 95.9%;
-    --accent-foreground: 240 5.9% 10%;
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 0 0% 98%;
-    --border: 240 5.9% 90%;
-    --input: 240 5.9% 90%;
-    --ring: 240 5.9% 10%;
-    --radius: 0.625rem;
+    --popover-foreground: 0 0% 14%;
+    --primary: 208 84% 39%;            /* brand #0f6cbd */
+    --primary-foreground: 0 0% 100%;
+    --secondary: 0 0% 94%;
+    --secondary-foreground: 0 0% 14%;
+    --muted: 0 0% 94%;
+    --muted-foreground: 0 0% 38%;      /* #616161 */
+    --accent: 210 60% 95%;             /* subtle brand tint for hover / selected */
+    --accent-foreground: 208 84% 30%;
+    --destructive: 4 62% 44%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 0 0% 88%;                /* #e0e0e0 */
+    --input: 0 0% 82%;
+    --ring: 208 84% 39%;
+    --radius: 0.5rem;
     --sidebar-background: 0 0% 98%;
-    --sidebar-foreground: 240 5.3% 26.1%;
-    --sidebar-primary: 240 5.9% 10%;
-    --sidebar-primary-foreground: 0 0% 98%;
-    --sidebar-accent: 240 4.8% 95.9%;
-    --sidebar-accent-foreground: 240 5.9% 10%;
-    --sidebar-border: 220 13% 91%;
-    --sidebar-ring: 217.2 91.2% 59.8%;
+    --sidebar-foreground: 0 0% 24%;
+    --sidebar-primary: 208 84% 39%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 210 60% 95%;
+    --sidebar-accent-foreground: 208 84% 30%;
+    --sidebar-border: 0 0% 90%;
+    --sidebar-ring: 208 84% 39%;
+    --appbar: 208 84% 31%;             /* title bar #0c5a9f-ish, like an Office app */
+    --appbar-foreground: 0 0% 100%;
   }
 
   .dark {
-    --background: 240 10% 3.9%;
-    --foreground: 0 0% 98%;
-    --card: 240 10% 3.9%;
-    --card-foreground: 0 0% 98%;
-    --popover: 240 10% 3.9%;
-    --popover-foreground: 0 0% 98%;
-    --primary: 0 0% 98%;
-    --primary-foreground: 240 5.9% 10%;
-    --secondary: 240 3.7% 15.9%;
-    --secondary-foreground: 0 0% 98%;
-    --muted: 240 3.7% 15.9%;
-    --muted-foreground: 240 5% 64.9%;
-    --accent: 240 3.7% 15.9%;
-    --accent-foreground: 0 0% 98%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 0 0% 98%;
-    --border: 240 3.7% 15.9%;
-    --input: 240 3.7% 15.9%;
-    --ring: 240 4.9% 83.9%;
-    --sidebar-background: 240 5.9% 10%;
-    --sidebar-foreground: 240 4.8% 95.9%;
-    --sidebar-primary: 224.3 76.3% 48%;
-    --sidebar-primary-foreground: 0 0% 100%;
-    --sidebar-accent: 240 3.7% 15.9%;
-    --sidebar-accent-foreground: 240 4.8% 95.9%;
-    --sidebar-border: 240 3.7% 15.9%;
-    --sidebar-ring: 217.2 91.2% 59.8%;
+    --background: 0 0% 10%;
+    --foreground: 0 0% 96%;
+    --card: 0 0% 14%;
+    --card-foreground: 0 0% 96%;
+    --popover: 0 0% 16%;
+    --popover-foreground: 0 0% 96%;
+    --primary: 208 90% 62%;
+    --primary-foreground: 0 0% 8%;
+    --secondary: 0 0% 18%;
+    --secondary-foreground: 0 0% 96%;
+    --muted: 0 0% 18%;
+    --muted-foreground: 0 0% 68%;
+    --accent: 208 40% 20%;
+    --accent-foreground: 208 90% 80%;
+    --destructive: 4 70% 55%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 0 0% 24%;
+    --input: 0 0% 30%;
+    --ring: 208 90% 62%;
+    --sidebar-background: 0 0% 12%;
+    --sidebar-foreground: 0 0% 90%;
+    --sidebar-primary: 208 90% 62%;
+    --sidebar-primary-foreground: 0 0% 8%;
+    --sidebar-accent: 208 40% 20%;
+    --sidebar-accent-foreground: 208 90% 80%;
+    --sidebar-border: 0 0% 22%;
+    --sidebar-ring: 208 90% 62%;
+    --appbar: 208 84% 22%;
+    --appbar-foreground: 0 0% 100%;
   }
 }
 
@@ -69,11 +78,25 @@
   * {
     @apply border-border;
   }
+  html {
+    font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Inter", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
   body {
     @apply bg-background text-foreground;
     margin: 0;
     min-width: 360px;
     min-height: 100vh;
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  h1, h2, h3, h4 {
+    letter-spacing: -0.005em;
+  }
+  :focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 1px;
   }
 }
 
@@ -89,4 +112,42 @@ button,
 input,
 textarea {
   font: inherit;
+}
+
+/* Quiet, thin scrollbars (Windows 11 style) */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: hsl(var(--muted-foreground) / 0.35) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background-color: hsl(var(--muted-foreground) / 0.3);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background-color: hsl(var(--muted-foreground) / 0.5);
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Radix ScrollArea wraps content in a `display: table` box that grows to its widest child and
+   pushes long chat content past the screen edge; make it an ordinary block. */
+[data-radix-scroll-area-viewport] > div {
+  display: block !important;
+  min-width: 0 !important;
 }
