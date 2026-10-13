@@ -428,6 +428,29 @@ def page_architecture():
 <li><strong>Structured output.</strong> <code>run_with_structure</code> parses JSON and falls back to narrative with a flag when the model returns prose.</li>
 </ul>
 
+<h2>Agent harness</h2>
+<p>"Harness" here means the code that wraps a model so it behaves like a dependable worker. DealForge has two: a runtime harness around every agent, and a test harness that checks the contracts.</p>
+<h3>Runtime harness</h3>
+<p><code>BaseAgent.run</code> wraps all 29 agents in the same pipeline:</p>
+{flow([('Skill injection', 'Domain skill and sector context are added to the task.'),
+         ('Issue tree', 'A MECE issue tree is generated and validated; context is retrieved per branch.'),
+         ('Core run', 'The agent runs its own logic, including the bounded tool loop.'),
+         ('Output validation', 'Deterministic checks on the output (arithmetic, required fields).'),
+         ('Memory', 'Learnings are stored for later runs.'),
+         ('Reflection', 'A reflection and reward engine scores the output and updates best practices; the score is attached to the result.'),
+         ('Messaging', 'An insight message is emitted on the agent bus.')])}
+<ul>
+<li><strong>Bounded tool loop:</strong> a capped number of tool rounds; calls within a round run concurrently and are returned in order; repeated identical calls are de-duplicated; tool context is size-bounded.</li>
+<li><strong>Failure isolation:</strong> tool timeouts, bad arguments and synchronous tools are contained by the router; a failing LLM provider returns a failed output instead of crashing the run; an agent has a wall-clock deadline (default 180 s).</li>
+<li><strong>Honest outputs:</strong> heuristic tools are labelled as such to the model and in results; a compliance agent without documents reports "unassessed", not "non-compliant".</li>
+</ul>
+<h3>Test harness</h3>
+<ul>
+<li><code>tests/test_agentic_harness.py</code> checks that every registered tool has a callable contract (schema, required arguments, description), that every agent allow-list and Laya tool family names only real tools, concurrency and de-duplication in the loop, the Laya cache, coalescing and circuit breaker, provider-failure handling and isolation between concurrent runs on a shared agent.</li>
+<li><code>tests/evals/</code> holds offline behavioral checks with a mocked model: agent contracts, MCP configuration, replication, reports, scenarios, the Scrum Master and tools.</li>
+</ul>
+<div class="note warn"><p><strong>Gap:</strong> these are deterministic contract tests. There is no benchmark that scores real-model output across a fixed set of deals; the <code>evaluate_*.py</code> scripts in <code>backend/</code> are ad hoc.</p></div>
+
 <h2>Model layer</h2>
 {table(['Component', 'Role'], [
         ['<code>ModelRouter</code>', 'Local-first routing: try a local model (Ollama / LM Studio) where configured, escalate to cloud on failure; a per-agent provider map comes from settings. The provider actually used is logged and shown in the UI.'],
@@ -446,6 +469,19 @@ def page_architecture():
         ['Knowledge graph', 'Deal facts, entities and risks written by agents; SQLite by default, Neo4j optional (<code>KG_BACKEND</code>). Feeds the cross-agent risk register'],
         ['Provenance', 'Audit trail of tool calls with parameters, raw response, timestamp and freshness; exportable per deal'],
     ])}
+
+<h2>Laya: the fast classifier layer</h2>
+<p>Laya is a small "System-1" decision engine. Instead of asking a large model every routing question, DealForge asks Laya typed questions (a choice, a score, a yes/no) and uses the answer to route work. Everything is <strong>fail-soft</strong>: if Laya is off, missing or slow, callers fall back to the previous keyword or LLM path, and a circuit breaker stops a dead backend from slowing every step.</p>
+{table(['Decision', 'Where it is used'], [
+        ['Complexity tier (fast / general / reasoning)', '<code>ModelRouter</code> picks a provider pool per task; simple tasks go to a local or fast model, hard ones to a reasoning model. Pools are configurable (<code>LAYA_FAST_POOL</code>, <code>LAYA_GENERAL_POOL</code>, <code>LAYA_REASONING_POOL</code>)'],
+        ['Tool family shortlist', '<code>ToolRouter</code> narrows the agent allow-list to the relevant tool family for the task'],
+        ['Deal triage and guardrail', 'LangGraph nodes classify the brief; secrets in briefs (API keys, bearer tokens, private keys) are redacted before any model sees them. Redaction runs even when Laya is unavailable'],
+        ['Confidence gate', 'Scores agent output so low-confidence results can trigger review or a retry in the orchestrator'],
+        ['Retrieval relevance and re-ranking', 'Hybrid search can re-rank chunks by relevance'],
+        ['Debate agreement', 'Detects whether debating agents have converged'],
+    ])}
+<p>Backends, in priority order: a local in-process router (<code>pip install laya</code>), a remote <code>laya-serve</code> over HTTP, an LM Studio model answering the same typed questions as constrained JSON, then a deterministic keyword heuristic. A decision cache and in-flight de-duplication keep it cheap because the planner, project manager, router and gates often ask the same question. Configure it with <code>LAYA_ENABLED</code>, <code>LAYA_MODE</code> (<code>auto|local|remote|lmstudio|off</code>), <code>LAYA_BASE_URL</code> and the other <code>LAYA_*</code> variables; status is at <code>GET /api/v1/laya/status</code>.</p>
+<div class="note warn"><p>Confidences are calibrated only with the local or remote checkpoints; the LM Studio backend reports uncalibrated model confidence. The demo runs on this site do not claim which backend was active.</p></div>
 
 <h2>Orchestration modes</h2>
 <p>The same agents can be driven three ways:</p>
