@@ -428,6 +428,29 @@ def page_architecture():
 <li><strong>Structured output.</strong> <code>run_with_structure</code> parses JSON and falls back to narrative with a flag when the model returns prose.</li>
 </ul>
 
+<h2>Agent harness</h2>
+<p>"Harness" here means the code that wraps a model so it behaves like a dependable worker. DealForge has two: a runtime harness around every agent, and a test harness that checks the contracts.</p>
+<h3>Runtime harness</h3>
+<p><code>BaseAgent.run</code> wraps all 29 agents in the same pipeline:</p>
+{flow([('Skill injection', 'Domain skill and sector context are added to the task.'),
+         ('Issue tree', 'A MECE issue tree is generated and validated; context is retrieved per branch.'),
+         ('Core run', 'The agent runs its own logic, including the bounded tool loop.'),
+         ('Output validation', 'Deterministic checks on the output (arithmetic, required fields).'),
+         ('Memory', 'Learnings are stored for later runs.'),
+         ('Reflection', 'A reflection and reward engine scores the output and updates best practices; the score is attached to the result.'),
+         ('Messaging', 'An insight message is emitted on the agent bus.')])}
+<ul>
+<li><strong>Bounded tool loop:</strong> a capped number of tool rounds; calls within a round run concurrently and are returned in order; repeated identical calls are de-duplicated; tool context is size-bounded.</li>
+<li><strong>Failure isolation:</strong> tool timeouts, bad arguments and synchronous tools are contained by the router; a failing LLM provider returns a failed output instead of crashing the run; an agent has a wall-clock deadline (default 180 s).</li>
+<li><strong>Honest outputs:</strong> heuristic tools are labelled as such to the model and in results; a compliance agent without documents reports "unassessed", not "non-compliant".</li>
+</ul>
+<h3>Test harness</h3>
+<ul>
+<li><code>tests/test_agentic_harness.py</code> checks that every registered tool has a callable contract (schema, required arguments, description), that every agent allow-list and Laya tool family names only real tools, concurrency and de-duplication in the loop, the Laya cache, coalescing and circuit breaker, provider-failure handling and isolation between concurrent runs on a shared agent.</li>
+<li><code>tests/evals/</code> holds offline behavioral checks with a mocked model: agent contracts, MCP configuration, replication, reports, scenarios, the Scrum Master and tools.</li>
+</ul>
+<div class="note warn"><p><strong>Gap:</strong> these are deterministic contract tests. There is no benchmark that scores real-model output across a fixed set of deals; the <code>evaluate_*.py</code> scripts in <code>backend/</code> are ad hoc.</p></div>
+
 <h2>Model layer</h2>
 {table(['Component', 'Role'], [
         ['<code>ModelRouter</code>', 'Local-first routing: try a local model (Ollama / LM Studio) where configured, escalate to cloud on failure; a per-agent provider map comes from settings. The provider actually used is logged and shown in the UI.'],
