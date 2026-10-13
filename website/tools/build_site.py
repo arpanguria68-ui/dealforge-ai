@@ -250,9 +250,9 @@ def page_index():
 <p style="margin-top:22px"><a href="docs/architecture.html">Read the architecture →</a></p></div></section>
 
 <section id="demo"><div class="wrap"><div class="sec-head"><h2>Watch the agents work</h2>
-<p>Real captures of a Sprout Social run in the chat UI: prompt, plan, approval, a sped-up recording of the agents executing, and the finished brief.</p></div>
+<p>From the real prompt to the result, in the chat UI. The first four steps are a screen recording of a live run (prompt typed in real time, the plan, approval, agents starting work; waiting is sped up 10x). The result screens are screenshots of an earlier completed run.</p></div>
 <div class="frame big-video"><div class="chrome"><i></i><i></i><i></i></div>
-<video controls preload="none" poster="assets/img/poster-chat.jpg"><source src="assets/video/chat-walkthrough.mp4" type="video/mp4"></video></div>
+<video controls preload="none" poster="assets/img/poster-chat.jpg"><source src="assets/video/prompt-to-result.mp4" type="video/mp4"></video></div>
 <div class="videos">{vids}</div></div></section>
 
 <section class="alt"><div class="wrap"><div class="sec-head"><h2>Product tour</h2><p>Real screens from the running app. Click any image to enlarge, or follow the <a href="docs/product-tour.html">guided tour</a>.</p></div>
@@ -365,8 +365,8 @@ def page_product_tour():
 <h1>Product tour</h1>
 <p>Everything on this page is a real capture from the running application, using public Sprout Social (NASDAQ: SPT) data.</p>
 <h2>See a run, end to end</h2>
-<div class="frame big-video"><div class="chrome"><i></i><i></i><i></i></div><video controls preload="none" poster="{p}assets/img/poster-chat.jpg"><source src="{p}assets/video/chat-walkthrough.mp4" type="video/mp4"></video></div>
-<p>The video combines screenshots of the prompt, plan and approval gate, a screen recording of the agents executing (sped up 10x, since real execution takes minutes), and screenshots of the finished brief.</p>
+<div class="frame big-video"><div class="chrome"><i></i><i></i><i></i></div><video controls preload="none" poster="{p}assets/img/poster-chat.jpg"><source src="{p}assets/video/prompt-to-result.mp4" type="video/mp4"></video></div>
+<p>The first half is a screen recording of a live run: the prompt typed in real time, the plan, the approval click and the agents starting work (waiting sped up 10x). That recording was made while the model endpoint was timing out, so it stops before the end of the run. The result screens at the end are screenshots of an earlier completed run on the same company, not the end of the same recording.</p>
 
 <h2>1 · Chat: from a brief to an approved plan</h2>
 {fig(p, 'chat-welcome', 'The Chat tab. Conversations on the left, the agent thread in the middle, the composer with focus mode (Speed / Balanced / Quality) and Sources at the bottom.')}
