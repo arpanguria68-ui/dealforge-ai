@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Status & limits · DealForge AI</title>
+<meta name="description" content="What DealForge AI has verified, what is experimental, and its known limits.">
+<meta property="og:title" content="Status &amp; limits · DealForge AI">
+<meta property="og:description" content="What DealForge AI has verified, what is experimental, and its known limits.">
+<meta property="og:image" content="../assets/img/poster-full.jpg">
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="bar"><div class="wrap">
+<a class="brand" href="../index.html"><span class="mark">DF</span>DealForge AI</a>
+<nav aria-label="Main"><a href="../index.html">Overview</a><a href="../docs/product-tour.html">Product tour</a><a href="../docs/architecture.html">Architecture</a><a href="../docs/agents.html">Agents</a><a href="../docs/tools-and-data.html">Tools &amp; data</a><a href="../docs/quality-and-controls.html">Quality &amp; controls</a><a href="../docs/reports.html">Reports</a><a href="../docs/api.html">API</a><a href="../docs/getting-started.html">Get started</a></nav>
+<a class="gh" href="https://github.com/arpanguria68-ui/dealforge-ai">GitHub</a>
+</div></header>
+<main id="main"><div class="wrap docs"><aside class="side" aria-label="Documentation"><h4>Start here</h4><a href="../docs/getting-started.html">Getting started</a><a href="../docs/product-tour.html">Product tour</a><h4>How it works</h4><a href="../docs/architecture.html">Architecture</a><a href="../docs/agents.html">Agent catalog</a><a href="../docs/tools-and-data.html">Tools &amp; data sources</a><h4>Trust</h4><a href="../docs/quality-and-controls.html">Quality &amp; controls</a><a href="../docs/reports.html">Reports &amp; review gate</a><h4>Reference</h4><a href="../docs/api.html">API reference</a><a href="../docs/status.html" class=on>Status &amp; limits</a></aside><article class="doc">
+<h1>Status &amp; limits</h1>
+<p>An honest account of what has been exercised and what has not.</p>
+<h2>Verified end to end</h2>
+<ul>
+<li>The interactive chat pipeline: clarify → plan → approve → execute → memo → brief, with real SEC EDGAR and Finnhub data, through an OpenAI-compatible endpoint, on a real company (Sprout Social).</li>
+<li>Dashboard metrics and per-deal insights, the task board, and generation of all four report formats with the review gate.</li>
+<li>448 automated tests (backend), a TypeScript build, and visual checks of the UI and reports.</li>
+</ul>
+<h2>Implemented but less exercised</h2>
+<ul>
+<li>The LangGraph deal orchestrator, OFAS missions, the debate engine, confidence and user-input gates, HaluGate NLI checks, GP-led CV and LMT workflows. They are in the repository and API-exposed, but the demos and docs here do not claim them as verified.</li>
+<li>Neo4j as the knowledge-graph backend, the cloud PageIndex mode, and MCP integrations depend on external services.</li>
+</ul>
+<h2>Known limits</h2>
+<div class="tw"><table class=""><thead><tr><th>Limit</th><th>Detail</th></tr></thead><tbody><tr><td>Redis is required</td><td>There is no in-memory fallback for deals, conversations and artifacts</td></tr><tr><td>Single-tenant</td><td>No user accounts; an optional admin bearer token guards report endpoints</td></tr><tr><td>Model quality varies</td><td>Chat-style proxy models can return canned errors or off-topic text; these are detected and retried, but output quality still depends on the model</td></tr><tr><td>Agents can still disagree</td><td>DCF assumptions are shared via the prompt, not forced; disagreement above 15% is flagged for a human, not resolved automatically</td></tr><tr><td>Comps are only as good as the peer list</td><td>Finnhub peers can be loosely related; the valuation agent filters by size and uses the median, but peer selection is not curated</td></tr><tr><td>No calibrated confidence</td><td>Confidence numbers are model-reported and labelled as such</td></tr><tr><td>No deal score in the chat flow</td><td>Reports say "deal not scored" rather than invent one; the memo recommendation is a labelled draft</td></tr><tr><td>Run time</td><td>A full run with a remote chat-style model takes several minutes; local models vary</td></tr><tr><td>US-centric data</td><td>SEC EDGAR XBRL covers US filers; other markets need other sources</td></tr><tr><td>Windows test failures</td><td>Two tests fail only on Windows (symlink permission, hard-coded paths)</td></tr></tbody></table></div>
+<h2>Data and privacy</h2>
+<p>The site and the app make no calls to analytics services. The app sends prompts and tool outputs to whichever LLM provider you configure, and requests to the data APIs you enable. Run local models and the knowledge base stays on your machine. The demos use public company data only.</p>
+<h2>Not financial advice</h2>
+<p>DealForge produces analysis drafts. It is not an investment adviser, and its outputs must be reviewed by qualified people before any decision.</p>
+</article></div></main>
+<footer><div class="wrap"><span>DealForge AI · multi-agent M&amp;A deal analysis · all figures in the demos come from public filings (Sprout Social, NASDAQ: SPT).</span>
+<span><a href="https://github.com/arpanguria68-ui/dealforge-ai">Source</a> · <a href="../docs/status.html">Status &amp; limits</a> · <a href="../docs/getting-started.html">Get started</a></span></div></footer>
+<script src="../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Getting started · DealForge AI</title>
+<meta name="description" content="Install and run DealForge AI with Docker Compose or locally, configure models and data keys, and run a first analysis.">
+<meta property="og:title" content="Getting started · DealForge AI">
+<meta property="og:description" content="Install and run DealForge AI with Docker Compose or locally, configure models and data keys, and run a first analysis.">
+<meta property="og:image" content="../assets/img/poster-full.jpg">
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="bar"><div class="wrap">
+<a class="brand" href="../index.html"><span class="mark">DF</span>DealForge AI</a>
+<nav aria-label="Main"><a href="../index.html">Overview</a><a href="../docs/product-tour.html">Product tour</a><a href="../docs/architecture.html">Architecture</a><a href="../docs/agents.html">Agents</a><a href="../docs/tools-and-data.html">Tools &amp; data</a><a href="../docs/quality-and-controls.html">Quality &amp; controls</a><a href="../docs/reports.html">Reports</a><a href="../docs/api.html">API</a><a href="../docs/getting-started.html" class=on>Get started</a></nav>
+<a class="gh" href="https://github.com/arpanguria68-ui/dealforge-ai">GitHub</a>
+</div></header>
+<main id="main"><div class="wrap docs"><aside class="side" aria-label="Documentation"><h4>Start here</h4><a href="../docs/getting-started.html" class=on>Getting started</a><a href="../docs/product-tour.html">Product tour</a><h4>How it works</h4><a href="../docs/architecture.html">Architecture</a><a href="../docs/agents.html">Agent catalog</a><a href="../docs/tools-and-data.html">Tools &amp; data sources</a><h4>Trust</h4><a href="../docs/quality-and-controls.html">Quality &amp; controls</a><a href="../docs/reports.html">Reports &amp; review gate</a><h4>Reference</h4><a href="../docs/api.html">API reference</a><a href="../docs/status.html">Status &amp; limits</a></aside><article class="doc">
+<h1>Getting started</h1>
+<p>DealForge AI is a FastAPI backend plus a React UI. It needs Redis for deals, conversations and generated artifacts, and at least one LLM provider.</p>
+<h2>Requirements</h2>
+<div class="tw"><table class=""><thead><tr><th>Component</th><th>Version</th><th>Notes</th></tr></thead><tbody><tr><td>Python</td><td>3.11+</td><td>Backend (the Dockerfile uses <code>python:3.11-slim</code>)</td></tr><tr><td>Node.js</td><td>20+</td><td>Frontend build and dev server</td></tr><tr><td>Redis</td><td>7</td><td>Required. Docker Compose starts one; locally run <code>redis-server</code></td></tr><tr><td>LLM access</td><td>any one</td><td>A cloud key (Gemini, OpenAI, Mistral, …), a local model (Ollama / LM Studio) or any OpenAI-compatible endpoint</td></tr><tr><td>Optional data keys</td><td></td><td>Finnhub, Alpha Vantage, financial_datasets, FMP. SEC EDGAR needs no key</td></tr></tbody></table></div>
+<h2>Option A · Docker Compose</h2>
+<pre><code>git clone https://github.com/arpanguria68-ui/dealforge-ai.git
+cd dealforge-ai
+# create .env.docker with your keys (see the table below), then:
+docker compose --env-file .env.docker up --build -d</code></pre>
+<p>The UI is served on <code>http://localhost:3000</code> and the API on <code>http://localhost:8005</code> (interactive docs at <code>/docs</code>). Generated reports persist in the <code>dealforge-reports</code> volume.</p>
+<h2>Option B · Local development</h2>
+<pre><code># 1. Redis
+redis-server
+
+# 2. Backend (from the repository root)
+cd backend
+python -m venv .venv &amp;&amp; source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8005
+
+# 3. Frontend (second terminal)
+cd frontend
+npm install
+npm run dev</code></pre>
+<p>The frontend talks to <code>&lt;current-host&gt;:8005</code> by default; override with <code>VITE_API_BASE</code>. The backend allows the origins <code>localhost:3000, 3001, 5173, 5174</code> out of the box; set <code>CORS_ORIGINS</code> for anything else.</p>
+<h2>Configure a model</h2>
+<p>Open <strong>Settings</strong> in the UI and add a provider key, or set the environment variables below. To use any OpenAI-compatible server (a local gateway, vLLM, a proxy), choose <strong>Custom endpoint</strong> and give it a base URL, model name and key. Per-agent routing is stored in <code>settings.json</code> and can pin individual agents to individual providers.</p>
+<div class="note"><p>Keys are masked in the UI and are never sent to the browser in full. Do not commit <code>settings.json</code> or <code>.env</code> files: the repository ignores them.</p></div>
+<h2>Environment variables</h2>
+<div class="tw"><table class=""><thead><tr><th>Variable</th><th>Purpose</th></tr></thead><tbody><tr><td><code>GEMINI_API_KEY</code>, <code>OPENAI_API_KEY</code>, <code>MISTRAL_API_KEY</code>, <code>OPENROUTER_API_KEY</code>, <code>NVIDIA_API_KEY</code></td><td>Cloud LLM providers</td></tr><tr><td><code>DEFAULT_LLM_PROVIDER</code></td><td>Fallback provider (default <code>gemini</code> in Compose)</td></tr><tr><td><code>FINNHUB_API_KEY</code>, <code>ALPHA_VANTAGE_API_KEY</code>, <code>FINANCIAL_DATASETS_API_KEY</code>, <code>FMP_API_KEY</code>, <code>SEC_API_KEY</code></td><td>Market and filing data (all optional; SEC EDGAR XBRL needs none)</td></tr><tr><td><code>REDIS_URL</code></td><td>Default <code>redis://localhost:6379/0</code></td></tr><tr><td><code>DATABASE_URL</code></td><td>Default SQLite via aiosqlite</td></tr><tr><td><code>PAGEINDEX_MODE</code></td><td><code>local</code> (self-hosted tree RAG, default) or <code>cloud</code></td></tr><tr><td><code>KG_BACKEND</code></td><td>Knowledge graph: <code>sqlite</code> (default), <code>neo4j</code>, or <code>off</code></td></tr><tr><td><code>AGENT_TIMEOUT_SECONDS</code></td><td>Per-agent wall-clock limit (default 180)</td></tr><tr><td><code>CUSTOM_ENDPOINT_TIMEOUT_SECONDS</code></td><td>Timeout for the custom endpoint client (default 155)</td></tr><tr><td><code>ADMIN_API_TOKEN</code>, <code>REQUIRE_ADMIN_TOKEN</code></td><td>Bearer-token guard for report generation, download and approval endpoints</td></tr><tr><td><code>CORS_ORIGINS</code></td><td>Comma-separated allowed browser origins</td></tr></tbody></table></div>
+<h2>Your first analysis</h2>
+<div class="flow"><div class="n"><b class="i">1</b><div><strong>Open the Chat tab and click <em>New Analysis</em></strong><p>The welcome message explains the flow.</p></div></div><div class="n"><b class="i">2</b><div><strong>Type a deal</strong><p>For example: <code>Evaluate a take-private of Sprout Social (NASDAQ: SPT). Proceed with public data only; do not ask clarifying questions.</code> Saying you do not want questions skips the clarification step.</p></div></div><div class="n"><b class="i">3</b><div><strong>Review the plan</strong><p>The Scrum Master lists the tasks and the agent for each. A valuation agent is added automatically whenever a DCF or LBO is planned.</p></div></div><div class="n"><b class="i">4</b><div><strong>Click Approve &amp; run</strong><p>Agents run in dependency order. Expect several minutes with a remote chat-style model; local models vary.</p></div></div><div class="n"><b class="i">5</b><div><strong>Read the brief, then open the Dashboard</strong><p>Use <em>View Analysis → Generate</em> for the documents; a reviewer approves them for release.</p></div></div></div>
+<h2>Tests</h2>
+<pre><code>cd backend
+pytest -q</code></pre>
+<p>The suite has 448 tests. Two tests fail on Windows for environmental reasons (symlink privilege and hard-coded Windows paths); they are unrelated to behavior.</p>
+<h2>Troubleshooting</h2>
+<div class="tw"><table class=""><thead><tr><th>Symptom</th><th>Likely cause</th></tr></thead><tbody><tr><td>The UI loads but every call fails</td><td>Backend not on port 8005, or the UI origin is missing from <code>CORS_ORIGINS</code></td></tr><tr><td>Backend exits on start</td><td>Redis is not running or <code>REDIS_URL</code> is wrong</td></tr><tr><td>Agents return "tool request" text or empty results</td><td>The model does not support native tool calls; use a provider that does, or the OpenAI-compatible endpoint (which uses the built-in text tool protocol)</td></tr><tr><td>Report downloads return 409</td><td>Reports are not approved yet; use the draft download (<code>?draft=true</code>) or approve them from the Dashboard</td></tr><tr><td>No peer multiples in comps</td><td>Finnhub key missing or rate limited; the valuation agent records this under "Not retrieved"</td></tr></tbody></table></div>
+</article></div></main>
+<footer><div class="wrap"><span>DealForge AI · multi-agent M&amp;A deal analysis · all figures in the demos come from public filings (Sprout Social, NASDAQ: SPT).</span>
+<span><a href="https://github.com/arpanguria68-ui/dealforge-ai">Source</a> · <a href="../docs/status.html">Status &amp; limits</a> · <a href="../docs/getting-started.html">Get started</a></span></div></footer>
+<script src="../assets/js/site.js"></script>
+</body>
+</html>
