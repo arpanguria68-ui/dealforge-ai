@@ -70,6 +70,8 @@ class DCFLBOArchitectAgent(BaseAgent):
             # Parse LLM analysis
             analysis = self._parse_output(content)
             analysis["deterministic_calculations"] = calc_results
+            self._ensure_lbo(task, context, analysis)
+            self._repair_dcf_bridge(context, analysis)
 
             elapsed = (datetime.utcnow() - start).total_seconds() * 1000
             return AgentOutput(
@@ -117,6 +119,81 @@ RULES:
             prompt += f"RELEVANT KNOWLEDGE:\n{chr(10).join(str(m)[:200] for m in memory[:3])}\n\n"
         prompt += "Provide your analysis in structured JSON format with sections for each model built."
         return prompt
+
+    def _ensure_lbo(self, task: str, context: Dict, analysis: Dict) -> None:
+        """Add a deterministic LBO when one was requested but the model's output has none."""
+        import re
+
+        wanted = f"{task} {context.get('user_prompt', '')}"
+        if not re.search(r"\blbo\b|leveraged\s+buy-?out|take[- ]private", wanted, re.IGNORECASE):
+            return
+        if any("lbo" in str(key).lower() for key in analysis):
+            return
+        from app.core.lbo import build_lbo
+        from app.core.valuation_inputs import DEFAULT_ASSUMPTIONS
+
+        for record in context.get("agent_results") or []:
+            data = record.get("data") if isinstance(record, dict) else None
+            audit = data.get("audit") if isinstance(data, dict) and isinstance(data.get("audit"), dict) else None
+            inputs = (audit or {}).get("inputs") or {}
+            fin, market = inputs.get("financial_data") or {}, inputs.get("market_data") or {}
+            lbo = build_lbo(
+                market.get("enterprise_value"), fin.get("free_cash_flow"), fin.get("revenue_growth"),
+                DEFAULT_ASSUMPTIONS["terminal_growth"],
+            )
+            if lbo:
+                analysis["lbo_model"] = lbo
+                return
+        limits = analysis.setdefault("data_limitations", [])
+        if isinstance(limits, list):
+            limits.append("An LBO was requested but could not be built: no sourced market enterprise value or free cash flow.")
+
+    @staticmethod
+    def _valuation_inputs(context: Dict) -> tuple:
+        """(financial_data, market_data) the valuation agent sourced, from upstream results."""
+        for record in context.get("agent_results") or []:
+            data = record.get("data") if isinstance(record, dict) else None
+            audit = data.get("audit") if isinstance(data, dict) and isinstance(data.get("audit"), dict) else None
+            inputs = (audit or {}).get("inputs") or {}
+            if inputs.get("financial_data"):
+                return inputs.get("financial_data") or {}, inputs.get("market_data") or {}
+        return {}, {}
+
+    def _repair_dcf_bridge(self, context: Dict, analysis: Dict) -> None:
+        """Replace a DCF bridge whose parts do not sum to its enterprise value with a computed one."""
+        from app.core.lbo import deterministic_dcf
+        from app.core.valuation_inputs import DEFAULT_ASSUMPTIONS
+        from app.core.validation.reconciliation import BRIDGE_TOLERANCE, declared_scale, parse_money
+
+        fin, _ = self._valuation_inputs(context)
+        scale = declared_scale(analysis)
+
+        def parsed(node: Dict, *needles: str) -> Optional[float]:
+            return next((parse_money(v, k, scale) for k, v in node.items()
+                         if all(n in k.lower() for n in needles)), None)
+
+        def walk(node: Any) -> bool:
+            items = list(node.items()) if isinstance(node, dict) else list(enumerate(node)) if isinstance(node, list) else []
+            for key, child in items:
+                if isinstance(child, dict) and "bridge" in str(key).lower():
+                    pv_cash = parsed(child, "pv", "fcf") or parsed(child, "pv", "cash")
+                    pv_terminal, ev = parsed(child, "pv", "terminal"), parsed(child, "enterprise")
+                    if pv_cash and pv_terminal and ev and abs(pv_cash + pv_terminal - ev) / ev > BRIDGE_TOLERANCE:
+                        rebuilt = deterministic_dcf(
+                            fin.get("free_cash_flow"), fin.get("revenue_growth"), fin.get("wacc"),
+                            DEFAULT_ASSUMPTIONS["terminal_growth"], int(DEFAULT_ASSUMPTIONS["projection_years"]),
+                        )
+                        if rebuilt:
+                            node[key] = rebuilt
+                            return True
+                elif walk(child):
+                    return True
+            return False
+
+        if walk(analysis):
+            limits = analysis.setdefault("data_limitations", [])
+            if isinstance(limits, list):
+                limits.append("The model's DCF bridge did not add up; it was recomputed from the shared valuation assumptions.")
 
     def _parse_output(self, content: str) -> Dict:
         from app.core.json_helpers import extract_and_parse_json

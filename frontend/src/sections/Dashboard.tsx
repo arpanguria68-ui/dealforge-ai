@@ -26,6 +26,10 @@ interface DealInsights {
     needs_review?: boolean;
 }
 
+/** A deal record that was created but never had an agent run (abandoned or test sessions). */
+const isNeverStarted = (deal: { status: string; agents_run?: string[] }): boolean =>
+    deal.status === 'created' && !(deal.agents_run && deal.agents_run.length);
+
 const money = (value?: number): string => {
     if (typeof value !== 'number' || !Number.isFinite(value)) return '—';
     const abs = Math.abs(value);
@@ -95,6 +99,7 @@ interface Metrics {
     avg_confidence: number | null;
     high_risk_alerts: number;
     needs_review_deals?: number;
+    inactive_deals?: number;
     deals: DealRecord[];
     agent_activity: AgentEvent[];
 }
@@ -910,6 +915,7 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
     const [error, setError] = useState<string | null>(null);
     const [selectedDeal, setSelectedDeal] = useState<DealRecord | null>(null);
     const [searchTerm, setSearchTerm] = useState('');
+    const [showInactive, setShowInactive] = useState(false);
 
     const fetchMetrics = useCallback(async () => {
         try {
@@ -990,7 +996,7 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
                             {loading ? <span className="animate-pulse">—</span> : (metrics?.active_deals ?? 0)}
                         </div>
                         <p className="text-xs text-muted-foreground">
-                            Not yet analysed · {metrics?.total_deals ?? 0} total in pipeline
+                            In analysis · {metrics?.total_deals ?? 0} total, {metrics?.inactive_deals ?? 0} never started
                         </p>
                     </CardContent>
                 </Card>
@@ -1118,7 +1124,17 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
                         <div className="flex items-center justify-between">
                             <div>
                                 <CardTitle>Deal Pipeline</CardTitle>
-                                <CardDescription>Most recent activity at the top.</CardDescription>
+                                <CardDescription>
+                                    Most recent activity at the top.
+                                    {(metrics?.inactive_deals ?? 0) > 0 && (
+                                        <button
+                                            className="ml-2 underline underline-offset-2 hover:text-foreground"
+                                            onClick={() => setShowInactive(v => !v)}
+                                        >
+                                            {showInactive ? 'Hide' : 'Show'} {metrics?.inactive_deals} never-started
+                                        </button>
+                                    )}
+                                </CardDescription>
                             </div>
                             <div className="relative w-full max-w-xs">
                                 <Activity className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
@@ -1154,7 +1170,8 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
                             ) : (
                                 <div className="space-y-4">
                                     {(metrics?.deals || [])
-                                        .filter(d => 
+                                        .filter(d => showInactive || searchTerm || !isNeverStarted(d))
+                                        .filter(d =>
                                             d.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
                                             d.target_company.toLowerCase().includes(searchTerm.toLowerCase()) ||
                                             d.industry.toLowerCase().includes(searchTerm.toLowerCase())

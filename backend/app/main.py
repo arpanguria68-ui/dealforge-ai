@@ -602,7 +602,8 @@ async def dashboard_metrics():
     high_risk = sum(
         1 for d in deals if d.get("final_score") is not None and d["final_score"] < 0.5
     )
-    active = sum(1 for d in deals if d["status"] in ("created", "running"))
+    inactive = sum(1 for d in deals if d["status"] == "created" and not d.get("agents_run"))
+    active = sum(1 for d in deals if d["status"] in ("created", "running")) - inactive
     completed = sum(1 for d in deals if d["status"] == "completed")
     needs_review = sum(1 for d in deals if d.get("status") == "needs_review")
 
@@ -634,6 +635,7 @@ async def dashboard_metrics():
         "avg_confidence": avg_confidence,
         "high_risk_alerts": high_risk,
         "needs_review_deals": needs_review,
+        "inactive_deals": inactive,
         "deals": deals,
         "agent_activity": agent_activity[-20:],  # last 20 events
     }
@@ -3210,6 +3212,21 @@ async def chat_respond(request: Request):
     }
 
 
+_NO_CLARIFICATION = re.compile(
+    r"\b(?:(?:do\s*n[o']?t|don't|never|no\s+need\s+to|without)\s+(?:ask|asking)?\s*(?:me\s+)?(?:any\s+)?"
+    r"(?:clarif\w*|follow[- ]?up)\s*(?:questions?)?"
+    r"|no\s+(?:clarif\w*|follow[- ]?up)\s+questions?"
+    r"|skip\s+(?:the\s+)?(?:clarif\w*|questions)"
+    r"|proceed\s+(?:directly|straight)\s+to\s+(?:the\s+)?plan(?:ning)?)",
+    re.IGNORECASE,
+)
+
+
+def declines_clarification(prompt: str) -> bool:
+    """True when the user has told the Scrum Master not to ask questions first."""
+    return bool(_NO_CLARIFICATION.search(prompt or ""))
+
+
 @app.post("/api/v1/chat/clarify")
 async def chat_clarify(request: Request):
     """
@@ -3234,7 +3251,7 @@ async def chat_clarify(request: Request):
     if str(company_name or "").strip().lower() in {"", "target company", "the target", "unknown"}:
         company_name = _explicit_company_name(prompt) or "Target Company"
     clarification_round = body.get("clarification_round", 0)
-    user_skipped = body.get("user_skipped", False)
+    user_skipped = bool(body.get("user_skipped", False)) or declines_clarification(prompt)
     skipped_questions = body.get("skipped_questions", [])
 
     from app.agents.project_manager import ProjectManagerAgent

@@ -191,3 +191,34 @@ def test_dcf_lbo_agents_depend_on_valuation_agent():
     wire_stage_dependencies(items)
     assert "v" in items[2].depends_on
     assert "d" not in items[1].depends_on   # no cycle
+
+
+def test_plan_with_dcf_lbo_gets_a_valuation_agent_once():
+    from app.agents.project_manager import ensure_valuation_for_models
+
+    tasks = [{"title": "DCF and LBO", "assigned_agent": "dcf_lbo_architect"}]
+    added = ensure_valuation_for_models(tasks, "Sprout Social")
+    assert [t["assigned_agent"] for t in added] == ["dcf_lbo_architect", "valuation_agent"]
+    assert ensure_valuation_for_models(added, "Sprout Social") == added   # idempotent
+    risk_only = [{"title": "Risks", "assigned_agent": "risk_assessor"}]
+    assert ensure_valuation_for_models(risk_only, "X") == risk_only
+
+
+def test_requested_lbo_is_added_once_and_only_when_asked():
+    from app.agents.project_manager import ensure_requested_lbo, ensure_valuation_for_models
+
+    base = [{"title": "Risks", "description": "assess risk", "assigned_agent": "risk_assessor"}]
+    planned = ensure_requested_lbo(base, "Evaluate a take-private of X with a DCF and LBO", "X")
+    assert [t["assigned_agent"] for t in planned] == ["risk_assessor", "dcf_lbo_architect"]
+    assert ensure_requested_lbo(planned, "build an LBO", "X") == planned           # already covered
+    assert ensure_requested_lbo(base, "assess the risks of X", "X") == base        # not requested
+    assert "valuation_agent" in [t["assigned_agent"] for t in ensure_valuation_for_models(planned, "X")]
+
+
+def test_lbo_task_planned_for_the_ratio_modeler_is_routed_to_the_architect():
+    from app.agents.project_manager import ensure_requested_lbo
+
+    tasks = [{"title": "Build Consistent DCF and LBO Models", "description": "Integrated DCF and leveraged buyout model",
+              "assigned_agent": "advanced_financial_modeler"}]
+    routed = ensure_requested_lbo(tasks, "take-private with an LBO", "X")
+    assert [t["assigned_agent"] for t in routed] == ["dcf_lbo_architect"]

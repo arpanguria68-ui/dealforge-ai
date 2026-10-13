@@ -73,7 +73,7 @@ function App() {
                   }`}
               >
                 <Icon className="h-4 w-4" />
-                <span className="hidden md:inline">{item.label}</span>
+                <span className={page === item.id ? 'inline' : 'hidden xl:inline'}>{item.label}</span>
               </button>
             );
           })}
@@ -88,20 +88,20 @@ function App() {
               id="system-status-btn"
             >
               {sysStatus === 'checking' ? (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                <Loader2 className="h-4 w-4 lg:mr-2 animate-spin" />
               ) : sysStatus === 'ok' ? (
-                <CheckCircle2 className="mr-2 h-4 w-4 text-green-500" />
+                <CheckCircle2 className="h-4 w-4 lg:mr-2 text-green-500" />
               ) : sysStatus === 'error' ? (
-                <XCircle className="mr-2 h-4 w-4 text-red-500" />
+                <XCircle className="h-4 w-4 lg:mr-2 text-red-500" />
               ) : (
-                <Activity className="mr-2 h-4 w-4" />
+                <Activity className="h-4 w-4 lg:mr-2" />
               )}
-              <span className="hidden sm:inline">{sysStatus === 'ok' ? 'Online' : sysStatus === 'error' ? 'Offline' : 'Backend'}</span>
+              <span className="hidden lg:inline">{sysStatus === 'ok' ? 'Online' : sysStatus === 'error' ? 'Offline' : 'Backend'}</span>
             </Button>
           </div>
           <Button size="sm" onClick={() => { createConversation(); navigateTo('chat'); }} id="new-deal-btn">
-            <Briefcase className="h-4 w-4 sm:mr-2" />
-            <span className="hidden sm:inline">New analysis</span>
+            <Briefcase className="h-4 w-4 lg:mr-2" />
+            <span className="hidden lg:inline">New analysis</span>
           </Button>
         </div>
       </header>
