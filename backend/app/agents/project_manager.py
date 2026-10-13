@@ -178,6 +178,10 @@ def wire_stage_dependencies(items: List[Any]) -> None:
             required = [candidate for candidate in by_id if candidate != item.id]
         elif item.id in modeling_ids:
             required = data_collection_ids or foundation_ids
+            if agent in {"dcf_lbo_architect", "advanced_financial_modeler"}:
+                # Run after the valuation agent so every DCF/LBO starts from its WACC and growth
+                # (shared_assumptions_note) instead of picking its own.
+                required = required + ids_by_agent.get("valuation_agent", [])
         else:
             required = list(getattr(item, "depends_on", []) or [])
         item.depends_on = list(dict.fromkeys(

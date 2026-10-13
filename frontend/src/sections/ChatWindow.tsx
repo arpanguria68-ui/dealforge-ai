@@ -326,11 +326,35 @@ function extractCompanyName(text: string): string {
     return match ? match[1].trim() : 'Target Company';
 }
 
+function formatMoney(value: number): string {
+    const abs = Math.abs(value);
+    const sign = value < 0 ? '-' : '';
+    if (abs >= 1e9) return `${sign}$${(abs / 1e9).toFixed(2)}B`;
+    if (abs >= 1e6) return `${sign}$${(abs / 1e6).toFixed(1)}M`;
+    if (abs >= 1e3) return `${sign}$${(abs / 1e3).toFixed(1)}K`;
+    return `${sign}$${abs.toFixed(0)}`;
+}
+
+function formatMetricValue(metric: string, raw: unknown): string {
+    const num = typeof raw === 'number' ? raw
+        : typeof raw === 'string' && raw.trim() !== '' && Number.isFinite(Number(raw)) ? Number(raw) : null;
+    if (num === null) return String(raw);
+    if (/growth|margin|rate|percent/i.test(metric)) return `${num.toFixed(1)}%`;
+    return formatMoney(num);
+}
+
+function formatDuration(ms: number): string {
+    if (ms < 1000) return `${Math.round(ms)}ms`;
+    const seconds = ms / 1000;
+    if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
+    return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+}
+
 function formatAgentSummaryLine(agentLabel: string, result: Record<string, unknown>): string {
     const data = result.data && typeof result.data === 'object' ? result.data as Record<string, unknown> : {};
     if (data.confidence_basis === 'not_calibrated_source_report' || data.synthesis_status === 'deterministic_source_report') {
         const sourceLabel = data.data_source === 'sec_edgar_companyfacts' ? 'SEC-sourced facts' : 'Vendor-sourced facts';
-        const time = typeof result.execution_time_ms === 'number' ? ` · ${Math.round(result.execution_time_ms as number)}ms` : '';
+        const time = typeof result.execution_time_ms === 'number' ? ` · ${formatDuration(result.execution_time_ms as number)}` : '';
         const synthesis = data.synthesis_status === 'partial_provider_unavailable'
             ? '; model synthesis incomplete' : '';
         return `**${agentLabel}** — ${sourceLabel}${synthesis}; confidence not calibrated${time}`;
@@ -341,7 +365,7 @@ function formatAgentSummaryLine(agentLabel: string, result: Record<string, unkno
     const confidence = calibrated && typeof result.confidence === 'number'
         ? `${Math.round((result.confidence as number) * 100)}%`
         : 'not calibrated';
-    const time = typeof result.execution_time_ms === 'number' ? `${Math.round(result.execution_time_ms as number)}ms` : '';
+    const time = typeof result.execution_time_ms === 'number' ? formatDuration(result.execution_time_ms as number) : '';
     return `**${agentLabel}** — ${calibrated ? `Confidence: ${confidence}` : `Agent-reported confidence; not calibrated`}${time ? ` · ${time}` : ''}`;
 }
 
@@ -483,10 +507,11 @@ function buildSynthesisMessage(completedResults: AgentResult[], taskList: TaskPl
     let dealScore: number | null = null;
     let sourceCount = 0;
     let synthesisIncomplete = false;
+    const reconciliationNotes = new Set<string>();
 
     const addMetric = (metric: string, value: unknown, period: unknown, source: string) => {
         if ((typeof value === 'number' && Number.isFinite(value)) || (typeof value === 'string' && value.trim())) {
-            metrics.push({ metric, value: String(value), period: typeof period === 'string' ? period : 'Not established', source });
+            metrics.push({ metric, value: formatMetricValue(metric, value), period: typeof period === 'string' ? period : 'Not established', source });
         }
     };
 
@@ -519,6 +544,17 @@ function buildSynthesisMessage(completedResults: AgentResult[], taskList: TaskPl
             addMetric('Long-term debt', balance.long_term_debt, balance.debt_fiscal_year, label);
             const sourceRows = Array.isArray(data.sources) ? data.sources : [];
             sourceCount += sourceRows.filter(source => source && typeof source === 'object' && 'url' in source).length;
+        }
+
+        if (agent === 'valuation_agent' && data.valuations && typeof data.valuations === 'object') {
+            const v = data.valuations as Record<string, { value?: unknown }>;
+            if (typeof v.dcf?.value === 'number') addMetric('DCF enterprise value', v.dcf.value, 'Current', label);
+            if (typeof v.comparable_companies?.value === 'number') addMetric('Comparable-companies value', v.comparable_companies.value, 'Current', label);
+            if (typeof data.weighted_estimate === 'number') addMetric('Weighted valuation estimate', data.weighted_estimate, 'Current', label);
+        }
+        for (const issue of Array.isArray(data.reconciliation) ? data.reconciliation : []) {
+            const text = issue && typeof issue === 'object' ? String((issue as Record<string, unknown>).message || '') : '';
+            if (text) reconciliationNotes.add(text);
         }
 
         const riskRows = [data.risks, data.key_risks, data.top_risks].filter(Array.isArray).flat() as unknown[];
@@ -566,6 +602,7 @@ function buildSynthesisMessage(completedResults: AgentResult[], taskList: TaskPl
         md += `\n\n### Evidence Snapshot\n\n| Measure | Recorded value | Period | Producing agent |\n| --- | ---: | --- | --- |\n`;
         for (const metric of uniqueMetrics.slice(0, 12)) md += `| ${metric.metric} | ${metric.value} | ${metric.period} | ${metric.source} |\n`;
     }
+    if (reconciliationNotes.size) md += `\n\n### Agents Disagree — Resolve Before Relying On These Figures\n\n${[...reconciliationNotes].map(item => `- ${item}`).join('\n')}`;
     if (findings.length) md += `\n\n### Derived Findings\n\n${findings.slice(0, 4).map(item => `- ${item}`).join('\n')}`;
     if (risks.length) md += `\n\n### Key Risks\n\n${risks.slice(0, 5).map(item => `- ${item}`).join('\n')}`;
     if (limitations.size) md += `\n\n### Diligence Gaps and Caveats\n\n${[...limitations].slice(0, 6).map(item => `- ${item}`).join('\n')}`;
@@ -1650,7 +1687,12 @@ export function ChatWindow() {
 
             // ─── Synthesis (Perplexity-style) ───
             setPhase('synthesizing');
-            const companyName = extractCompanyName(userText);
+            // The last reply may be "skip" or "go ahead"; the target is named in the first message.
+            let companyName = extractCompanyName(userText);
+            if (companyName === 'Target Company') {
+                const firstPrompt = messages.find(message => message.role === 'user')?.content;
+                if (typeof firstPrompt === 'string') companyName = extractCompanyName(firstPrompt);
+            }
             const synthesisContent = buildSynthesisMessage(completedResults, taskList, companyName, failedCount);
             addMessage({
                 role: 'agent', agentName: 'DealForge Summary',

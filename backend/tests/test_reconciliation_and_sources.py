@@ -108,3 +108,31 @@ def test_lbo_per_share_and_multiples_are_not_entry_value():
 
     results = [{"agent_type": "dcf_lbo_architect", "data": {"lbo": {"purchase_price_per_share": 40, "entry_multiple": 12}}}]
     assert reconcile(results, market_ev=580_000_000) == []
+
+
+def _architect_result(bridge, entry="$669.68"):
+    return {"agent_type": "dcf_lbo_architect", "data": {
+        "unit": "Millions (unless specified otherwise) USD",
+        "dcf_model": {"valuation_bridge": bridge, "scenario_summary": [
+            {"scenario": "Bear", "implied_enterprise_value": "$560.4"},
+            {"scenario": "Bull", "implied_enterprise_value": "$775.2"}]},
+        "lbo_model": {"deal_structure": {"entry_valuation": entry}},
+    }}
+
+
+def test_declared_unit_scales_bare_figures_and_scenarios_are_not_separate_dcfs():
+    from app.core.validation.reconciliation import extract_figures, reconcile
+
+    result = _architect_result({"pv_fcfs_5y": "$300.0", "pv_terminal_value": "$350.7", "enterprise_value": "$650.67"})
+    figures = extract_figures([result])
+    assert [round(e["value"] / 1e6) for e in figures["dcf_ev"]] == [651]
+    assert [round(e["value"] / 1e6) for e in figures["lbo_entry_ev"]] == [670]
+    assert reconcile([result], market_ev=582_000_000) == []   # one agent's bear/bull spread is not a conflict
+
+
+def test_dcf_bridge_that_does_not_add_up_is_flagged():
+    from app.core.validation.reconciliation import reconcile
+
+    result = _architect_result({"pv_fcfs_5y": "$847.37", "pv_terminal_value": "$789.60", "enterprise_value": "$650.67"})
+    issues = reconcile([result])
+    assert [i["metric"] for i in issues] == ["DCF bridge does not add up"]

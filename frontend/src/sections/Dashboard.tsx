@@ -13,9 +13,26 @@ import {
     Download, FileSpreadsheet, Presentation, Archive, Loader2
 } from 'lucide-react';
 import {
-    BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell
+    BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
 } from 'recharts';
 import { API_BASE, withAdminAuth } from '@/lib/api-base';
+
+interface DealInsights {
+    valuation?: { dcf?: number; comps?: number; weighted?: number };
+    market_ev?: number;
+    grounding?: { grounded?: number; total?: number };
+    tools?: { ok: number; failed: number };
+    reconciliation?: string[];
+    needs_review?: boolean;
+}
+
+const money = (value?: number): string => {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return '—';
+    const abs = Math.abs(value);
+    if (abs >= 1e9) return `$${(value / 1e9).toFixed(2)}B`;
+    if (abs >= 1e6) return `$${(value / 1e6).toFixed(0)}M`;
+    return `$${value.toLocaleString()}`;
+};
 
 interface DealRecord {
     id: string;
@@ -27,6 +44,7 @@ interface DealRecord {
     current_stage: string;
     final_score: number | null;
     agents_run: string[];
+    insights?: DealInsights;
     created_at: string;
     updated_at: string;
 }
@@ -76,6 +94,7 @@ interface Metrics {
     completed_deals: number;
     avg_confidence: number | null;
     high_risk_alerts: number;
+    needs_review_deals?: number;
     deals: DealRecord[];
     agent_activity: AgentEvent[];
 }
@@ -971,7 +990,7 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
                             {loading ? <span className="animate-pulse">—</span> : (metrics?.active_deals ?? 0)}
                         </div>
                         <p className="text-xs text-muted-foreground">
-                            {metrics?.total_deals ?? 0} total in pipeline
+                            Not yet analysed · {metrics?.total_deals ?? 0} total in pipeline
                         </p>
                     </CardContent>
                 </Card>
@@ -991,14 +1010,14 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
 
                 <Card className="hover:shadow-md transition-all duration-200">
                     <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                        <CardTitle className="text-sm font-medium">Risk Alerts</CardTitle>
+                        <CardTitle className="text-sm font-medium">Needs Review</CardTitle>
                         <AlertTriangle className="h-4 w-4 text-red-500" />
                     </CardHeader>
                     <CardContent>
                         <div className="text-2xl font-bold">
-                            {loading ? <span className="animate-pulse">—</span> : (metrics?.high_risk_alerts ?? 0)}
+                            {loading ? <span className="animate-pulse">—</span> : (metrics?.needs_review_deals ?? 0)}
                         </div>
-                        <p className="text-xs text-muted-foreground">Deal score below 50%</p>
+                        <p className="text-xs text-muted-foreground">Awaiting reviewer approval or flagged by checks</p>
                     </CardContent>
                 </Card>
 
@@ -1019,41 +1038,39 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
             {/* Analytics Charts */}
             {metrics && metrics.deals.length > 0 && (
                 <div className="grid gap-4 md:grid-cols-2">
-                    {/* Deal Score Distribution */}
+                    {/* Valuation vs market enterprise value (recorded values only) */}
                     <Card>
                         <CardHeader className="pb-2">
-                            <CardTitle className="text-sm font-medium">Deal Score Distribution</CardTitle>
-                            <CardDescription>Final scores across all analyzed deals</CardDescription>
+                            <CardTitle className="text-sm font-medium">Valuation vs Market EV</CardTitle>
+                            <CardDescription>Weighted valuation estimate against current market enterprise value ($M)</CardDescription>
                         </CardHeader>
                         <CardContent>
-                            <ResponsiveContainer width="100%" height={200}>
-                                <BarChart
-                                    data={[...metrics.deals]
-                                        .filter(d => d.final_score !== null)
-                                        .map(d => ({
-                                            name: d.name.length > 12 ? d.name.slice(0, 12) + '…' : d.name,
-                                            score: Math.round((d.final_score ?? 0) * (d.final_score! > 1 ? 1 : 100)),
-                                        }))}
-                                    margin={{ top: 4, right: 8, left: -20, bottom: 4 }}
-                                >
-                                    <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
-                                    <XAxis dataKey="name" tick={{ fontSize: 10 }} />
-                                    <YAxis domain={[0, 100]} tick={{ fontSize: 10 }} />
-                                    <Tooltip
-                                        formatter={(v: number) => [`${v}/100`, 'Score']}
-                                        contentStyle={{ fontSize: 12 }}
-                                    />
-                                    <Bar dataKey="score" radius={[4, 4, 0, 0]}>
-                                        {[...metrics.deals]
-                                            .filter(d => d.final_score !== null)
-                                            .map((d, i) => {
-                                                const s = Math.round((d.final_score ?? 0) * (d.final_score! > 1 ? 1 : 100));
-                                                const color = s >= 70 ? '#22c55e' : s >= 50 ? '#f59e0b' : '#ef4444';
-                                                return <Cell key={i} fill={color} />;
-                                            })}
-                                    </Bar>
-                                </BarChart>
-                            </ResponsiveContainer>
+                            {(() => {
+                                const rows = [...metrics.deals]
+                                    .filter(d => d.insights?.valuation?.weighted)
+                                    .sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)))
+                                    .slice(0, 6)
+                                    .map(d => ({
+                                        name: `${d.target_company} ${d.id.slice(0, 4)}`,
+                                        weighted: Math.round((d.insights!.valuation!.weighted as number) / 1e6),
+                                        market: d.insights!.market_ev ? Math.round(d.insights!.market_ev / 1e6) : undefined,
+                                    }));
+                                if (!rows.length) {
+                                    return <p className="py-16 text-center text-xs text-muted-foreground">No valuation recorded yet. Run a deal with a valuation agent.</p>;
+                                }
+                                return (
+                                    <ResponsiveContainer width="100%" height={200}>
+                                        <BarChart data={rows} margin={{ top: 4, right: 8, left: -10, bottom: 4 }}>
+                                            <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
+                                            <XAxis dataKey="name" tick={{ fontSize: 10 }} />
+                                            <YAxis tick={{ fontSize: 10 }} />
+                                            <Tooltip formatter={(v: number, n: string) => [`$${v}M`, n === 'weighted' ? 'Weighted valuation' : 'Market EV']} contentStyle={{ fontSize: 12 }} />
+                                            <Bar dataKey="weighted" fill="#6366f1" radius={[4, 4, 0, 0]} />
+                                            <Bar dataKey="market" fill="#94a3b8" radius={[4, 4, 0, 0]} />
+                                        </BarChart>
+                                    </ResponsiveContainer>
+                                );
+                            })()}
                         </CardContent>
                     </Card>
 
@@ -1183,6 +1200,43 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
                                                     </div>
                                                 )}
                                             </div>
+
+                                            {deal.insights && (
+                                                <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px]">
+                                                    {deal.insights.valuation?.weighted !== undefined && (
+                                                        <span className="rounded-md bg-indigo-500/10 px-2 py-0.5 text-indigo-300" title="Weighted DCF / comps estimate">
+                                                            Valuation {money(deal.insights.valuation.weighted)}
+                                                        </span>
+                                                    )}
+                                                    {deal.insights.valuation?.dcf !== undefined && (
+                                                        <span className="rounded-md bg-muted px-2 py-0.5">DCF {money(deal.insights.valuation.dcf)}</span>
+                                                    )}
+                                                    {deal.insights.valuation?.comps !== undefined && (
+                                                        <span className="rounded-md bg-muted px-2 py-0.5">Comps {money(deal.insights.valuation.comps)}</span>
+                                                    )}
+                                                    {deal.insights.market_ev !== undefined && (
+                                                        <span className="rounded-md bg-muted px-2 py-0.5">Market EV {money(deal.insights.market_ev)}</span>
+                                                    )}
+                                                    {deal.insights.grounding?.total ? (
+                                                        <span className="rounded-md bg-emerald-500/10 px-2 py-0.5 text-emerald-300" title="Memo figures traced to recorded evidence">
+                                                            {deal.insights.grounding.grounded}/{deal.insights.grounding.total} figures sourced
+                                                        </span>
+                                                    ) : null}
+                                                    {deal.insights.tools && (
+                                                        <span className="rounded-md bg-muted px-2 py-0.5" title="Tool calls recorded by the agents">
+                                                            {deal.insights.tools.ok} tool calls ok{deal.insights.tools.failed ? `, ${deal.insights.tools.failed} failed` : ''}
+                                                        </span>
+                                                    )}
+                                                    {deal.insights.needs_review && (
+                                                        <span className="rounded-md bg-amber-500/15 px-2 py-0.5 text-amber-300">Review required</span>
+                                                    )}
+                                                </div>
+                                            )}
+                                            {deal.insights?.reconciliation?.length ? (
+                                                <ul className="mt-1.5 list-disc pl-5 text-[11px] text-amber-300/90">
+                                                    {deal.insights.reconciliation.map((message, i) => <li key={i}>{message}</li>)}
+                                                </ul>
+                                            ) : null}
 
                                             <div className="flex items-center justify-between pt-2">
                                                 <span className="text-xs text-muted-foreground font-mono">{deal.target_company} · {deal.industry}</span>

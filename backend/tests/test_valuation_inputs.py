@@ -179,3 +179,15 @@ def test_shared_assumptions_note_from_valuation_audit():
     note = shared_assumptions_note(results)
     assert "WACC 12.34%" in note and "$50,000,000" in note and "above it" in note
     assert shared_assumptions_note([{"agent_type": "x", "data": {}}]) == ""
+
+
+def test_dcf_lbo_agents_depend_on_valuation_agent():
+    from types import SimpleNamespace as NS
+    from app.agents.project_manager import wire_stage_dependencies
+
+    items = [NS(id="c", title="Pull SEC filings", description="retrieve financial statements", assigned_agent="data_curator", depends_on=[]),
+             NS(id="v", title="Comps", description="peer valuation", assigned_agent="valuation_agent", depends_on=[]),
+             NS(id="d", title="DCF and LBO", description="model", assigned_agent="dcf_lbo_architect", depends_on=[])]
+    wire_stage_dependencies(items)
+    assert "v" in items[2].depends_on
+    assert "d" not in items[1].depends_on   # no cycle

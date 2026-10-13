@@ -225,7 +225,7 @@ def validate_agent_output(output_type: str, data: dict) -> dict:
 def format_validation_block(result: dict) -> str:
     """Format validation results as a readable block for chat output."""
     if result["valid"] and not result.get("warnings"):
-        return "\n\n✅ **Validation Passed** — All mathematical checks verified."
+        return "\n\n✅ **Validation Passed** — no arithmetic inconsistencies found in the fields checked."
 
     lines = []
     if result["valid"]:

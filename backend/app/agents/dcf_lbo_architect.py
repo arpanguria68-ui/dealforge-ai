@@ -76,7 +76,9 @@ class DCFLBOArchitectAgent(BaseAgent):
                 success=True,
                 data=analysis,
                 reasoning=f"Built financial model covering DCF/LBO analysis. "
-                f"Deterministic calcs: {len(calc_results)} models executed.",
+                + (f"Deterministic calculations: {len(calc_results)} cross-checked."
+                   if calc_results else
+                   "No deterministic cross-check ran (no structured financial inputs); figures are model-stated."),
                 confidence=self._evidence_confidence(0.85, result, analysis),
                 execution_time_ms=elapsed,
                 tool_calls=result.get("tool_calls"),

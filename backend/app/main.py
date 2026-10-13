@@ -516,6 +516,61 @@ async def get_deal_agent_messages(deal_id: str):
     return {"deal_id": deal_id, "messages": messages}
 
 
+def summarize_deal_insights(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Decision-grade facts for a dashboard row, read from the agents' recorded results.
+
+    ``results`` are ``{"agent_type", "data"}`` records. Only recorded values are reported:
+    a missing valuation stays absent rather than being estimated.
+    """
+    from app.core.validation.reconciliation import reconcile
+
+    insights: Dict[str, Any] = {}
+    market_ev = None
+    tools_ok = tools_failed = 0
+    review = False
+    for record in results:
+        data = record.get("data")
+        if not isinstance(data, dict):
+            continue
+        for call in data.get("tools_used") or []:
+            if isinstance(call, dict):
+                if call.get("success"):
+                    tools_ok += 1
+                else:
+                    tools_failed += 1
+        if data.get("human_review_required"):
+            review = True
+        if record.get("agent_type") == "valuation_agent":
+            valuations = data.get("valuations") if isinstance(data.get("valuations"), dict) else {}
+            dcf = (valuations.get("dcf") or {}).get("value")
+            comps = (valuations.get("comparable_companies") or {}).get("value")
+            valuation = {
+                key: value for key, value in (
+                    ("dcf", dcf), ("comps", comps), ("weighted", data.get("weighted_estimate"))
+                ) if isinstance(value, (int, float)) and abs(value) >= 1e6  # smaller: unit unknown
+            }
+            if valuation:
+                insights["valuation"] = valuation
+            market = (((data.get("audit") or {}).get("inputs") or {}).get("market_data") or {})
+            if isinstance(market.get("enterprise_value"), (int, float)):
+                market_ev = float(market["enterprise_value"])
+                insights["market_ev"] = market_ev
+        if record.get("agent_type") == "investment_memo_agent":
+            grounding = data.get("grounding") if isinstance(data.get("grounding"), dict) else {}
+            if grounding.get("figures_total"):
+                insights["grounding"] = {
+                    "grounded": grounding.get("figures_grounded"), "total": grounding.get("figures_total"),
+                }
+    issues = reconcile(results, market_ev=market_ev)
+    if issues:
+        insights["reconciliation"] = [issue["message"] for issue in issues][:3]
+    if tools_ok or tools_failed:
+        insights["tools"] = {"ok": tools_ok, "failed": tools_failed}
+    if review or issues:
+        insights["needs_review"] = True
+    return insights
+
+
 @app.get("/api/v1/dashboard/metrics")
 async def dashboard_metrics():
     """Return live dashboard KPIs and agent activity feed"""
@@ -549,6 +604,28 @@ async def dashboard_metrics():
     )
     active = sum(1 for d in deals if d["status"] in ("created", "running"))
     completed = sum(1 for d in deals if d["status"] == "completed")
+    needs_review = sum(1 for d in deals if d.get("status") == "needs_review")
+
+    # Recorded results for the most recent deals only; older runs stay as they were.
+    recent = sorted(
+        (d for d in deals if d.get("agents_run")), key=lambda d: str(d.get("updated_at") or ""), reverse=True
+    )[:12]
+    try:
+        from app.core.tasks.task_manager import get_task_manager
+
+        manager = get_task_manager()
+        for deal in recent:
+            records: List[Dict[str, Any]] = []
+            for todo in await manager.get_lists_for_deal(deal["id"]):
+                records += [
+                    {"agent_type": item.assigned_agent, "data": item.result}
+                    for item in todo.items if item.status == "done" and isinstance(item.result, dict)
+                ]
+            insights = summarize_deal_insights(records) if records else {}
+            if insights:
+                deal["insights"] = insights
+    except Exception as exc:
+        logger.warning("dashboard_insights_unavailable", error=str(exc))
 
     return {
         "total_deals": total,
@@ -556,6 +633,7 @@ async def dashboard_metrics():
         "completed_deals": completed,
         "avg_confidence": avg_confidence,
         "high_risk_alerts": high_risk,
+        "needs_review_deals": needs_review,
         "deals": deals,
         "agent_activity": agent_activity[-20:],  # last 20 events
     }
