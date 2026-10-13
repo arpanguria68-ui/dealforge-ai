@@ -308,6 +308,7 @@ class FinancialAnalystAgent(BaseAgent):
                 analysis_data["calculations"] = tool_results
 
             if not source_grounded_fallback:
+                self._merge_sourced_facts(analysis_data, (context or {}).get("financial_data"), requested_period_count)
                 self._enforce_evidence_grounding(analysis_data, task, context or {}, tool_results)
 
             await self._apply_laya_output_gate(task, analysis_data)
@@ -334,6 +335,36 @@ class FinancialAnalystAgent(BaseAgent):
                 reasoning=f"Analysis failed: {str(e)}",
                 confidence=0.0,
             )
+
+    @classmethod
+    def _merge_sourced_facts(
+        cls, analysis: Dict[str, Any], financial_data: Any, period_limit: Optional[int] = None
+    ) -> None:
+        """Overlay filing-linked statement facts on the model's analysis.
+
+        The model writes the narrative but drops the per-year history, filing URLs and the
+        fiscal periods; without them every figure is "unsourced" downstream. The
+        deterministic readout from the fetched statements is authoritative for numbers,
+        and the model's prose fields are left alone.
+        """
+        if not (isinstance(financial_data, dict) and financial_data.get("has_data")):
+            return
+        sourced = cls._statement_data_assessment(financial_data, period_limit=period_limit)
+        if not sourced.get("historical_financials"):
+            return
+        for key in ("historical_financials", "sources", "data_source", "source_url", "retrieved_at"):
+            if sourced.get(key):
+                analysis[key] = sourced[key]
+        for section in ("revenue_analysis", "cash_flow", "balance_sheet"):
+            facts = sourced.get(section)
+            if isinstance(facts, dict) and facts:
+                current = analysis.get(section) if isinstance(analysis.get(section), dict) else {}
+                analysis[section] = {**current, **{k: v for k, v in facts.items() if v is not None}}
+        existing = analysis.get("key_findings") if isinstance(analysis.get("key_findings"), list) else []
+        known = {str(f.get("finding")) for f in existing if isinstance(f, dict)}
+        analysis["key_findings"] = existing + [
+            f for f in sourced.get("key_findings", []) if isinstance(f, dict) and str(f.get("finding")) not in known
+        ]
 
     async def _apply_laya_output_gate(self, task: str, analysis: Dict[str, Any]) -> None:
         """Use Laya as an advisory unsupported-claim gate, never as an arithmetic oracle."""

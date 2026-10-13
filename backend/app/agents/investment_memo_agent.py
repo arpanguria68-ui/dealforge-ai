@@ -12,6 +12,7 @@ from datetime import datetime
 from app.agents.base import BaseAgent, AgentOutput
 from app.core.prompt_context import render_context
 from app.core.validation.memo_grounding import check_memo_grounding, grounding_notice
+from app.core.validation.reconciliation import reconcile, reconciliation_notice
 
 # Context keys that are runtime objects or duplicated elsewhere in the prompt.
 _CONTEXT_EXCLUDE = {"agent_results", "kb_graph", "knowledge_graph_context", "risk_data"}
@@ -109,6 +110,8 @@ RULES:
 - Flag assumptions explicitly
 - Use ONLY figures that appear in AGENT FINDINGS or VERIFIED VALUATION INPUTS. If a figure was
   not retrieved, write "not retrieved" instead of estimating it from memory
+- If CROSS-AGENT RECONCILIATION ISSUES are listed, report them in the memo and do not present the
+  conflicting figures as consistent or average them
 - Do not cite data vendors or publishers (Bloomberg, Capital IQ, FactSet, Gartner, IDC, ...)
   unless they appear in the findings
 - Where a figure you derive yourself (scenario IRR, sensitivity) is shown, label it
@@ -125,6 +128,9 @@ RULES:
             verified = _verified_valuation_block(agent_results)
             if verified:
                 prompt += "\n" + verified + "\n"
+            reconciliation = reconcile(agent_results)
+            if reconciliation:
+                prompt += "\n" + reconciliation_notice(reconciliation) + "\n"
 
             # Cross-agent risks from the deal knowledge graph feed section 6.
             from app.core.knowledge_graph.service import format_risk_register, risk_register
@@ -164,7 +170,9 @@ RULES:
                 "risk_register": register,
                 "grounding": grounding,
             }
-            if grounding["status"] != "ok":
+            if reconciliation:
+                analysis["reconciliation"] = reconciliation
+            if grounding["status"] != "ok" or reconciliation:
                 analysis["human_review_required"] = True
             analysis.update(await self._build_memo_files(context))
 

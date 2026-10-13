@@ -417,6 +417,12 @@ async def prepare_document_payload(registry: Any, deal: Dict[str, Any], activiti
         + [str(point.get("metric")) for point in evidence.get("data_points", []) if point.get("metric")]
     ))[:40]
     evidence["metric_conflicts"] = _metric_conflicts(agent_results)
+    from app.core.validation.reconciliation import reconcile
+
+    evidence["metric_conflicts"] += [
+        {"metric": issue["metric"], "reports": issue["reports"], "message": issue["message"]}
+        for issue in reconcile(agent_results)
+    ]
     fallback = default_document_blueprint(deal, evidence)
     analyst_data: Dict[str, Any] = {}
     synthesis_provider = None

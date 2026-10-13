@@ -3379,6 +3379,19 @@ async def _await_agent_execution(execution, agent_type: str, timeout_seconds: in
         ) from exc
 
 
+def _with_tools_used(result: Any) -> Any:
+    """Agent data plus the tools it actually called (name, outcome), for the report and the UI."""
+    data = getattr(result, "data", None)
+    calls = getattr(result, "tool_calls", None)
+    if not isinstance(data, dict) or not isinstance(calls, list) or not calls or "tools_used" in data:
+        return data
+    used = [
+        {"name": str(c.get("name")), "success": bool(c.get("success")), **({"error": c["error"]} if c.get("error") else {})}
+        for c in calls if isinstance(c, dict) and c.get("name")
+    ]
+    return {**data, "tools_used": used} if used else data
+
+
 @app.post("/api/v1/chat/execute-task")
 async def chat_execute_task(request: Request):
     """Execute a single task from the scrum master's plan via the assigned agent."""
@@ -3600,7 +3613,7 @@ async def chat_execute_task(request: Request):
             "reasoning": result.reasoning,
             "confidence": result.confidence,
             "execution_time_ms": result.execution_time_ms,
-            "data": result.data,
+            "data": _with_tools_used(result),
             "provider": actual_provider,
             "used_fallback": used_fallback,
             "task_title": task_title,

@@ -2055,7 +2055,7 @@ export function ChatWindow() {
                         const conf = isUncalibratedSourceReport
                             ? undefined
                             : msg.metadata?.confidence;
-                        if (messageCites.length === 0 && typeof conf !== 'number' && !msg.metadata?.grounding && !msg.metadata?.audit) return null;
+                        if (messageCites.length === 0 && typeof conf !== 'number' && !msg.metadata?.grounding && !msg.metadata?.audit && !msg.metadata?.reconciliation) return null;
                         return (
                             <div className="mt-2 w-full space-y-1.5">
                                 {typeof conf === 'number' && (

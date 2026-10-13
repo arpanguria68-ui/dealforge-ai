@@ -8,6 +8,11 @@ interface Grounding {
     unsupported_sources?: string[];
 }
 
+interface ReconciliationIssue {
+    metric?: string;
+    message?: string;
+}
+
 interface ValuationAudit {
     sources?: string[];
     assumptions?: string[];
@@ -36,7 +41,10 @@ export function ProvenanceBar({ data }: { data: unknown }) {
     const assumptions = strings(audit?.assumptions);
     const missing = strings(audit?.missing);
     const hasAudit = auditSources.length + assumptions.length + missing.length > 0;
-    if (!hasGrounding && !hasAudit) return null;
+    const reconciliation = Array.isArray(data.reconciliation)
+        ? (data.reconciliation as ReconciliationIssue[]).filter(issue => issue && typeof issue.message === 'string')
+        : [];
+    if (!hasGrounding && !hasAudit && reconciliation.length === 0) return null;
 
     const ok = grounding?.status === 'ok';
     const ungrounded = strings(grounding?.ungrounded);
@@ -44,6 +52,16 @@ export function ProvenanceBar({ data }: { data: unknown }) {
 
     return (
         <div className="mt-2 w-full space-y-1.5 text-[11px]">
+            {reconciliation.length > 0 && (
+                <div className="rounded-xl border border-amber-500/25 bg-amber-500/[0.05] px-3 py-2 text-amber-200/90" role="alert">
+                    <p className="flex items-center gap-1.5 font-medium text-amber-300">
+                        <AlertTriangle className="h-3.5 w-3.5" /> Agents disagree: resolve before relying on these figures
+                    </p>
+                    <ul className="mt-1 list-disc pl-5 text-white/60">
+                        {reconciliation.map((issue, i) => <li key={i}>{issue.message}</li>)}
+                    </ul>
+                </div>
+            )}
             {hasGrounding && grounding && (
                 <details className={`rounded-xl border ${ok ? 'border-emerald-500/20 bg-emerald-500/[0.04]' : 'border-amber-500/25 bg-amber-500/[0.05]'} overflow-hidden`}>
                     <summary className={`flex cursor-pointer list-none items-center gap-1.5 px-3 py-2 font-medium ${ok ? 'text-emerald-300' : 'text-amber-300'}`}>

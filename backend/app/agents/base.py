@@ -682,7 +682,13 @@ PROTOCOL
                 reported.add(key)
                 round_results.append(entry)
             accumulated_tool_results.extend(round_results)
-            all_function_calls.extend(calls)
+            for call, key in zip(calls, memo_keys):  # record outcomes on copies, not the executed calls
+                outcome = call_memo.get(key, {})
+                all_function_calls.append({
+                    **call,
+                    "success": bool(outcome.get("success")),
+                    **({"error": str(outcome["error"])[:200]} if outcome.get("error") else {}),
+                })
             pending_tool_results = True
 
             if not fresh:

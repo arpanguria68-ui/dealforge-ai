@@ -259,6 +259,11 @@ async def gather_market_inputs(
 
     beta = _num(target.get("beta"))
     market_cap = _num(target.get("marketCapitalization"))  # $M
+    market_ev = _num(target.get("enterpriseValue"))  # $M
+    if market_ev:
+        out["market_data"]["enterprise_value"] = market_ev * 1e6
+    if market_cap:
+        out["market_data"]["market_cap"] = market_cap * 1e6
     if beta is not None and market_cap:
         debt_ratio = _num(target.get("totalDebt/totalEquityQuarterly")) or 0.0
         wacc = build_wacc(beta, market_cap, debt_ratio * market_cap, a)

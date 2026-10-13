@@ -72,6 +72,18 @@ class FinanceAnalysisTool(BaseTool):
                     "description": "Number of years of historical data to analyze (max 10 for free tier)",
                     "default": 3,
                 },
+                "growth_rate": {
+                    "type": "number",
+                    "description": "DCF only: annual free-cash-flow growth over the forecast (e.g. 0.12). Defaults to an assumption.",
+                },
+                "perpetual_growth_rate": {
+                    "type": "number",
+                    "description": "DCF only: terminal growth (e.g. 0.025). Defaults to 0.025.",
+                },
+                "wacc": {
+                    "type": "number",
+                    "description": "DCF only: discount rate (e.g. 0.096). Defaults to an assumption.",
+                },
             },
             "required": ["tickers"],
         }
@@ -83,6 +95,9 @@ class FinanceAnalysisTool(BaseTool):
         sub_type: str = "valuation",
         quarterly: bool = False,
         years_history: int = 3,
+        growth_rate: Optional[float] = None,
+        perpetual_growth_rate: Optional[float] = None,
+        wacc: Optional[float] = None,
         **kwargs,
     ) -> ToolResult:
         Toolkit = _try_import_toolkit()
@@ -153,8 +168,25 @@ class FinanceAnalysisTool(BaseTool):
             elif analysis_type == "dcf":
                 # Assuming simple growth rates for the intrinsic valuation out out of box
                 # In a real scenario, these could be parameters
-                dcf_df = toolkit.models.get_intrinsic_valuation()
+                # The library requires all three inputs. Anything the caller did not supply is an
+                # explicit, reported assumption rather than a hidden default.
+                assumed = {}
+                g_rate, p_rate, d_rate = growth_rate, perpetual_growth_rate, wacc
+                if g_rate is None:
+                    g_rate, assumed["growth_rate"] = 0.08, "default 8% (not supplied)"
+                if p_rate is None:
+                    p_rate, assumed["perpetual_growth_rate"] = 0.025, "default 2.5% (not supplied)"
+                if d_rate is None:
+                    d_rate, assumed["wacc"] = 0.10, "default 10% (not supplied)"
+                dcf_df = toolkit.models.get_intrinsic_valuation(
+                    growth_rate=g_rate,
+                    perpetual_growth_rate=p_rate,
+                    weighted_average_cost_of_capital=d_rate,
+                )
                 result_data = dcf_df.to_dict()
+                result_data["_inputs"] = {
+                    "growth_rate": g_rate, "perpetual_growth_rate": p_rate, "wacc": d_rate, "assumed": assumed,
+                }
 
             elif analysis_type == "wacc":
                 wacc_df = toolkit.models.get_weighted_average_cost_of_capital()
