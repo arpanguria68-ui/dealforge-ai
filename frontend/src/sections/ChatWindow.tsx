@@ -343,6 +343,11 @@ function formatMetricValue(metric: string, raw: unknown): string {
     return formatMoney(num);
 }
 
+function filenameFromDisposition(header: string | null): string {
+    const match = header?.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+    return match ? decodeURIComponent(match[1]) : '';
+}
+
 function formatDuration(ms: number): string {
     if (ms < 1000) return `${Math.round(ms)}ms`;
     const seconds = ms / 1000;
@@ -766,6 +771,7 @@ export function ChatWindow() {
     const [collapsedAgents, setCollapsedAgents] = useState<Record<string, boolean>>({});
     const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
     const [followUps, setFollowUps] = useState<string[]>([]);
+    const [exporting, setExporting] = useState<'docx' | 'json' | null>(null);
     const [copiedId, setCopiedId] = useState<string | null>(null);
     const [ratedIds, setRatedIds] = useState<Record<number, 'up' | 'down'>>({});
     const [editingMsgId, setEditingMsgId] = useState<string | null>(null);
@@ -1727,6 +1733,8 @@ export function ChatWindow() {
     }
 
     async function handleExport(format: 'json' | 'docx' = 'json') {
+        if (exporting) return;
+        setExporting(format);
         try {
             const dealId = activeDealId;
             if (format === 'docx') {
@@ -1743,9 +1751,17 @@ export function ChatWindow() {
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `DealForge-${dealId.slice(0, 8)}.docx`;
+                a.download = filenameFromDisposition(response.headers.get('Content-Disposition'))
+                    || `DealForge-${dealId.slice(0, 8)}.docx`;
                 a.click();
                 window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+                if (response.headers.get('X-Release-Status') === 'draft-not-approved') {
+                    addMessage({
+                        role: 'system',
+                        content: 'Word report downloaded as a draft. It is not approved for client release; a reviewer approves it from the Dashboard.',
+                        status: 'done',
+                    });
+                }
                 return;
             }
             if (!dealId) throw new Error('Save or complete an analysis before downloading its structured data.');
@@ -1766,6 +1782,8 @@ export function ChatWindow() {
             window.setTimeout(() => URL.revokeObjectURL(url), 1000);
         } catch (error) {
             addMessage({ role: 'system', content: `Export failed: ${error instanceof Error ? error.message : 'Could not create analysis export.'}`, status: 'error' });
+        } finally {
+            setExporting(null);
         }
     }
 
@@ -2186,11 +2204,17 @@ export function ChatWindow() {
                 </div>
                 {messages.length > 1 && (
                     <div className="flex shrink-0 items-center gap-1.5">
-                        <Button variant="outline" size="sm" onClick={() => handleExport('docx')} title="Download Word report (.docx)" className="h-8 border-border bg-transparent px-2.5 text-foreground hover:bg-accent hover:text-foreground sm:px-3">
-                            <FileText className="h-3.5 w-3.5 sm:mr-2" /><span className="hidden sm:inline">Report</span>
+                        <Button variant="outline" size="sm" onClick={() => handleExport('docx')} disabled={exporting !== null} aria-busy={exporting === 'docx'} title="Download Word report (.docx)" className="h-8 border-border bg-transparent px-2.5 text-foreground hover:bg-accent hover:text-foreground sm:px-3">
+                            {exporting === 'docx'
+                                ? <Loader2 className="h-3.5 w-3.5 animate-spin sm:mr-2" />
+                                : <FileText className="h-3.5 w-3.5 sm:mr-2" />}
+                            <span className="hidden sm:inline">{exporting === 'docx' ? 'Preparing…' : 'Report'}</span>
                         </Button>
-                        <Button variant="outline" size="sm" onClick={() => handleExport('json')} title="Export structured analysis data" className="h-8 border-border bg-transparent px-2.5 text-foreground hover:bg-accent hover:text-foreground sm:px-3">
-                            <Download className="h-3.5 w-3.5 sm:mr-2" /><span className="hidden sm:inline">Data</span>
+                        <Button variant="outline" size="sm" onClick={() => handleExport('json')} disabled={exporting !== null} aria-busy={exporting === 'json'} title="Export structured analysis data" className="h-8 border-border bg-transparent px-2.5 text-foreground hover:bg-accent hover:text-foreground sm:px-3">
+                            {exporting === 'json'
+                                ? <Loader2 className="h-3.5 w-3.5 animate-spin sm:mr-2" />
+                                : <Download className="h-3.5 w-3.5 sm:mr-2" />}
+                            <span className="hidden sm:inline">{exporting === 'json' ? 'Preparing…' : 'Data'}</span>
                         </Button>
                     </div>
                 )}

@@ -214,7 +214,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
+    expose_headers=["Content-Disposition", "X-Release-Status"],
 )
 
 # Request body size guard for JSON APIs (uploads have their own limit above).
@@ -2804,6 +2804,17 @@ async def get_deal_tasks(deal_id: str):
     return {"deal_id": deal_id, "todo_lists": [tl.to_dict() for tl in lists]}
 
 
+def export_download_headers(filename_base: str, extension: str, approved: bool) -> Dict[str, str]:
+    """Download headers for an on-the-fly export: unapproved reports are named and flagged as drafts."""
+    headers = {
+        **REPORT_DOWNLOAD_HEADERS,
+        "Content-Disposition": f'attachment; filename="DealForge_{filename_base}{"" if approved else "_DRAFT_not_approved"}.{extension}"',
+    }
+    if not approved:
+        headers["X-Release-Status"] = "draft-not-approved"
+    return headers
+
+
 @app.get("/api/v1/deals/{deal_id}/exports/docx")
 async def download_analysis_docx(deal_id: str, _: bool = Depends(require_admin_token)):
     """Synthesize persisted agent results and download a validated evidence-led DOCX."""
@@ -2871,13 +2882,16 @@ async def download_analysis_docx(deal_id: str, _: bool = Depends(require_admin_t
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     filename_base = re.sub(r"[^A-Za-z0-9_-]+", "_", report_deal.get("target_company", "deal-report")).strip("_") or "deal-report"
+    # Same rule as the Dashboard downloads: until a reviewer approves the reports, the file is a draft.
+    from app.core.document_store import DocumentStore
+
+    meta = await DocumentStore.get_instance().get_document_meta(deal_id, "docx")
+    approved = bool(meta) and (meta or {}).get("release_status") == "approved"
+    headers = export_download_headers(filename_base, "docx", approved)
     return Response(
         content=content,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={
-            **REPORT_DOWNLOAD_HEADERS,
-            "Content-Disposition": f'attachment; filename="DealForge_{filename_base}.docx"',
-        },
+        headers=headers,
     )
 
 

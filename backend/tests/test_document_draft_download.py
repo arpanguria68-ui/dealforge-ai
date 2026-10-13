@@ -42,3 +42,12 @@ def test_approved_report_downloads_normally_even_with_draft_flag(monkeypatch):
     response = _download(monkeypatch, "approved", draft=True)
     assert "DRAFT" not in response.headers["content-disposition"]
     assert "x-release-status" not in response.headers
+
+
+def test_on_the_fly_export_is_a_draft_until_the_reports_are_approved():
+    draft = main.export_download_headers("Acme", "docx", approved=False)
+    assert draft["Content-Disposition"] == 'attachment; filename="DealForge_Acme_DRAFT_not_approved.docx"'
+    assert draft["X-Release-Status"] == "draft-not-approved"
+    final = main.export_download_headers("Acme", "docx", approved=True)
+    assert final["Content-Disposition"] == 'attachment; filename="DealForge_Acme.docx"'
+    assert "X-Release-Status" not in final
