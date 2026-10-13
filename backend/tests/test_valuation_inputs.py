@@ -150,3 +150,32 @@ def test_dollar_figures_are_left_alone_and_unit_hints_do_not_leak():
     prior = {"financial_analyst": {"revenue_analysis": {"annual_revenue": 457_547_000}},
              "other": {"unit": "millions", "notes": {"revenue": 5}}}
     assert derive_valuation_inputs(prior)["financial_data"]["revenue"] == 457_547_000
+
+
+def test_curate_peers_drops_size_outliers():
+    from app.core.valuation_inputs import curate_peers
+
+    rows = [{"ticker": t, "ev_revenue": 3.0, "market_cap": c}
+            for t, c in [("A", 500), ("B", 900), ("C", 2000), ("BIG", 90000), ("TINY", 5)]]
+    kept, dropped = curate_peers(rows, 600)
+    assert [r["ticker"] for r in kept] == ["A", "B", "C"]
+    assert set(dropped) == {"BIG", "TINY"}
+
+
+def test_curate_peers_keeps_all_when_filter_too_aggressive():
+    from app.core.valuation_inputs import curate_peers
+
+    rows = [{"ticker": "A", "ev_revenue": 3.0, "market_cap": 500}, {"ticker": "BIG", "ev_revenue": 9.0, "market_cap": 90000}]
+    assert curate_peers(rows, 600) == (rows, [])
+    assert curate_peers(rows, None) == (rows, [])
+
+
+def test_shared_assumptions_note_from_valuation_audit():
+    from app.core.valuation_inputs import shared_assumptions_note
+
+    results = [{"agent_type": "valuation_agent", "data": {"audit": {"inputs": {
+        "financial_data": {"wacc": 0.1234, "revenue_growth": 0.12, "free_cash_flow": 50_000_000},
+        "market_data": {"enterprise_value": 580_000_000}}}}}]
+    note = shared_assumptions_note(results)
+    assert "WACC 12.34%" in note and "$50,000,000" in note and "above it" in note
+    assert shared_assumptions_note([{"agent_type": "x", "data": {}}]) == ""

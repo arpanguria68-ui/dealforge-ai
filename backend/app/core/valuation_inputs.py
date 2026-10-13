@@ -238,6 +238,58 @@ def project_cash_flows(
     return flows
 
 
+MODELLING_AGENTS = frozenset({"dcf_lbo_architect", "advanced_financial_modeler", "valuation_agent"})
+
+
+def shared_assumptions_note(results: List[Dict[str, Any]]) -> str:
+    """One assumption set for every agent that builds a DCF/LBO, taken from the valuation agent.
+
+    Agents otherwise pick their own WACC and growth and their enterprise values disagree
+    by 30%+. Returns "" until the valuation agent has recorded its inputs.
+    """
+    for result in results or []:
+        data = result.get("data") if isinstance(result, dict) else None
+        audit = data.get("audit") if isinstance(data, dict) and isinstance(data.get("audit"), dict) else None
+        inputs = ((audit or {}).get("inputs") or {}).get("financial_data") or {}
+        wacc = _num(inputs.get("wacc"))
+        if not wacc:
+            continue
+        lines = [f"- WACC {wacc:.2%}",
+                 f"- terminal growth {DEFAULT_ASSUMPTIONS['terminal_growth']:.1%}",
+                 f"- projection horizon {int(DEFAULT_ASSUMPTIONS['projection_years'])} years"]
+        growth, fcf = _num(inputs.get("revenue_growth")), _num(inputs.get("free_cash_flow"))
+        if growth is not None:
+            lines.append(f"- starting revenue growth {growth:.1%}")
+        if fcf:
+            lines.append(f"- base free cash flow ${fcf:,.0f}")
+        market = ((audit or {}).get("inputs") or {}).get("market_data") or {}
+        if _num(market.get("enterprise_value")):
+            lines.append(f"- current market enterprise value ${_num(market['enterprise_value']):,.0f} "
+                         "(a take-private entry must sit above it)")
+        return ("SHARED VALUATION ASSUMPTIONS (use these; if you deviate, state the new value and why, "
+                "so the DCFs stay comparable):\n" + "\n".join(lines))
+    return ""
+
+
+PEER_SIZE_BAND = (0.1, 10.0)  # peer market cap relative to the target's
+
+
+def curate_peers(rows: List[Dict[str, Any]], target_cap: Optional[float]) -> tuple:
+    """Keep peers of comparable size; Finnhub's list mixes in unrelated conglomerates.
+
+    Returns ``(kept, dropped_tickers)``. If the filter would leave fewer than three
+    peers (or the target's cap is unknown) the full list is kept, so a thin peer set
+    never silently becomes none.
+    """
+    if not target_cap or target_cap <= 0:
+        return rows, []
+    low, high = target_cap * PEER_SIZE_BAND[0], target_cap * PEER_SIZE_BAND[1]
+    kept = [r for r in rows if r.get("market_cap") and low <= r["market_cap"] <= high]
+    if len(kept) < 3:
+        return rows, []
+    return kept, [r["ticker"] for r in rows if r not in kept]
+
+
 async def gather_market_inputs(
     ticker: str, fetch: Fetch, financial_data: Dict[str, Any],
     assumptions: Optional[Dict[str, float]] = None,
@@ -263,14 +315,20 @@ async def gather_market_inputs(
     if "ev_revenue_median" not in out["market_data"]:
         peers = await fetch("peers", ticker)
         peer_rows = []
-        for symbol in [p for p in (peers or []) if p and p != ticker][: MAX_PEERS * 2]:
+        target_cap = _num(target.get("marketCapitalization"))  # $M
+        for symbol in [p for p in (peers or []) if p and p != ticker][: MAX_PEERS * 3]:
             metrics = metric_of(await fetch("metric", symbol))
             multiple = _num(metrics.get("evRevenueTTM"))
             if multiple and 0 < multiple <= MAX_SANE_EV_REVENUE:
                 peer_rows.append({"ticker": symbol, "ev_revenue": multiple,
-                                  "ev_fcf": _num(metrics.get("currentEv/freeCashFlowTTM"))})
-            if len(peer_rows) >= MAX_PEERS:
-                break
+                                  "ev_fcf": _num(metrics.get("currentEv/freeCashFlowTTM")),
+                                  "market_cap": _num(metrics.get("marketCapitalization"))})
+        peer_rows, dropped = curate_peers(peer_rows, target_cap)
+        peer_rows = peer_rows[:MAX_PEERS]
+        if dropped:
+            out["assumptions"].append(
+                f"peer set trimmed to comparable size (0.1x-10x market cap); excluded {', '.join(dropped)}"
+            )
         if peer_rows:
             out["market_data"]["ev_revenue_median"] = round(median(p["ev_revenue"] for p in peer_rows), 4)
             out["market_data"]["peers"] = peer_rows

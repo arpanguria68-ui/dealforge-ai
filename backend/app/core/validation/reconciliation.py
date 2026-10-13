@@ -58,6 +58,18 @@ def _is_ev_key(key: str) -> bool:
     return "ev" in tokens or {"enterprise", "value"} <= tokens
 
 
+def _is_entry_value_key(key: str) -> bool:
+    """What the sponsor pays for the whole business: entry EV, purchase enterprise value, transaction value."""
+    lowered = key.lower()
+    tokens = set(re.split(r"[^a-z0-9]+", lowered))
+    if "multiple" in tokens or "to" in tokens or "pct" in tokens or "percent" in tokens:
+        return False
+    if _is_ev_key(key) and ("entry" in tokens or "purchase" in tokens or "offer" in tokens or "transaction" in tokens):
+        return True
+    return bool({"purchase", "price"} <= tokens and "equity" not in tokens and "per" not in tokens
+                or {"transaction", "value"} <= tokens or {"entry", "value"} <= tokens)
+
+
 def extract_figures(agent_results: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     """Headline figures by kind: ``dcf_ev``, ``lbo_entry_ev``, ``market_ev``."""
     found: Dict[str, List[Dict[str, Any]]] = {"dcf_ev": [], "lbo_entry_ev": [], "market_ev": []}
@@ -75,7 +87,7 @@ def extract_figures(agent_results: List[Dict[str, Any]]) -> Dict[str, List[Dict[
             scenario = "bear" in context or "bull" in context
             if agent == "valuation_agent" and path == "/valuations/dcf" and key == "value":
                 found["dcf_ev"].append(entry)
-            elif _is_ev_key(key) and not scenario and "entry" in key.lower() and (
+            elif not scenario and _is_entry_value_key(key) and (
                     "lbo" in context or "sponsor" in context or agent in _LBO_AGENTS):
                 found["lbo_entry_ev"].append(entry)
             elif _is_ev_key(key) and not scenario and "entry" not in context and (

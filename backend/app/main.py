@@ -3425,6 +3425,7 @@ async def chat_execute_task(request: Request):
     ))
 
     upstream_results: List[Dict[str, Any]] = []
+    sibling_results: List[Dict[str, Any]] = []
     if task_list_id and task_id:
         task_manager = get_task_manager()
         todo = await task_manager.get_todo_list(task_list_id)
@@ -3461,6 +3462,11 @@ async def chat_execute_task(request: Request):
             }
             for item in todo.items
             if item.id in planned_task.depends_on and item.status == "done" and isinstance(item.result, dict)
+        ]
+        sibling_results = [
+            {"agent_type": item.assigned_agent, "data": item.result}
+            for item in todo.items
+            if item.id != task_id and item.status == "done" and isinstance(item.result, dict)
         ]
 
     # Prefer an explicitly supplied public ticker in the user/task text over
@@ -3553,6 +3559,13 @@ async def chat_execute_task(request: Request):
                 except Exception as exc:
                     logger.debug("execute_task_graph_context_unavailable", error=str(exc))
             agent._current_context = agent_context
+            from app.core.valuation_inputs import MODELLING_AGENTS, shared_assumptions_note
+
+            if resolved_type in MODELLING_AGENTS and not input_only:
+                shared = shared_assumptions_note(upstream_results + sibling_results)
+                if shared:
+                    agent_context["shared_assumptions"] = shared
+                    task_description = task_description + "\n\n" + shared
             if input_only or resolved_type == "financial_analyst":
                 execution = agent.run(task_description, context=agent_context)
             else:

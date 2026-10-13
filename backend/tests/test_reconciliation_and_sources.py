@@ -91,3 +91,20 @@ def test_enterprise_value_ratios_are_not_mistaken_for_values():
     data = {"valuation_bridge": {"enterprise_value": "$1,695.6M", "ev_to_revenue": 3.7, "ev_ebitda_multiple": 14.0}}
     figures = extract_figures([{"agent_type": "dcf_lbo_architect", "data": data}])
     assert [round(e["value"] / 1e6, 1) for e in figures["dcf_ev"]] == [1695.6]
+
+
+def test_lbo_entry_found_under_purchase_price_and_transaction_value_keys():
+    from app.core.validation.reconciliation import reconcile
+
+    for key in ("purchase_price", "purchase_enterprise_value", "transaction_value", "entry_enterprise_value_usd_m"):
+        value = 270.0 if key.endswith("_m") else 270_000_000
+        results = [{"agent_type": "dcf_lbo_architect", "data": {"lbo": {key: value}}}]
+        issues = reconcile(results, market_ev=580_000_000)
+        assert any(i["metric"] == "LBO entry vs market value" for i in issues), key
+
+
+def test_lbo_per_share_and_multiples_are_not_entry_value():
+    from app.core.validation.reconciliation import reconcile
+
+    results = [{"agent_type": "dcf_lbo_architect", "data": {"lbo": {"purchase_price_per_share": 40, "entry_multiple": 12}}}]
+    assert reconcile(results, market_ev=580_000_000) == []
