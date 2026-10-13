@@ -1221,7 +1221,7 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
                                             {deal.insights && (
                                                 <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px]">
                                                     {deal.insights.valuation?.weighted !== undefined && (
-                                                        <span className="rounded-md bg-indigo-500/10 px-2 py-0.5 text-indigo-300" title="Weighted DCF / comps estimate">
+                                                        <span className="rounded-md bg-indigo-500/10 px-2 py-0.5 text-indigo-700" title="Weighted DCF / comps estimate">
                                                             Valuation {money(deal.insights.valuation.weighted)}
                                                         </span>
                                                     )}
@@ -1235,7 +1235,7 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
                                                         <span className="rounded-md bg-muted px-2 py-0.5">Market EV {money(deal.insights.market_ev)}</span>
                                                     )}
                                                     {deal.insights.grounding?.total ? (
-                                                        <span className="rounded-md bg-emerald-500/10 px-2 py-0.5 text-emerald-300" title="Memo figures traced to recorded evidence">
+                                                        <span className="rounded-md bg-emerald-500/10 px-2 py-0.5 text-emerald-700" title="Memo figures traced to recorded evidence">
                                                             {deal.insights.grounding.grounded}/{deal.insights.grounding.total} figures sourced
                                                         </span>
                                                     ) : null}
@@ -1245,12 +1245,12 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
                                                         </span>
                                                     )}
                                                     {deal.insights.needs_review && (
-                                                        <span className="rounded-md bg-amber-500/15 px-2 py-0.5 text-amber-300">Review required</span>
+                                                        <span className="rounded-md bg-amber-500/15 px-2 py-0.5 text-amber-700">Review required</span>
                                                     )}
                                                 </div>
                                             )}
                                             {deal.insights?.reconciliation?.length ? (
-                                                <ul className="mt-1.5 list-disc pl-5 text-[11px] text-amber-300/90">
+                                                <ul className="mt-1.5 list-disc pl-5 text-[11px] text-amber-700">
                                                     {deal.insights.reconciliation.map((message, i) => <li key={i}>{message}</li>)}
                                                 </ul>
                                             ) : null}

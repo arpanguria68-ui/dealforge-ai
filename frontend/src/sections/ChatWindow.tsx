@@ -2252,7 +2252,7 @@ export function ChatWindow() {
 
                 {approvalRequest && (
                     <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-amber-300/20 bg-amber-300/[0.06] px-4 py-3 sm:px-6" role="status">
-                        <div className="flex min-w-0 items-center gap-2 text-sm text-amber-100">
+                        <div className="flex min-w-0 items-center gap-2 text-sm text-amber-800">
                             <AlertTriangle className="h-4 w-4 shrink-0 text-amber-700" />
                             <span>{approvalRequest.label ?? `Review the ${approvalRequest.taskCount}-task plan above. Nothing runs until you approve.`}</span>
                         </div>
