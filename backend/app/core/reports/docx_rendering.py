@@ -55,7 +55,9 @@ def _fix_mojibake(text: str) -> str:
 
 def clean(text: Any) -> str:
     """Printable text; unlike the PDF path, Word handles Unicode so it is kept."""
-    return _CONTROL.sub("", _fix_mojibake("" if text is None else str(text)))
+    from app.core.text_clean import strip_latex
+
+    return _CONTROL.sub("", strip_latex(_fix_mojibake("" if text is None else str(text))))
 
 
 def add_inline(paragraph, text: str, size: Optional[float] = None) -> None:

@@ -35,13 +35,16 @@ def _safe_get(data: Dict, *keys, default="N/A"):
 from app.core.reports.docx_rendering import add_inline, add_markdown, agent_lines, render_payload  # noqa: E402
 from app.core.reports.report_editor import deterministic_edit, section_for  # noqa: E402
 from app.core.reports.result_views import enrich_deal_from_results, revenue_bridge  # noqa: E402
+from app.core.text_clean import strip_latex  # noqa: E402
 
 
 def _clean_text(text: Any) -> str:
     """Sanitize text for PDF/PPTX (handle smart quotes, non-ASCII chars)."""
     if text is None:
         return ""
-    s = str(text)
+    from app.core.text_clean import strip_latex
+
+    s = strip_latex(str(text))
     # Replace common Unicode "smart" characters with ASCII equivalents
     replacements = {
         "\u2013": "-",  # en dash
@@ -224,7 +227,7 @@ def generate_pptx(
         tf = txBox.text_frame
         tf.word_wrap = True
         p = tf.paragraphs[0]
-        p.text = text
+        p.text = strip_latex(text) if isinstance(text, str) else text
         p.font.size = Pt(font_size)
         p.font.bold = bold
         p.font.color.rgb = color
@@ -463,10 +466,11 @@ def generate_pptx(
         
         y_offset = 1.5
         for risk in risk_matrix[:4]: # Top 4
-            r_title = risk.get("risk", "Unknown Risk")
+            r_title = _clip(risk.get("risk") or risk.get("name") or risk.get("title") or risk.get("description")
+                            or "Unnamed risk", 120)
             r_sev = _severity_label(risk.get("severity", "Medium"))
-            r_mit = risk.get("mitigation") or "N/A"
-            r_evid = risk.get("evidence") or "Analysis pending further diligence."
+            r_mit = _clip(_plain_text(risk.get("mitigation")) or "Not recorded", 260)
+            r_evid = _clip(_plain_text(risk.get("evidence")) or "Not recorded", 260)
 
             color = ACCENT_RED if r_sev.lower() in ("high", "critical") else SECONDARY
             
@@ -1018,12 +1022,35 @@ def generate_excel(
     ws5["A1"] = "LBO Returns Analysis"
     ws5["A1"].font = section_font
 
-    ws5["A3"] = "Model status"
-    ws5["B3"] = "Not calculated"
-    ws5["A4"] = "Required inputs"
-    ws5["B4"] = "Entry/exit valuation, financing mix, holding period, debt paydown, and transaction fees"
-    ws5["B4"].alignment = Alignment(wrap_text=True)
-    ws5["A6"] = "Returns are not estimated without transaction-specific assumptions."
+    lbo_rows = _lbo_rows(agent_results)
+    if lbo_rows:
+        ws5.column_dimensions["A"].width = 38
+        ws5.column_dimensions["B"].width = 28
+        ws5["A3"] = "Model status"
+        ws5["B3"] = "Recorded by the modelling agent; assumptions listed below"
+        row_no = 5
+        for label_text, value in lbo_rows:
+            ws5.cell(row=row_no, column=1, value=label_text)
+            if value is None:
+                ws5.cell(row=row_no - 0, column=1).font = bold_font
+            else:
+                cell = ws5.cell(row=row_no, column=2, value=value)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    lowered = label_text.lower()
+                    if "pct" in lowered or "irr" in lowered or "%" in lowered or "premium" in lowered:
+                        cell.number_format = '0.00"%"' if abs(value) > 1 else "0.00%"
+                    elif "moic" in lowered or "multiple" in lowered:
+                        cell.number_format = '0.00"x"'
+                    elif abs(value) >= 1000:
+                        cell.number_format = '$#,##0'
+            row_no += 1
+    else:
+        ws5["A3"] = "Model status"
+        ws5["B3"] = "Not calculated"
+        ws5["A4"] = "Required inputs"
+        ws5["B4"] = "Entry/exit valuation, financing mix, holding period, debt paydown, and transaction fees"
+        ws5["B4"].alignment = Alignment(wrap_text=True)
+        ws5["A6"] = "Returns are not estimated without transaction-specific assumptions."
 
     # ─── Sheet 6: Risk Matrix ───
     ws6 = wb.create_sheet("Risk Matrix")
@@ -1040,13 +1067,24 @@ def generate_excel(
     risks = risk_data.get("risks", [])
     if not risks:
         risks = analyst_data.get("risk_matrix", [])
-        
+    if not risks:
+        # No risk-assessor task: the register built from every agent's recorded risks, as in the Word report.
+        from app.core.reports.document_workflow import collect_risk_register
+
+        risks = [
+            {"risk": entry["risk"], "category": entry.get("category"),
+             "severity": entry.get("severity"), "mitigation": entry.get("mitigation")}
+            for entry in collect_risk_register(agent_results, [])
+        ]
+
     if not risks:
         ws6.cell(row=2, column=1, value="No structured risk findings recorded")
     for r, risk in enumerate(risks, 2):
         name = risk.get("risk", risk.get("description", f"Risk {r-1}"))
-        cat = str(risk.get("category") or "General")
-        sev = risk.get("severity", "Not rated")
+        cat = str(risk.get("category") or "General").replace("_", " ")
+        sev = risk.get("severity")
+        if sev is None or sev == "":
+            sev = "Not rated"
         if isinstance(sev, (int, float)) and not isinstance(sev, bool):
             sev = _severity_label(sev)
         mit = risk.get("mitigation") or ""
@@ -2202,6 +2240,50 @@ def generate_docx(
     return buf.read()
 
 
+def _lbo_rows(agent_results: List[Dict[str, Any]]) -> List[tuple]:
+    """(label, value) rows for the workbook's LBO sheet; a ``None`` value marks a section heading."""
+    for result in agent_results or []:
+        data = result.get("data") if isinstance(result, dict) else None
+        if not isinstance(data, dict):
+            continue
+        for key, node in data.items():
+            if "lbo" in str(key).lower() and isinstance(node, dict) and node:
+                rows: List[tuple] = []
+
+                def walk(current: Dict[str, Any], depth: int = 0) -> None:
+                    for name, value in current.items():
+                        title = str(name).replace("_", " ").strip().title()
+                        if isinstance(value, dict):
+                            rows.append((title, None))
+                            walk(value, depth + 1)
+                        elif isinstance(value, list) and value and all(isinstance(v, dict) for v in value):
+                            rows.append((title, None))
+                            for index, item in enumerate(value[:10], 1):
+                                rows.append((f"{title} {index}", ", ".join(f"{k}: {v}" for k, v in item.items())))
+                        elif isinstance(value, list):
+                            rows.append((title, "; ".join(str(v) for v in value)))
+                        elif isinstance(value, (int, float, str)) and not isinstance(value, bool):
+                            rows.append((title, value))
+
+                walk(node)
+                return rows
+    return []
+
+
+def _plain_text(value: Any) -> str:
+    """Lists of strings read as sentences, not as a Python list literal."""
+    if isinstance(value, (list, tuple)):
+        return " ".join(str(item).strip() for item in value if str(item).strip())
+    if isinstance(value, dict):
+        return "; ".join(f"{k}: {v}" for k, v in value.items())
+    return str(value).strip() if value is not None else ""
+
+
+def _clip(text: Any, limit: int) -> str:
+    text = str(text).strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
 def _severity_label(value: Any) -> str:
     """Agents report severity as words or numbers (1-5 or 1-10); render a label.
 
@@ -2232,11 +2314,13 @@ def _report_currency(value: Any) -> str:
     if value is None:
         return "Not established"
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if abs(value) >= 1_000_000_000:
-            return f"${value / 1_000_000_000:,.1f}bn"
-        if abs(value) >= 1_000_000:
-            return f"${value / 1_000_000:,.1f}m"
-        return f"${value:,.0f}"
+        sign = "-" if value < 0 else ""
+        magnitude = abs(value)
+        if magnitude >= 1_000_000_000:
+            return f"{sign}${magnitude / 1_000_000_000:,.1f}bn"
+        if magnitude >= 1_000_000:
+            return f"{sign}${magnitude / 1_000_000:,.2f}m"
+        return f"{sign}${magnitude:,.0f}"
     return str(value)
 
 

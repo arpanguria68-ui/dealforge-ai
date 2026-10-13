@@ -87,6 +87,14 @@ def build_report_agent_results(
             agent = task.get("assigned_agent") if isinstance(task, dict) else getattr(task, "assigned_agent", None)
             title = task.get("title") if isinstance(task, dict) else getattr(task, "title", None)
             timestamp = task.get("updated_at") if isinstance(task, dict) else getattr(task, "updated_at", None)
+            if agent == "investment_memo_agent" and "memo" in data:
+                from app.agents.investment_memo_agent import memo_is_usable
+
+                if not memo_is_usable(str(data.get("memo") or "")):
+                    # A stored reply that is not a memo (chatter, canned error) must not be shown as one.
+                    data = {**data, "memo": "", "data_limitations": list(data.get("data_limitations") or []) + [
+                        "The Investment Committee memo could not be drafted: the model's reply was not a usable memo. "
+                        "Re-run the memo task."]}
             match_index = next((
                 index for index in range(len(activity_rows) - 1, -1, -1)
                 if index not in consumed and task_id and activity_rows[index].get("task_id") == task_id
@@ -215,11 +223,11 @@ def _metric_conflicts(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def _deterministic_synthesis(evidence: Dict[str, Any]) -> Dict[str, Any]:
     """Readable no-model report narrative built only from curated recorded evidence."""
     points = evidence.get("data_points", [])
-    financial = [point for point in points if point.get("agent") == "financial_analyst"]
-    periods = list(dict.fromkeys(
-        str(point.get("period")) for point in financial
+    financial = [point for point in points if isinstance(point, dict) and point.get("value") is not None]
+    periods = sorted({
+        re.sub(r"^FY\s*", "", str(point.get("period")).strip(), flags=re.IGNORECASE) for point in financial
         if point.get("period") and str(point.get("period")).casefold() not in {"not established", "unknown", "n/a"}
-    ))
+    })
     if periods:
         coverage = f"Financial data points are recorded for {', '.join(periods)}."
     elif financial:

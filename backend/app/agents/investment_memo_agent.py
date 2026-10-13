@@ -7,6 +7,7 @@ Generates visual aids (football field, Sankey, radar charts).
 
 from typing import Dict, Any, Optional, List
 import json
+import re
 from datetime import datetime
 
 from app.agents.base import BaseAgent, AgentOutput
@@ -18,11 +19,27 @@ from app.core.validation.reconciliation import reconcile, reconciliation_notice
 _CONTEXT_EXCLUDE = {"agent_results", "kb_graph", "knowledge_graph_context", "risk_data"}
 
 
+_CHATTER_OPENER = re.compile(
+    r"^\s*(?:sure|okay|ok|of course|certainly|absolutely|alright|yes|no problem|i(?:'|’)?ll|i will|i can|i need|"
+    r"i(?:'|’)?m|i am|first,|let me|here(?:'|’)?s)(?![a-z])",
+    re.IGNORECASE,
+)
+
+
 def memo_is_usable(content: str) -> bool:
-    """False for an empty reply or a chat product's canned error ("Sorry, something went wrong...")."""
+    """False for an empty reply, a chat product's canned error, or short off-topic chatter.
+
+    A chat-product proxy has answered "Sure. First, I'll need your permission to turn on the
+    Adobe app." in place of a memo. A real memo has headings, figures or substantial length;
+    a short conversational reply with none of them is not one.
+    """
     from app.core.llm.gemini_client import looks_like_chat_failure
 
-    return bool((content or "").strip()) and not looks_like_chat_failure(content)
+    text = (content or "").strip()
+    if not text or looks_like_chat_failure(text):
+        return False
+    structured = "#" in text or "\n" in text or any(ch.isdigit() for ch in text)
+    return structured or len(text) >= 400 or not _CHATTER_OPENER.match(text)
 
 
 def _verified_valuation_block(agent_results: List[Dict[str, Any]]) -> str:
@@ -161,6 +178,10 @@ RULES:
 
             result = await self.generate_with_tools(prompt, system_prompt=system_prompt)
             content = result.get("content", "")
+            if not memo_is_usable(content):
+                self.logger.warning("memo_reply_unusable_retrying", reply=(content or "").strip()[:100])
+                result = await self.generate_with_tools(prompt, system_prompt=system_prompt)
+                content = result.get("content", "")
             if not memo_is_usable(content):
                 raise ValueError(f"Model reply is not a memo: {(content or '').strip()[:100]!r}")
 

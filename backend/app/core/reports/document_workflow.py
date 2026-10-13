@@ -240,13 +240,24 @@ def _severity_10(value: Any) -> Optional[float]:
     return None
 
 
+def _flat_text(value: Any) -> Optional[str]:
+    """Mitigation/evidence arrive as strings, lists of strings or dicts; never show a Python repr."""
+    if value is None or value == "" or value == []:
+        return None
+    if isinstance(value, (list, tuple)):
+        return " ".join(str(v).strip() for v in value if str(v).strip()) or None
+    if isinstance(value, dict):
+        return "; ".join(f"{k}: {v}" for k, v in value.items()) or None
+    return str(value).strip() or None
+
+
 def collect_risk_register(agent_results: List[Dict[str, Any]], graph_risks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """One deduplicated risk register from every agent plus the knowledge graph."""
     register: Dict[str, Dict[str, Any]] = {}
 
     def add(name: Any, severity: Any, category: Any, source: str, mitigation: Any = None, evidence: Any = None):
         title = str(name or "").strip()
-        if not title:
+        if not title or re.match(r"^\w+ is missing:", title):   # a pipeline data-gap flag, not a risk
             return
         key = re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()[:120]
         sev = _severity_10(severity)
@@ -254,15 +265,15 @@ def collect_risk_register(agent_results: List[Dict[str, Any]], graph_risks: List
         if current is None:
             register[key] = {
                 "risk": title[:240], "severity": sev, "category": str(category or "General")[:80],
-                "sources": [source], "mitigation": (str(mitigation)[:300] if mitigation else None),
-                "evidence": (str(evidence)[:300] if evidence else None),
+                "sources": [source], "mitigation": (_flat_text(mitigation) or "")[:400] or None,
+                "evidence": (_flat_text(evidence) or "")[:400] or None,
             }
         else:
             if source not in current["sources"]:
                 current["sources"].append(source)
             if sev is not None and (current["severity"] is None or sev > current["severity"]):
                 current["severity"] = sev
-            current["mitigation"] = current["mitigation"] or (str(mitigation)[:300] if mitigation else None)
+            current["mitigation"] = current["mitigation"] or ((_flat_text(mitigation) or "")[:400] or None)
 
     for result in agent_results:
         data = result.get("data") if isinstance(result.get("data"), dict) else {}

@@ -31,7 +31,11 @@ def _strings(value: Any) -> Iterable[str]:
         if value.strip():
             yield value.strip()
     elif isinstance(value, dict):
-        text = next((value.get(k) for k in ("finding", "title", "risk", "issue", "description", "text", "summary") if value.get(k)), None)
+        candidates = [value.get(k) for k in ("finding", "title", "risk", "issue", "description", "text", "summary")
+                      if isinstance(value.get(k), str) and value.get(k).strip()]
+        # "finding": "revenue_cagr" is an identifier; the sentence beside it is the finding.
+        sentences = [c for c in candidates if not re.fullmatch(r"[a-z0-9_]+", c.strip())]
+        text = sentences[0] if sentences else (candidates[0] if candidates else None)
         if text:
             detail = value.get("evidence") or value.get("rationale")
             yield f"{text.strip()}: {str(detail).strip()}" if detail else str(text).strip()
@@ -62,6 +66,53 @@ def _contains_execution_error(value: Any) -> bool:
     return False
 
 
+_CURATED_FIELDS = _FINANCIAL_FIELDS + ("cost_of_revenue", "operating_expenses", "interest_expense")
+
+
+def _add_curated_financials(
+    data: Dict[str, Any], agent: str, data_points: List[Dict[str, Any]],
+    source_records: List[Dict[str, Any]], source_ids: Dict[str, str],
+) -> None:
+    """Year-keyed statements from the data curator: {"financials": {"2025": {"revenue": 457.55}}}.
+
+    Values are scaled by the record's declared unit. They are linked to a source only when
+    the curator's citation names an SEC filer (CIK), which gives a verifiable filing index.
+    """
+    curated = data.get("curated_deal_metrics")
+    statements = curated.get("financials") if isinstance(curated, dict) else None
+    if not isinstance(statements, dict):
+        return
+    unit = str(curated.get("unit") or "").lower()
+    scale = 1e9 if "billion" in unit else 1e6 if "million" in unit else 1e3 if "thousand" in unit else 1.0
+
+    source_id, source_url = None, None
+    citations = data.get("source_citations")
+    for description in (citations.values() if isinstance(citations, dict) else []):
+        cik = re.search(r"CIK:?\s*(\d{6,10})", str(description))
+        if cik:
+            source_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik.group(1)}&type=10-K"
+            if source_url not in source_ids:
+                source_ids[source_url] = f"S{len(source_ids) + 1}"
+                source_records.append({"id": source_ids[source_url], "url": source_url, "title": str(description)[:200]})
+            source_id = source_ids[source_url]
+            break
+
+    for period, row in statements.items():
+        if not isinstance(row, dict):
+            continue
+        for field in _CURATED_FIELDS:
+            value = row.get(field)
+            if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            is_ratio = field in _DERIVED_FINANCIAL_FIELDS
+            data_points.append({
+                "metric": field, "value": value if is_ratio else round(value * scale, 2), "period": str(period),
+                "period_end": None, "agent": agent, "source_id": source_id, "source_url": source_url,
+                "basis": ("derived_source_linked" if is_ratio else "reported_source_linked") if source_id
+                else ("derived_unverified_no_source" if is_ratio else "unverified_no_source"),
+            })
+
+
 def build_evidence_brief(deal: Dict[str, Any], analyses: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Aggregate explicit agent output; never infer a recommendation or fill missing facts."""
     findings, gaps = [], []
@@ -89,6 +140,9 @@ def build_evidence_brief(deal: Dict[str, Any], analyses: List[Dict[str, Any]]) -
                 if key not in source_ids:
                     source_ids[key] = f"S{len(source_ids) + 1}"
                     source_records.append({"id": source_ids[key], **source})
+        _add_curated_financials(data, agent, data_points, source_records, source_ids)
+        if any(point.get("agent") == agent and point.get("source_id") for point in data_points):
+            agents_with_sources += 1
         historical = data.get("historical_financials")
         for period in historical if isinstance(historical, list) else []:
             if not isinstance(period, dict):

@@ -61,3 +61,29 @@ def test_a_one_line_reply_is_not_accepted_as_an_investment_memo():
     assert not memo_is_usable("Sorry, something went wrong. Please try your request again.")
     assert not memo_is_usable("")
     assert memo_is_usable("# Memo\n" + "Substantive paragraph about the transaction. " * 20)
+
+
+def test_off_topic_chat_reply_is_not_a_memo_and_is_retried():
+    import asyncio
+    from types import SimpleNamespace
+
+    from app.agents.investment_memo_agent import InvestmentMemoAgent, memo_is_usable
+
+    assert not memo_is_usable("Sure. First, I'll need your permission to turn on the Adobe app.")
+    assert not memo_is_usable("I can help with that, but first tell me more.")
+    assert memo_is_usable("# Executive Summary\nDraft prose.")
+    assert memo_is_usable("memo")
+    assert memo_is_usable("Revenue grew 12.7% to $457.5M.")
+
+    replies = iter([{"content": "Sure. First, I'll need your permission to turn on the Adobe app."},
+                    {"content": "# Investment Memo\nSprout Social revenue was $457.5M."}])
+    agent = InvestmentMemoAgent.__new__(InvestmentMemoAgent)
+    agent.name = "investment_memo_agent"
+    agent.logger = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None)
+
+    async def fake(prompt, system_prompt=None):
+        return next(replies)
+
+    agent.generate_with_tools = fake
+    out = asyncio.run(agent.run("Draft IC memo", {"deal_id": "d-retry"}))
+    assert out.success and "457.5M" in out.data["memo"]
