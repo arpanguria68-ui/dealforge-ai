@@ -397,7 +397,8 @@ def generate_pptx(
                 valuations=valuations,
                 unit=(deal.get("valuation_output") or {}).get("unit", "$B"),
                 title="Valuation Range Analysis",
-                current_price=deal.get("current_price")
+                current_price=deal.get("current_price"),
+                reference_lines=(deal.get("valuation_output") or {}).get("reference_lines")
             )
             slide.shapes.add_picture(io.BytesIO(chart_bytes), Inches(2), Inches(1.5), Inches(9), Inches(5))
         except Exception as e:
@@ -451,7 +452,7 @@ def generate_pptx(
             add_text_box(slide, left, Inches(1.45), Inches(5.9), Inches(0.5),
                          str(sec["agent"]).replace("_", " ").title(), font_size=16, bold=True, color=SECONDARY)
             add_text_box(slide, left, Inches(2.05), Inches(5.9), Inches(5.0),
-                         "\n\n".join(f"\u2022 {pt}" for pt in sec["points"][:4]), font_size=12)
+                         "\n\n".join(f"\u2022 {pt}" for pt in sec["points"][:4]), font_size=15)
 
     # ─── Slide 4: Risk Matrix ───
     risk_matrix = []
@@ -583,8 +584,17 @@ def generate_pptx(
             color=BLACK,
         )
     else:
-        rec = deal.get("final_recommendation") or "No recommendation recorded; human review required."
-        rec_color = ACCENT if deal.get("final_recommendation") else SECONDARY
+        recorded = deal.get("final_recommendation")
+        if recorded and re.search(r"tasks completed; deal not scored", str(recorded)):
+            recorded = None   # a progress note, not a recommendation
+        draft = _memo_recommendation(agent_results)
+        if recorded:
+            rec = recorded
+        elif draft:
+            rec = f"IC memo draft: {_clip(draft, 220)}"
+        else:
+            rec = "No recommendation recorded; human review required."
+        rec_color = ACCENT if recorded else SECONDARY
 
         add_text_box(
             slide,
@@ -604,10 +614,16 @@ def generate_pptx(
             Inches(11),
             Inches(1),
             rec,
-            font_size=24,
+            font_size=24 if len(rec) < 90 else 18,
             bold=True,
             color=rec_color,
         )
+        if draft and not recorded:
+            add_text_box(
+                slide, Inches(1), Inches(3.35), Inches(11), Inches(0.4),
+                "Model-generated draft from the investment memo agent. It is not an approved decision and "
+                "needs reviewer sign-off.", font_size=12, color=SECONDARY,
+            )
 
         # Score Waterfall in PPTX
         scoring_data = deal.get("scoring_output", {})
@@ -842,7 +858,7 @@ def generate_excel(
 
     score = deal.get("final_score")
     score_text = f"{round(score * 100)}%" if score is not None else "Pending"
-    rec = deal.get("final_recommendation") or "No recommendation recorded; human review required"
+    rec, _recorded = _recommendation_text(deal, agent_results)
 
     ws1["A3"] = "Target Company"
     ws1["B3"] = deal.get("target_company", "N/A")
@@ -869,7 +885,7 @@ def generate_excel(
     ws1["A12"] = "Question"
     ws1["B12"] = exec_sum.get("question", "N/A")
     ws1["A13"] = "Answer"
-    ws1["B13"] = deal.get("final_recommendation") or "No recommendation recorded; human review required"
+    ws1["B13"] = rec
     for r in range(10, 14):
         ws1[f"B{r}"].alignment = Alignment(wrap_text=True)
 
@@ -1484,7 +1500,8 @@ def generate_pdf(
                     valuations=valuations,
                     unit=(deal.get("valuation_output") or {}).get("unit", "$B"),
                     title="Valuation Range Analysis",
-                    current_price=deal.get("current_price")
+                    current_price=deal.get("current_price"),
+                reference_lines=(deal.get("valuation_output") or {}).get("reference_lines")
                 )
                 img = Image(io.BytesIO(chart_bytes), width=450, height=250)
                 Story.append(img)
@@ -2091,7 +2108,8 @@ def generate_docx(
                 valuations=valuations,
                 unit=(deal.get("valuation_output") or {}).get("unit", "$B"),
                 title="Valuation Range Analysis",
-                current_price=deal.get("current_price")
+                current_price=deal.get("current_price"),
+                reference_lines=(deal.get("valuation_output") or {}).get("reference_lines")
             )
             from io import BytesIO
             img_stream = BytesIO(chart_bytes)
@@ -2268,6 +2286,34 @@ def _lbo_rows(agent_results: List[Dict[str, Any]]) -> List[tuple]:
                 walk(node)
                 return rows
     return []
+
+
+def _recommendation_text(deal: Dict[str, Any], agent_results: List[Dict[str, Any]]) -> tuple:
+    """(text, recorded): the deal's recorded recommendation, else the memo's labelled draft, else a notice.
+
+    "10/10 tasks completed; deal not scored" is a progress note, not a recommendation.
+    """
+    recorded = (deal or {}).get("final_recommendation")
+    if recorded and re.search(r"tasks completed; deal not scored", str(recorded)):
+        recorded = None
+    if recorded:
+        return str(recorded), True
+    draft = _memo_recommendation(agent_results)
+    if draft:
+        return f"IC memo draft: {_clip(draft, 220)} (model-generated; not an approved decision)", False
+    return "No recommendation recorded; human review required.", False
+
+
+def _memo_recommendation(agent_results: List[Dict[str, Any]]) -> str:
+    """The memo agent's stated recommendation line, or "" when the memo has none."""
+    for result in agent_results or []:
+        data = result.get("data") if isinstance(result, dict) else None
+        memo = data.get("memo") if isinstance(data, dict) else None
+        if isinstance(memo, str):
+            match = re.search(r"RECOMMENDATION\s*:\s*\*{0,2}\s*([^\n]+)", memo, flags=re.IGNORECASE)
+            if match:
+                return re.sub(r"[*_`]+", "", match.group(1)).strip()
+    return ""
 
 
 def _plain_text(value: Any) -> str:

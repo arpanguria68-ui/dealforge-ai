@@ -66,6 +66,13 @@ def _contains_execution_error(value: Any) -> bool:
     return False
 
 
+def _same_figure(a: Any, b: Any) -> bool:
+    """Equal, or within rounding (a curator's $457.55M against a filing's $457,547,000)."""
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool) and not isinstance(b, bool):
+        return a == b or abs(a - b) <= 0.001 * max(abs(a), abs(b))
+    return a == b
+
+
 _CURATED_FIELDS = _FINANCIAL_FIELDS + ("cost_of_revenue", "operating_expenses", "interest_expense")
 
 
@@ -223,6 +230,24 @@ def build_evidence_brief(deal: Dict[str, Any], analyses: List[Dict[str, Any]]) -
         for field in _TEXT_FIELDS:
             for text in _strings(data.get(field)):
                 findings.append({"text": text[:360], "agent": agent, "severity": "unrated", "sources": item_sources if isinstance(item_sources, list) else []})
+
+    # The same figure reported by two agents ("2025" and "FY2025") is one data point; a source-linked
+    # copy wins over an unsourced one.
+    deduped: List[Dict[str, Any]] = []
+    for point in data_points:
+        period = re.sub(r"^FY\s*", "", str(point.get("period") or "").strip(), flags=re.IGNORECASE)
+        value = point.get("value")
+        twin = next((
+            kept for kept in deduped
+            if kept.get("metric") == point.get("metric")
+            and re.sub(r"^FY\s*", "", str(kept.get("period") or "").strip(), flags=re.IGNORECASE) == period
+            and _same_figure(kept.get("value"), value)
+        ), None)
+        if twin is None:
+            deduped.append(point)
+        elif not twin.get("source_id") and point.get("source_id"):
+            deduped[deduped.index(twin)] = point
+    data_points = deduped
 
     # De-duplicate without paraphrasing or merging claims from different agents.
     unique = []

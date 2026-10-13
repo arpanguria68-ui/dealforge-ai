@@ -63,6 +63,21 @@ CHART_COLORS = [
 ]
 
 
+def _unit_label(value: float, unit: str, engine: str = "plain") -> str:
+    """"$1.21B" for unit "$B", "$725.0M" for "$M"; the currency sign leads, the scale letter trails.
+
+    Plotly and Matplotlib both read a pair of dollar signs as math, so ``engine`` escapes them.
+    """
+    symbol = "$" if unit.startswith("$") else ""
+    scale = unit.lstrip("$")
+    decimals = 2 if scale == "B" else 1
+    if symbol and engine == "plotly":
+        symbol = "&#36;"
+    elif symbol and engine == "mpl":
+        symbol = "\\$"
+    return f"{symbol}{value:,.{decimals}f}{scale}"
+
+
 class InfographicEngine:
     """Generate McKinsey/IB-grade infographic charts as PNG bytes."""
 
@@ -75,6 +90,7 @@ class InfographicEngine:
         height: int = 500,
         current_price: Optional[float] = None,
         unit: str = "$B",
+        reference_lines: Optional[List[Dict[str, Any]]] = None,
     ) -> bytes:
         """
         Generate a 'Football Field' valuation summary chart.
@@ -91,12 +107,15 @@ class InfographicEngine:
         lows = [v["low"] for v in valuations]
         mids = [v.get("mid", (v["low"] + v["high"]) / 2) for v in valuations]
         highs = [v["high"] for v in valuations]
+        references = list(reference_lines or [])
+        if current_price is not None:
+            references.append({"label": "Current", "value": current_price})
         try:
             _ensure_plotly()
             import plotly.graph_objects as go
         except Exception as exc:  # no kaleido: Plotly cannot render a PNG here
             logger.warning("football_field_plotly_unavailable", error=str(exc))
-            return InfographicEngine._football_field_mpl(methods, lows, mids, highs, title, unit, current_price)
+            return InfographicEngine._football_field_mpl(methods, lows, mids, highs, title, unit, references)
 
         fig = go.Figure()
 
@@ -114,43 +133,49 @@ class InfographicEngine:
                     ),
                     name=m,
                     showlegend=False,
-                    text=f"{lo:,.1f}{unit} \u2013 {hi:,.1f}{unit}",
-                    textposition="inside",
-                    hovertemplate=f"<b>{m}</b><br>Range: {lo:,.1f}{unit} \u2013 {hi:,.1f}{unit}<br>Mid: {mi:,.1f}{unit}",
+                    hovertemplate=f"<b>{m}</b><br>Range: {_unit_label(lo, unit)} \u2013 {_unit_label(hi, unit)}"
+                                  f"<br>Mid: {_unit_label(mi, unit)}",
                 )
             )
-            # Midpoint marker
+            # Range text sits to the right of the bar so narrow bars stay legible; midpoint is the diamond.
             fig.add_trace(
                 go.Scatter(
-                    y=[m],
-                    x=[mi],
-                    mode="markers+text",
-                    marker=dict(color=color, size=14, symbol="diamond"),
-                    text=[f"{mi:,.1f}{unit}"],
-                    textposition="middle right",
-                    showlegend=False,
+                    y=[m], x=[hi], mode="text",
+                    text=[f"  {_unit_label(lo, unit, 'plotly')} \u2013 {_unit_label(hi, unit, 'plotly')}"],
+                    textposition="middle right", textfont=dict(size=15, color=PALETTE["text"]),
+                    showlegend=False, hoverinfo="skip",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    y=[m], x=[mi], mode="markers",
+                    marker=dict(color=color, size=14, symbol="diamond", line=dict(color="white", width=1)),
+                    showlegend=False, hovertemplate=f"Mid: {_unit_label(mi, unit)}",
                 )
             )
 
-        # Current Price Marker
-        if current_price is not None:
+        # Reference lines: market value, deal entry, current price
+        for index, ref in enumerate(references):
             fig.add_vline(
-                x=current_price,
-                line_dash="dash",
-                line_color=PALETTE["negative"],
-                annotation_text=f"Current: {current_price:,.1f}{unit}",
+                x=ref["value"], line_dash="dash",
+                line_color=PALETTE["negative"] if index == 0 else PALETTE["text"],
+                annotation_text=f"{ref['label']} {_unit_label(ref['value'], unit, 'plotly')}",
                 annotation_position="top",
+                annotation_yshift=22 * (index % 2),
+                annotation_font_size=13,
             )
 
         fig.update_layout(
             title=dict(text=title, font=dict(size=18, color=PALETTE["text"])),
-            xaxis=dict(title=f"Enterprise Value ({unit})", gridcolor=PALETTE["grid"]),
-            yaxis=dict(autorange="reversed"),
+            xaxis=dict(title=dict(text=f"Enterprise Value ({unit})", font=dict(size=14)),
+                       tickfont=dict(size=13), gridcolor=PALETTE["grid"],
+                       range=[0, max(highs + [r["value"] for r in references]) * 1.45]),
+            yaxis=dict(autorange="reversed", tickfont=dict(size=14)),
             plot_bgcolor=PALETTE["bg"],
             paper_bgcolor="white",
             height=height,
             width=width,
-            margin=dict(l=140, r=40, t=60, b=60),
+            margin=dict(l=230, r=40, t=100, b=60),
             barmode="overlay",
             font=dict(family="Liberation Sans, Helvetica, Arial"),
         )
@@ -159,10 +184,10 @@ class InfographicEngine:
             return fig.to_image(format="png", scale=2)
         except Exception as exc:  # Plotly image export needs kaleido; fall back to matplotlib
             logger.warning("football_field_plotly_export_failed", error=str(exc))
-            return InfographicEngine._football_field_mpl(methods, lows, mids, highs, title, unit, current_price)
+            return InfographicEngine._football_field_mpl(methods, lows, mids, highs, title, unit, references)
 
     @staticmethod
-    def _football_field_mpl(methods, lows, mids, highs, title, unit, current_price=None) -> bytes:
+    def _football_field_mpl(methods, lows, mids, highs, title, unit, references=None) -> bytes:
         _ensure_matplotlib()
         import matplotlib.pyplot as plt
 
@@ -171,9 +196,12 @@ class InfographicEngine:
             color = CHART_COLORS[i % len(CHART_COLORS)]
             ax.barh(i, max(hi - lo, (hi or 1) * 0.004), left=lo, color=color, alpha=0.35, edgecolor=color, linewidth=2)
             ax.plot([mi], [i], marker="D", color=color, markersize=9)
-            ax.text(hi, i, f"  {lo:,.2f} - {hi:,.2f} {unit}", va="center", fontsize=9, color=PALETTE["text"])
-        if current_price is not None:
-            ax.axvline(current_price, linestyle="--", color=PALETTE["negative"])
+            ax.text(hi, i, f"  {_unit_label(lo, unit, 'mpl')} - {_unit_label(hi, unit, 'mpl')}", va="center", fontsize=10,
+                    color=PALETTE["text"])
+        for index, ref in enumerate(references or []):
+            ax.axvline(ref["value"], linestyle="--", color=PALETTE["negative"] if index == 0 else PALETTE["text"])
+            ax.text(ref["value"], -0.55 - 0.25 * (index % 2), f"{ref['label']} {_unit_label(ref['value'], unit, 'mpl')}", fontsize=9,
+                    ha="center", color=PALETTE["text"])
         ax.set_yticks(range(len(methods)))
         ax.set_yticklabels(methods)
         ax.invert_yaxis()

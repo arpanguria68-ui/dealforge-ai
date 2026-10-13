@@ -101,6 +101,20 @@ def revenue_bridge(history: List[Dict[str, Any]]) -> Tuple[List[str], List[float
     return labels, values
 
 
+def valuation_references(agent_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Vertical reference lines for the football field ($B): current market EV and the LBO entry."""
+    from app.core.validation.reconciliation import extract_figures
+
+    figures = extract_figures(agent_results)
+    lines: List[Dict[str, Any]] = []
+    if figures["market_ev"]:
+        lines.append({"label": "Market EV", "value": figures["market_ev"][0]["value"] / 1e9})
+    if figures["lbo_entry_ev"]:
+        entry = min(figures["lbo_entry_ev"], key=lambda e: e["value"])["value"] / 1e9
+        lines.append({"label": "LBO entry", "value": entry})
+    return lines
+
+
 def enrich_deal_from_results(deal: Dict[str, Any], agent_results: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Copy of ``deal`` with chartable valuation and revenue data filled in when missing."""
     out = dict(deal or {})
@@ -108,7 +122,10 @@ def enrich_deal_from_results(deal: Dict[str, Any], agent_results: List[Dict[str,
     if not existing:
         rows = valuation_rows(agent_results)
         if rows:
-            out["valuation_output"] = {**(out.get("valuation_output") or {}), "valuations": rows, "unit": "$B"}
+            out["valuation_output"] = {
+                **(out.get("valuation_output") or {}), "valuations": rows, "unit": "$B",
+                "reference_lines": valuation_references(agent_results),
+            }
     fact_base = dict(out.get("fact_base") or {})
     metrics = dict(fact_base.get("metrics") or {})
     if not metrics.get("historical_revenue"):
