@@ -1774,6 +1774,26 @@ class ValuationAgent(BaseAgent):
                 audit["wacc_build"] = gathered["wacc_build"]
         elif needs_market:
             audit["missing"].append("public ticker (needed to fetch peer multiples, beta)")
+
+        # No usable FCF / growth from earlier tasks: read them from the filings (sourced, not assumed).
+        if re.fullmatch(r"[A-Z][A-Z.\-]{0,5}", ticker) and not (
+            (financial_data.get("free_cash_flow") or 0) > 0 and financial_data.get("revenue_growth") is not None
+        ):
+            await self._fill_from_filings(financial_data, ticker, audit)
+            if financial_data.get("free_cash_flow") and not financial_data.get("projected_cash_flows"):
+                from app.core.valuation_inputs import DEFAULT_ASSUMPTIONS, project_cash_flows
+
+                growth = financial_data.get("revenue_growth")
+                if growth is not None and financial_data["free_cash_flow"] > 0:
+                    financial_data["projected_cash_flows"] = project_cash_flows(
+                        financial_data["free_cash_flow"], growth, DEFAULT_ASSUMPTIONS["terminal_growth"],
+                        int(DEFAULT_ASSUMPTIONS["projection_years"]),
+                    )
+                    audit["assumptions"].append(
+                        f"FCF grows from {growth:.1%} fading linearly to "
+                        f"{DEFAULT_ASSUMPTIONS['terminal_growth']:.1%} over {int(DEFAULT_ASSUMPTIONS['projection_years'])} years"
+                    )
+                    audit["missing"] = [m for m in audit["missing"] if "cash-flow projection" not in m]
         audit["inputs"] = {"financial_data": financial_data, "market_data": market_data}
 
         # Run multiple valuation methods
@@ -1828,6 +1848,34 @@ class ValuationAgent(BaseAgent):
             confidence=0.75,
             execution_time_ms=execution_time,
         )
+
+    async def _fill_from_filings(self, financial_data: Dict[str, Any], ticker: str, audit: Dict[str, Any]) -> None:
+        """Latest revenue, free cash flow (CFO - capex) and revenue growth from SEC filings, via the tool."""
+        try:
+            result = await self.tools.execute(
+                "fetch_financial_statements",
+                {"ticker": ticker, "statements": ["income", "balance", "cashflow"], "periods": 5, "frequency": "annual"},
+            )
+            if not (result.success and isinstance(result.data, dict) and result.data.get("has_data")):
+                return
+            assessment = FinancialAnalystAgent._statement_data_assessment(result.data, period_limit=5)
+        except Exception:
+            return
+        facts = assessment.get("cash_flow") if isinstance(assessment.get("cash_flow"), dict) else {}
+        revenue = (assessment.get("revenue_analysis") or {}).get("annual_revenue")
+        growth = (assessment.get("revenue_analysis") or {}).get("growth_rate")
+        filled = []
+        if isinstance(facts.get("free_cash_flow"), (int, float)) and facts["free_cash_flow"] > 0:
+            financial_data["free_cash_flow"] = float(facts["free_cash_flow"])
+            filled.append("free cash flow")
+        if isinstance(revenue, (int, float)) and not financial_data.get("revenue"):
+            financial_data["revenue"] = float(revenue)
+            filled.append("revenue")
+        if isinstance(growth, (int, float)) and financial_data.get("revenue_growth") is None:
+            financial_data["revenue_growth"] = float(growth) / 100
+            filled.append("revenue growth")
+        if filled:
+            audit["sources"].append("SEC EDGAR filings (fetch_financial_statements): " + ", ".join(filled))
 
     async def _finnhub_fetch(self, endpoint: str, symbol: str) -> Any:
         """Finnhub JSON for ``endpoint`` or None (tool errors are non-fatal)."""

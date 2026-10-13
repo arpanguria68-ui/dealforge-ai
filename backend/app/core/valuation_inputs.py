@@ -96,6 +96,10 @@ def normalize_units(node: Any, scale: float = 1.0) -> Any:
     out: Dict[str, Any] = {}
     for key, value in node.items():
         lowered = str(key).lower()
+        child_scale = local
+        if isinstance(value, (dict, list)):  # "historical_financials_millions_usd": {...}
+            named = 1e9 if "billions" in lowered else 1e6 if "millions" in lowered else 1e3 if "thousands" in lowered else None
+            child_scale = named or local
         key_scale = local
         if lowered.endswith(("_m", "_millions", "_usd_m")):
             key_scale = 1e6
@@ -104,7 +108,7 @@ def normalize_units(node: Any, scale: float = 1.0) -> Any:
         ) and key_scale != 1.0:
             out[key] = float(value) * key_scale
         else:
-            out[key] = normalize_units(value, local)
+            out[key] = normalize_units(value, child_scale)
     return out
 
 
@@ -123,6 +127,13 @@ def _latest_year_value(outputs: Dict[str, Any], key: str) -> Optional[float]:
                     candidate = (int(digits.group(0)), number)
                     if best is None or candidate[0] > best[0]:
                         best = candidate
+                for child_key, child in node.items():  # {"2024": {"revenue": ...}} keyed by year
+                    if isinstance(child, dict) and re.fullmatch(r"(?:FY)?(\d{4})", str(child_key)):
+                        child_number = _num(child.get(key))
+                        if child_number is not None:
+                            candidate = (int(re.search(r"\d{4}", str(child_key)).group(0)), child_number)
+                            if best is None or candidate[0] > best[0]:
+                                best = candidate
                 stack.extend(v for v in node.values() if isinstance(v, (dict, list)))
             elif isinstance(node, list):
                 stack.extend(node)
