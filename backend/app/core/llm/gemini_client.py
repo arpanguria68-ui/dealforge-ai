@@ -3,6 +3,8 @@
 import os
 from typing import List, Dict, Any, Optional, AsyncGenerator
 import json
+import re
+import asyncio
 import structlog
 from app.config import get_settings
 
@@ -288,6 +290,23 @@ Respond ONLY with the JSON, no other text.
             raise
 
 
+# A chat product behind a proxy reports its own failures as an ordinary 200 reply. Short
+# replies that read like that are failures, never an answer to hand to the next stage.
+_CHAT_FAILURE = re.compile(
+    r"(something went wrong|encountered an error|an error occurred|try (?:your request|again)|"
+    r"i(?:'m| am) (?:sorry|unable|having trouble)|can(?:'|no)t (?:help|assist) with that|"
+    r"unable to (?:process|complete|generate)|rate limit|too many requests)",
+    re.IGNORECASE,
+)
+_CHAT_FAILURE_MAX_CHARS = 400
+
+
+def looks_like_chat_failure(text: str) -> bool:
+    """True for a short canned error such as "Sorry, something went wrong. Please try again."."""
+    body = (text or "").strip()
+    return 0 < len(body) <= _CHAT_FAILURE_MAX_CHARS and bool(_CHAT_FAILURE.search(body))
+
+
 class OpenAIClient:
     """Client for OpenAI API (GPT-4, Codex)"""
 
@@ -355,6 +374,14 @@ class OpenAIClient:
             params["tool_choice"] = "auto"
 
         response = await self.client.chat.completions.create(**params)
+        if self.provider == "custom_endpoint" and looks_like_chat_failure(response.choices[0].message.content or ""):
+            await asyncio.sleep(2)  # one retry: the proxy's canned errors are usually transient
+            response = await self.client.chat.completions.create(**params)
+            if looks_like_chat_failure(response.choices[0].message.content or ""):
+                raise ValueError(
+                    "Custom endpoint returned an error message instead of an answer: "
+                    + (response.choices[0].message.content or "").strip()[:120]
+                )
 
         message = response.choices[0].message
 
