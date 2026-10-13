@@ -18,12 +18,11 @@ from app.core.validation.reconciliation import reconcile, reconciliation_notice
 _CONTEXT_EXCLUDE = {"agent_results", "kb_graph", "knowledge_graph_context", "risk_data"}
 
 
-MIN_MEMO_CHARS = 600  # the required structure alone is longer than this
-
-
 def memo_is_usable(content: str) -> bool:
-    """A finished memo has substance; a one-line apology from the model or proxy is not one."""
-    return len((content or "").strip()) >= MIN_MEMO_CHARS
+    """False for an empty reply or a chat product's canned error ("Sorry, something went wrong...")."""
+    from app.core.llm.gemini_client import looks_like_chat_failure
+
+    return bool((content or "").strip()) and not looks_like_chat_failure(content)
 
 
 def _verified_valuation_block(agent_results: List[Dict[str, Any]]) -> str:
@@ -163,7 +162,7 @@ RULES:
             result = await self.generate_with_tools(prompt, system_prompt=system_prompt)
             content = result.get("content", "")
             if not memo_is_usable(content):
-                raise ValueError(f"Model returned {len((content or '').strip())} characters, not a memo: {(content or '').strip()[:100]!r}")
+                raise ValueError(f"Model reply is not a memo: {(content or '').strip()[:100]!r}")
 
             # Deterministic check: do the memo's figures trace to agent outputs?
             grounding = check_memo_grounding(content, agent_results, str(context.get("user_prompt") or ""))
