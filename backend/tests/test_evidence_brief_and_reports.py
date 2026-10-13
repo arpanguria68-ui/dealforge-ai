@@ -69,10 +69,16 @@ def test_evidence_brief_curates_periodic_api_metrics_with_stable_source_ids():
     assert not any(item["metric"] == "net_income" for item in brief["data_points"])
 
 
-def test_document_synthesis_receives_curated_evidence_not_raw_tool_payload():
+def test_document_synthesis_receives_curated_evidence_not_raw_tool_payload(monkeypatch):
     import asyncio
     from types import SimpleNamespace
     from app.core.reports.document_planner import prepare_document_payload
+
+    async def fake_edit(agent_results, evidence, user_text, verified):
+        # No model in CI: stand in for a successful editor so the QA status reflects the evidence only.
+        return {"key_messages": [], "sections": [], "editor": "llm"}
+
+    monkeypatch.setattr("app.core.reports.report_editor.edit_report", fake_edit)
 
     class FakeAgent:
         async def run(self, task, context):
