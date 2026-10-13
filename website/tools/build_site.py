@@ -447,6 +447,19 @@ def page_architecture():
         ['Provenance', 'Audit trail of tool calls with parameters, raw response, timestamp and freshness; exportable per deal'],
     ])}
 
+<h2>Laya: the fast classifier layer</h2>
+<p>Laya is a small "System-1" decision engine. Instead of asking a large model every routing question, DealForge asks Laya typed questions (a choice, a score, a yes/no) and uses the answer to route work. Everything is <strong>fail-soft</strong>: if Laya is off, missing or slow, callers fall back to the previous keyword or LLM path, and a circuit breaker stops a dead backend from slowing every step.</p>
+{table(['Decision', 'Where it is used'], [
+        ['Complexity tier (fast / general / reasoning)', '<code>ModelRouter</code> picks a provider pool per task; simple tasks go to a local or fast model, hard ones to a reasoning model. Pools are configurable (<code>LAYA_FAST_POOL</code>, <code>LAYA_GENERAL_POOL</code>, <code>LAYA_REASONING_POOL</code>)'],
+        ['Tool family shortlist', '<code>ToolRouter</code> narrows an agent's allow-list to the relevant tool family for the task'],
+        ['Deal triage and guardrail', 'LangGraph nodes classify the brief; secrets in briefs (API keys, bearer tokens, private keys) are redacted before any model sees them. Redaction runs even when Laya is unavailable'],
+        ['Confidence gate', 'Scores agent output so low-confidence results can trigger review or a retry in the orchestrator'],
+        ['Retrieval relevance and re-ranking', 'Hybrid search can re-rank chunks by relevance'],
+        ['Debate agreement', 'Detects whether debating agents have converged'],
+    ])}
+<p>Backends, in priority order: a local in-process router (<code>pip install laya</code>), a remote <code>laya-serve</code> over HTTP, an LM Studio model answering the same typed questions as constrained JSON, then a deterministic keyword heuristic. A decision cache and in-flight de-duplication keep it cheap because the planner, project manager, router and gates often ask the same question. Configure it with <code>LAYA_ENABLED</code>, <code>LAYA_MODE</code> (<code>auto|local|remote|lmstudio|off</code>), <code>LAYA_BASE_URL</code> and the other <code>LAYA_*</code> variables; status is at <code>GET /api/v1/laya/status</code>.</p>
+<div class="note warn"><p>Confidences are calibrated only with the local or remote checkpoints; the LM Studio backend reports uncalibrated model confidence. The demo runs on this site do not claim which backend was active.</p></div>
+
 <h2>Orchestration modes</h2>
 <p>The same agents can be driven three ways:</p>
 {table(['Mode', 'Entry point', 'Status'], [
