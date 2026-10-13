@@ -36,6 +36,13 @@ def get_llm_client(provider=None):
             api_key=configured("openai_api_key", "OPENAI_API_KEY"),
             model=configured("openai_model", "OPENAI_MODEL"),
         )
+    elif provider == "custom_endpoint":
+        return OpenAIClient(
+            api_key=configured("custom_endpoint_api_key", "CUSTOM_ENDPOINT_API_KEY", ""),
+            model=configured("custom_endpoint_model", "CUSTOM_ENDPOINT_MODEL", ""),
+            base_url=configured("custom_endpoint_base_url", "CUSTOM_ENDPOINT_BASE_URL", ""),
+            provider="custom_endpoint",
+        )
     elif provider == "openrouter":
         return OpenRouterClient(
             api_key=configured("openrouter_api_key", "OPENROUTER_API_KEY"),

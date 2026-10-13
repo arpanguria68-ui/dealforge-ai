@@ -49,13 +49,13 @@ function App() {
   ];
 
   return (
-    <div className="flex h-full min-h-0 w-full flex-col overflow-hidden font-sans antialiased text-slate-900 dark:text-slate-50 bg-slate-50 dark:bg-slate-950">
-      <header className="relative z-10 flex min-h-14 shrink-0 items-center gap-3 border-b bg-background px-4 sm:px-5">
+    <div className="flex h-full min-h-0 w-full flex-col overflow-hidden font-sans antialiased text-foreground bg-background">
+      <header className="relative z-10 flex min-h-12 shrink-0 items-center gap-3 bg-appbar px-3 text-appbar-foreground shadow-fluent sm:px-4">
         <div className="flex shrink-0 items-center gap-2.5">
-          <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
+          <div className="flex h-8 w-8 items-center justify-center rounded-md bg-white/15 text-appbar-foreground">
             <Zap className="h-4 w-4" />
           </div>
-          <h1 className="hidden text-base font-semibold tracking-tight sm:block">DealForge</h1>
+          <h1 className="hidden text-[15px] font-semibold tracking-tight sm:block">DealForge</h1>
         </div>
 
         {/* Navigation */}
@@ -67,13 +67,13 @@ function App() {
                 key={item.id}
                 id={`nav-${item.id}`}
                 onClick={() => navigateTo(item.id)}
-                className={`flex shrink-0 items-center gap-2 rounded-md px-2 py-2 text-sm font-medium transition-colors md:px-3 ${page === item.id
-                  ? 'bg-primary/10 text-primary shadow-sm'
-                  : 'text-muted-foreground hover:text-foreground hover:bg-slate-100 dark:hover:bg-slate-800'
+                className={`relative flex shrink-0 items-center gap-2 rounded-md px-2 py-1.5 text-sm font-medium transition-colors md:px-3 ${page === item.id
+                  ? 'bg-white/15 text-appbar-foreground after:absolute after:inset-x-2 after:-bottom-[7px] after:h-[3px] after:rounded-full after:bg-white'
+                  : 'text-appbar-foreground/80 hover:bg-white/10 hover:text-appbar-foreground'
                   }`}
               >
                 <Icon className="h-4 w-4" />
-                <span className="hidden md:inline">{item.label}</span>
+                <span className={page === item.id ? 'inline' : 'hidden xl:inline'}>{item.label}</span>
               </button>
             );
           })}
@@ -86,22 +86,23 @@ function App() {
               size="sm"
               onClick={checkSystemStatus}
               id="system-status-btn"
+              className="border-white/30 bg-transparent text-appbar-foreground hover:bg-white/10 hover:text-appbar-foreground"
             >
               {sysStatus === 'checking' ? (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                <Loader2 className="h-4 w-4 lg:mr-2 animate-spin" />
               ) : sysStatus === 'ok' ? (
-                <CheckCircle2 className="mr-2 h-4 w-4 text-green-500" />
+                <CheckCircle2 className="h-4 w-4 lg:mr-2 text-emerald-300" />
               ) : sysStatus === 'error' ? (
-                <XCircle className="mr-2 h-4 w-4 text-red-500" />
+                <XCircle className="h-4 w-4 lg:mr-2 text-red-300" />
               ) : (
-                <Activity className="mr-2 h-4 w-4" />
+                <Activity className="h-4 w-4 lg:mr-2" />
               )}
-              <span className="hidden sm:inline">{sysStatus === 'ok' ? 'Online' : sysStatus === 'error' ? 'Offline' : 'Backend'}</span>
+              <span className="hidden lg:inline">{sysStatus === 'ok' ? 'Online' : sysStatus === 'error' ? 'Offline' : 'Backend'}</span>
             </Button>
           </div>
-          <Button size="sm" onClick={() => { createConversation(); navigateTo('chat'); }} id="new-deal-btn">
-            <Briefcase className="h-4 w-4 sm:mr-2" />
-            <span className="hidden sm:inline">New analysis</span>
+          <Button size="sm" onClick={() => { createConversation(); navigateTo('chat'); }} id="new-deal-btn" className="bg-white text-appbar hover:bg-white/90">
+            <Briefcase className="h-4 w-4 lg:mr-2" />
+            <span className="hidden lg:inline">New analysis</span>
           </Button>
         </div>
       </header>

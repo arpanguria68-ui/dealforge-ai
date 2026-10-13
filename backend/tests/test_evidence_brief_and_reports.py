@@ -69,10 +69,16 @@ def test_evidence_brief_curates_periodic_api_metrics_with_stable_source_ids():
     assert not any(item["metric"] == "net_income" for item in brief["data_points"])
 
 
-def test_document_synthesis_receives_curated_evidence_not_raw_tool_payload():
+def test_document_synthesis_receives_curated_evidence_not_raw_tool_payload(monkeypatch):
     import asyncio
     from types import SimpleNamespace
     from app.core.reports.document_planner import prepare_document_payload
+
+    async def fake_edit(agent_results, evidence, user_text, verified):
+        # No model in CI: stand in for a successful editor so the QA status reflects the evidence only.
+        return {"key_messages": [], "sections": [], "editor": "llm"}
+
+    monkeypatch.setattr("app.core.reports.report_editor.edit_report", fake_edit)
 
     class FakeAgent:
         async def run(self, task, context):
@@ -248,7 +254,9 @@ def test_docx_omits_unavailable_risk_and_visual_sections_and_uncurated_raw_metri
 
     assert "Risk Matrix" not in text and "Risk Assessment" not in text
     assert "Visual Analytics Annex" not in text and "Visual Analysis" not in text
-    assert "900.0" not in text and "$900.0m" not in text
+    # Uncited agent figures may be shown for context, but never as established facts.
+    assert all("unverified" in line for line in text.splitlines() if "900.0" in line)
+    assert "$900.0m" not in text
 
 
 def test_cash_flow_points_without_citations_are_not_labeled_reported():

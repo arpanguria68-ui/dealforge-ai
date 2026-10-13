@@ -575,7 +575,9 @@ class BaseAgent(ABC):
         tool_context_chars = self._tool_context_budget(provider, selected_model, request_tokens)
         if selected_model:
             self.logger.info("laya_model_selected", agent=self.name, provider=provider, model=selected_model)
-        is_local_model = provider in ["ollama", "lmstudio", "mistral"]
+        # Providers without reliable native function calling use the text tool
+        # protocol below (a custom OpenAI-compatible endpoint is only a proxy).
+        is_local_model = provider in self._TEXT_TOOL_PROVIDERS
 
         gateway = get_llm_gateway()
 
@@ -583,17 +585,24 @@ class BaseAgent(ABC):
         effective_tools = tools if (tools and not is_local_model) else None
         if is_local_model and tools:
             react_instructions = """
-You have access to the following tools:
+## TOOLS
+You are a tool-using agent. You do NOT have live data. Never answer from memory or your
+own browsing for prices, market caps, financial statements, filings, peer multiples or news:
+call a tool first, then answer using ONLY the tool results.
+
+Available tools (name, description, parameters):
 {}
 
-To use a tool, you MUST output a JSON block wrapped in Markdown like this:
+PROTOCOL
+- To call tools, reply with ONLY fenced json blocks and no other text, one block per call:
 ```json
-{{
-  "command": "tool_name",
-  "args": {{"arg1": "value1"}}
-}}
+{{"command": "tool_name", "args": {{"arg1": "value1"}}}}
 ```
-Do NOT wrap the JSON in any other formatting. Output only the JSON block to use a tool, or your final answer if no tools are needed.
+- You may emit several blocks in one reply when the calls are independent.
+- After the results arrive, either call more tools or give your final answer in the format
+  the task asks for. If the task needs no outside data, answer directly without a tool call.
+- If a tool returns an error, say which tool failed and that the data was not retrieved. Never
+  claim a source you did not call and never fill the gap from memory.
 """.format(
                 json.dumps([t.get("function") for t in tools], indent=2)
             )
@@ -628,21 +637,12 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
                     f"{response.get('content') or 'No usable response'}"
                 )
 
-            # Local models often represent ReAct calls as JSON text instead of
-            # returning native function_calls.
+            # Text-protocol providers return tool calls as JSON blocks in the reply.
             if is_local_model and not response.get("function_calls"):
-                content = response.get("content", "")
-                if '"command"' in content or "'command'" in content:
-                    from app.core.json_helpers import extract_and_parse_json
-
-                    parsed = extract_and_parse_json(content)
-                    if isinstance(parsed, dict) and isinstance(parsed.get("command"), str):
-                        args = parsed.get("args", {})
-                        response["function_calls"] = [{
-                            "name": parsed["command"],
-                            "args": args if isinstance(args, dict) else {},
-                        }]
-                        response["content"] = ""
+                text_calls = self._parse_text_tool_calls(response.get("content", ""))
+                if text_calls:
+                    response["function_calls"] = text_calls
+                    response["content"] = ""
 
             # Check if tool calls were requested
             if not response.get("function_calls"):
@@ -682,7 +682,13 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
                 reported.add(key)
                 round_results.append(entry)
             accumulated_tool_results.extend(round_results)
-            all_function_calls.extend(calls)
+            for call, key in zip(calls, memo_keys):  # record outcomes on copies, not the executed calls
+                outcome = call_memo.get(key, {})
+                all_function_calls.append({
+                    **call,
+                    "success": bool(outcome.get("success")),
+                    **({"error": str(outcome["error"])[:200]} if outcome.get("error") else {}),
+                })
             pending_tool_results = True
 
             if not fresh:
@@ -736,6 +742,29 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
 
     # Keys agents use when the model's output could not be parsed as JSON.
     _PARSE_FALLBACK_KEYS = frozenset({"raw_reasoning", "raw_synthesis", "raw_response", "raw"})
+
+    @staticmethod
+    def _parse_text_tool_calls(content: str) -> List[Dict[str, Any]]:
+        """Tool calls written as ``{"command": ..., "args": {...}}`` JSON in a reply.
+
+        Accepts several fenced blocks, one block holding a JSON list, or a bare object.
+        Anything that is not a well-formed call is ignored, so ordinary prose or a final
+        JSON answer is never mistaken for a tool request.
+        """
+        if not content or ("command" not in content):
+            return []
+        from app.core.json_helpers import extract_and_parse_json
+
+        blocks = re.findall(r"```(?:json)?\s*(.*?)```", content, flags=re.DOTALL)
+        candidates = blocks or [content]
+        calls: List[Dict[str, Any]] = []
+        for block in candidates:
+            parsed = extract_and_parse_json(block)
+            for item in (parsed if isinstance(parsed, list) else [parsed]):
+                if isinstance(item, dict) and isinstance(item.get("command"), str) and item["command"]:
+                    args = item.get("args", {})
+                    calls.append({"name": item["command"], "args": args if isinstance(args, dict) else {}})
+        return calls[:6]
 
     @classmethod
     def _evidence_confidence(
@@ -804,6 +833,8 @@ Do NOT wrap the JSON in any other formatting. Output only the JSON block to use 
     _TOOL_CONTEXT_CHAR_LIMIT = 24000
     _TOOL_CONTEXT_MIN_CHARS = 2000
     _TOOL_RESULT_HEADROOM_TOKENS = 4000
+    # Providers that get tools as a text protocol instead of native function calls.
+    _TEXT_TOOL_PROVIDERS = frozenset({"ollama", "lmstudio", "mistral", "custom_endpoint"})
     _CHARS_PER_TOKEN = 3.5
 
     @classmethod

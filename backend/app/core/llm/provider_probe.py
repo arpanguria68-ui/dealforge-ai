@@ -35,6 +35,10 @@ def _client(provider: str, model: str, api_key: str, base_url: Optional[str] = N
         return GeminiClient(model=model, api_key=api_key)
     if provider == "openai":
         return OpenAIClient(model=model, api_key=api_key)
+    if provider == "custom_endpoint":
+        if not base_url:
+            raise ValueError("Custom endpoint base URL is required")
+        return OpenAIClient(model=model, api_key=api_key, base_url=base_url, provider=provider)
     if provider == "openrouter":
         return OpenRouterClient(model=model, api_key=api_key)
     if provider == "claude":

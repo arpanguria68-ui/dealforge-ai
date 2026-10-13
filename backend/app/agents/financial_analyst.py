@@ -3,6 +3,7 @@
 from typing import Dict, Any, Optional, List
 import asyncio
 import json
+import re
 import math
 import re
 from datetime import datetime
@@ -307,6 +308,7 @@ class FinancialAnalystAgent(BaseAgent):
                 analysis_data["calculations"] = tool_results
 
             if not source_grounded_fallback:
+                self._merge_sourced_facts(analysis_data, (context or {}).get("financial_data"), requested_period_count)
                 self._enforce_evidence_grounding(analysis_data, task, context or {}, tool_results)
 
             await self._apply_laya_output_gate(task, analysis_data)
@@ -333,6 +335,36 @@ class FinancialAnalystAgent(BaseAgent):
                 reasoning=f"Analysis failed: {str(e)}",
                 confidence=0.0,
             )
+
+    @classmethod
+    def _merge_sourced_facts(
+        cls, analysis: Dict[str, Any], financial_data: Any, period_limit: Optional[int] = None
+    ) -> None:
+        """Overlay filing-linked statement facts on the model's analysis.
+
+        The model writes the narrative but drops the per-year history, filing URLs and the
+        fiscal periods; without them every figure is "unsourced" downstream. The
+        deterministic readout from the fetched statements is authoritative for numbers,
+        and the model's prose fields are left alone.
+        """
+        if not (isinstance(financial_data, dict) and financial_data.get("has_data")):
+            return
+        sourced = cls._statement_data_assessment(financial_data, period_limit=period_limit)
+        if not sourced.get("historical_financials"):
+            return
+        for key in ("historical_financials", "sources", "data_source", "source_url", "retrieved_at"):
+            if sourced.get(key):
+                analysis[key] = sourced[key]
+        for section in ("revenue_analysis", "cash_flow", "balance_sheet"):
+            facts = sourced.get(section)
+            if isinstance(facts, dict) and facts:
+                current = analysis.get(section) if isinstance(analysis.get(section), dict) else {}
+                analysis[section] = {**current, **{k: v for k, v in facts.items() if v is not None}}
+        existing = analysis.get("key_findings") if isinstance(analysis.get("key_findings"), list) else []
+        known = {str(f.get("finding")) for f in existing if isinstance(f, dict)}
+        analysis["key_findings"] = existing + [
+            f for f in sourced.get("key_findings", []) if isinstance(f, dict) and str(f.get("finding")) not in known
+        ]
 
     async def _apply_laya_output_gate(self, task: str, analysis: Dict[str, Any]) -> None:
         """Use Laya as an advisory unsupported-claim gate, never as an arithmetic oracle."""
@@ -1717,6 +1749,55 @@ class ValuationAgent(BaseAgent):
         if fact_base:
             financial_data = {**financial_data, **deal_terms}
 
+        # The UI path passes earlier tasks' outputs as free-form agent_outputs;
+        # map their explicit figures, then fill gaps from sourced market data.
+        from app.core.valuation_inputs import derive_valuation_inputs, gather_market_inputs
+
+        derived = derive_valuation_inputs((context or {}).get("agent_outputs") or {})
+        financial_data = {**derived["financial_data"], **(financial_data or {})}
+        market_data = {**derived["market_data"], **(market_data or {})}
+        audit: Dict[str, Any] = {"assumptions": [], "sources": [], "missing": []}
+        from app.core.valuation_inputs import normalize_ticker
+
+        ticker = normalize_ticker((context or {}).get("ticker"))
+        needs_market = not (
+            financial_data.get("wacc")
+            and financial_data.get("projected_cash_flows")
+            and market_data.get("ev_revenue_median")
+        )
+        if needs_market and re.fullmatch(r"[A-Z][A-Z.\-]{0,5}", ticker):
+            gathered = await gather_market_inputs(ticker, self._finnhub_fetch, financial_data)
+            for key, value in gathered["financial_data"].items():
+                financial_data.setdefault(key, value)
+            for key, value in gathered["market_data"].items():
+                market_data.setdefault(key, value)
+            audit = {k: gathered[k] for k in ("assumptions", "sources", "missing")}
+            if gathered.get("wacc_build"):
+                audit["wacc_build"] = gathered["wacc_build"]
+        elif needs_market:
+            audit["missing"].append("public ticker (needed to fetch peer multiples, beta)")
+
+        # No usable FCF / growth from earlier tasks: read them from the filings (sourced, not assumed).
+        if re.fullmatch(r"[A-Z][A-Z.\-]{0,5}", ticker) and not (
+            (financial_data.get("free_cash_flow") or 0) > 0 and financial_data.get("revenue_growth") is not None
+        ):
+            await self._fill_from_filings(financial_data, ticker, audit)
+            if financial_data.get("free_cash_flow") and not financial_data.get("projected_cash_flows"):
+                from app.core.valuation_inputs import DEFAULT_ASSUMPTIONS, project_cash_flows
+
+                growth = financial_data.get("revenue_growth")
+                if growth is not None and financial_data["free_cash_flow"] > 0:
+                    financial_data["projected_cash_flows"] = project_cash_flows(
+                        financial_data["free_cash_flow"], growth, DEFAULT_ASSUMPTIONS["terminal_growth"],
+                        int(DEFAULT_ASSUMPTIONS["projection_years"]),
+                    )
+                    audit["assumptions"].append(
+                        f"FCF grows from {growth:.1%} fading linearly to "
+                        f"{DEFAULT_ASSUMPTIONS['terminal_growth']:.1%} over {int(DEFAULT_ASSUMPTIONS['projection_years'])} years"
+                    )
+                    audit["missing"] = [m for m in audit["missing"] if "cash-flow projection" not in m]
+        audit["inputs"] = {"financial_data": financial_data, "market_data": market_data}
+
         # Run multiple valuation methods
         methods = ["dcf", "comparable_companies", "precedent_transactions"]
         valuations = {}
@@ -1737,17 +1818,20 @@ class ValuationAgent(BaseAgent):
             execution_time = (datetime.now() - start_time).total_seconds() * 1000
             return AgentOutput(
                 success=False,
-                data={"valuations": valuations},
-                reasoning="All valuation methods returned insufficient data",
+                data={"valuations": valuations, "audit": audit},
+                reasoning=(
+                    "All valuation methods returned insufficient data. Missing: "
+                    + ("; ".join(audit["missing"]) or "structured financial inputs")
+                ),
                 confidence=0.0,
                 execution_time_ms=execution_time,
             )
 
-        weighted_value = sum(
-            valuations[m]["value"] * weights[m]
-            for m in methods
-            if valuations[m].get("value")
-        )
+        # Renormalise over the methods that produced a value, otherwise a missing
+        # method drags the estimate below every individual result.
+        used = [m for m in methods if valuations[m].get("value")]
+        total_weight = sum(weights[m] for m in used)
+        weighted_value = sum(valuations[m]["value"] * weights[m] for m in used) / total_weight
 
         execution_time = (datetime.now() - start_time).total_seconds() * 1000
 
@@ -1755,6 +1839,7 @@ class ValuationAgent(BaseAgent):
             success=True,
             data={
                 "valuations": valuations,
+                "audit": audit,
                 "weighted_estimate": weighted_value,
                 "valuation_range": {
                     "low": min(valid_values),
@@ -1765,6 +1850,44 @@ class ValuationAgent(BaseAgent):
             confidence=0.75,
             execution_time_ms=execution_time,
         )
+
+    async def _fill_from_filings(self, financial_data: Dict[str, Any], ticker: str, audit: Dict[str, Any]) -> None:
+        """Latest revenue, free cash flow (CFO - capex) and revenue growth from SEC filings, via the tool."""
+        try:
+            result = await self.tools.execute(
+                "fetch_financial_statements",
+                {"ticker": ticker, "statements": ["income", "balance", "cashflow"], "periods": 5, "frequency": "annual"},
+            )
+            if not (result.success and isinstance(result.data, dict) and result.data.get("has_data")):
+                return
+            assessment = FinancialAnalystAgent._statement_data_assessment(result.data, period_limit=5)
+        except Exception:
+            return
+        facts = assessment.get("cash_flow") if isinstance(assessment.get("cash_flow"), dict) else {}
+        revenue = (assessment.get("revenue_analysis") or {}).get("annual_revenue")
+        growth = (assessment.get("revenue_analysis") or {}).get("growth_rate")
+        filled = []
+        if isinstance(facts.get("free_cash_flow"), (int, float)) and facts["free_cash_flow"] > 0:
+            financial_data["free_cash_flow"] = float(facts["free_cash_flow"])
+            filled.append("free cash flow")
+        if isinstance(revenue, (int, float)) and not financial_data.get("revenue"):
+            financial_data["revenue"] = float(revenue)
+            filled.append("revenue")
+        if isinstance(growth, (int, float)) and financial_data.get("revenue_growth") is None:
+            financial_data["revenue_growth"] = float(growth) / 100
+            filled.append("revenue growth")
+        if filled:
+            audit["sources"].append("SEC EDGAR filings (fetch_financial_statements): " + ", ".join(filled))
+
+    async def _finnhub_fetch(self, endpoint: str, symbol: str) -> Any:
+        """Finnhub JSON for ``endpoint`` or None (tool errors are non-fatal)."""
+        try:
+            result = await self.tools.execute(
+                "finnhub_data", {"symbol": symbol, "endpoint": endpoint}
+            )
+            return result.data if result.success else None
+        except Exception:
+            return None
 
     async def _run_valuation_method(
         self, method: str, financial_data: Dict, market_data: Dict

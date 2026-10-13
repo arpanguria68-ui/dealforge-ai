@@ -8,12 +8,15 @@ import {
     Download, ChevronRight, HelpCircle, Cpu, Cloud,
     ListChecks, CheckCircle2, Copy, Check, RotateCcw, Edit2,
     Zap, Sliders, Star, Globe, BookOpen, Database, ChevronDown, ChevronUp,
-    ThumbsUp, ThumbsDown, Quote
+    ThumbsUp, ThumbsDown, Square
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { CodeBlock } from '@/components/chat/CodeBlock';
 import { StarterPrompts } from '@/components/chat/EmptyState';
+import { CitationPill, SourceCards } from '@/components/chat/Sources';
+import { citationIndex, linkCitations, type SourceItem } from '@/lib/citations';
+import { ProvenanceBar } from '@/components/chat/Provenance';
 import { useDealForgeStore } from '@/lib/dealforge-store';
 import { API_BASE, withAdminAuth } from '@/lib/api-base';
 import { isDealAnalysisRequest } from '@/lib/chat-intent';
@@ -167,9 +170,9 @@ const AGENT_STYLES: Record<string, { icon: typeof Sparkles; gradient: string; gl
 };
 
 const FOCUS_MODES: { value: FocusMode; label: string; icon: typeof Zap; desc: string; color: string; badge?: string }[] = [
-    { value: 'speed', label: 'Speed', icon: Zap, desc: 'Prioritize speed and get the quickest possible answer.', color: 'text-amber-400' },
-    { value: 'balanced', label: 'Balanced', icon: Sliders, desc: 'Find the right balance between speed and accuracy.', color: 'text-blue-400' },
-    { value: 'quality', label: 'Quality', icon: Star, desc: 'Get the most thorough and accurate answer.', color: 'text-emerald-400', badge: 'Beta' },
+    { value: 'speed', label: 'Speed', icon: Zap, desc: 'Prioritize speed and get the quickest possible answer.', color: 'text-amber-700' },
+    { value: 'balanced', label: 'Balanced', icon: Sliders, desc: 'Find the right balance between speed and accuracy.', color: 'text-blue-700' },
+    { value: 'quality', label: 'Quality', icon: Star, desc: 'Get the most thorough and accurate answer.', color: 'text-emerald-700', badge: 'Beta' },
 ];
 
 const DATA_SOURCES: { value: DataSource; label: string; icon: typeof Globe }[] = [
@@ -180,11 +183,11 @@ const DATA_SOURCES: { value: DataSource; label: string; icon: typeof Globe }[] =
 
 const PHASE_LABELS: Record<Phase, { text: string; color: string }> = {
     idle: { text: '', color: '' },
-    brainstorming: { text: 'Brainstorming', color: 'text-violet-400' },
-    planning: { text: 'Building plan', color: 'text-cyan-400' },
-    awaiting_approval: { text: 'Awaiting approval', color: 'text-amber-400' },
-    executing: { text: 'Agents running', color: 'text-amber-400' },
-    synthesizing: { text: 'Synthesizing', color: 'text-emerald-400' },
+    brainstorming: { text: 'Brainstorming', color: 'text-violet-700' },
+    planning: { text: 'Building plan', color: 'text-cyan-700' },
+    awaiting_approval: { text: 'Awaiting approval', color: 'text-amber-700' },
+    executing: { text: 'Agents running', color: 'text-amber-700' },
+    synthesizing: { text: 'Synthesizing', color: 'text-emerald-700' },
 };
 
 // ─── Helpers ───
@@ -283,6 +286,32 @@ function normalizeCitations(raw: unknown): Citation[] {
     }).filter(c => c.label || c.source);
 }
 
+// Evidence behind an agent result: tool-call sources (SEC filings, vendor APIs) and the
+// valuation audit's data sources, so agent messages show what they were built from.
+function deriveEvidenceCitations(meta: Record<string, unknown> | undefined): Citation[] {
+    if (!meta) return [];
+    const out: Citation[] = [];
+    const seen = new Set<string>();
+    const add = (label: string, source: string) => {
+        const key = `${label}|${source}`;
+        if (!label || seen.has(key)) return;
+        seen.add(key);
+        out.push({ label, source });
+    };
+    const calls = Array.isArray(meta.calculations) ? meta.calculations as unknown[] : [];
+    for (const call of calls) {
+        const entry = call && typeof call === 'object' ? call as Record<string, unknown> : {};
+        const data = entry.data && typeof entry.data === 'object' ? entry.data as Record<string, unknown> : {};
+        const url = typeof data.source_url === 'string' ? data.source_url : '';
+        if (url) add(String(data.entity_name || data.source || entry.name || 'Source'), url);
+    }
+    const audit = meta.audit && typeof meta.audit === 'object' ? meta.audit as Record<string, unknown> : null;
+    if (audit && Array.isArray(audit.sources)) {
+        for (const src of audit.sources) if (typeof src === 'string') add(src, '');
+    }
+    return out.slice(0, 8);
+}
+
 function extractCompanyName(text: string): string {
     const tickerMatch = text.match(/\b([A-Z][\w&.'-]*(?:\s+[A-Z][\w&.'-]*){0,5})\s+\((?:(?:NASDAQ|NYSE|NYSEAMERICAN|AMEX|OTC)\s*:\s*)?[A-Z]{1,5}\)/);
     if (tickerMatch) {
@@ -297,11 +326,40 @@ function extractCompanyName(text: string): string {
     return match ? match[1].trim() : 'Target Company';
 }
 
+function formatMoney(value: number): string {
+    const abs = Math.abs(value);
+    const sign = value < 0 ? '-' : '';
+    if (abs >= 1e9) return `${sign}$${(abs / 1e9).toFixed(2)}B`;
+    if (abs >= 1e6) return `${sign}$${(abs / 1e6).toFixed(2)}M`;
+    if (abs >= 1e3) return `${sign}$${(abs / 1e3).toFixed(1)}K`;
+    return `${sign}$${abs.toFixed(0)}`;
+}
+
+function formatMetricValue(metric: string, raw: unknown): string {
+    const num = typeof raw === 'number' ? raw
+        : typeof raw === 'string' && raw.trim() !== '' && Number.isFinite(Number(raw)) ? Number(raw) : null;
+    if (num === null) return String(raw);
+    if (/growth|margin|rate|percent/i.test(metric)) return `${num.toFixed(1)}%`;
+    return formatMoney(num);
+}
+
+function filenameFromDisposition(header: string | null): string {
+    const match = header?.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+    return match ? decodeURIComponent(match[1]) : '';
+}
+
+function formatDuration(ms: number): string {
+    if (ms < 1000) return `${Math.round(ms)}ms`;
+    const seconds = ms / 1000;
+    if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
+    return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+}
+
 function formatAgentSummaryLine(agentLabel: string, result: Record<string, unknown>): string {
     const data = result.data && typeof result.data === 'object' ? result.data as Record<string, unknown> : {};
     if (data.confidence_basis === 'not_calibrated_source_report' || data.synthesis_status === 'deterministic_source_report') {
         const sourceLabel = data.data_source === 'sec_edgar_companyfacts' ? 'SEC-sourced facts' : 'Vendor-sourced facts';
-        const time = typeof result.execution_time_ms === 'number' ? ` · ${Math.round(result.execution_time_ms as number)}ms` : '';
+        const time = typeof result.execution_time_ms === 'number' ? ` · ${formatDuration(result.execution_time_ms as number)}` : '';
         const synthesis = data.synthesis_status === 'partial_provider_unavailable'
             ? '; model synthesis incomplete' : '';
         return `**${agentLabel}** — ${sourceLabel}${synthesis}; confidence not calibrated${time}`;
@@ -312,7 +370,7 @@ function formatAgentSummaryLine(agentLabel: string, result: Record<string, unkno
     const confidence = calibrated && typeof result.confidence === 'number'
         ? `${Math.round((result.confidence as number) * 100)}%`
         : 'not calibrated';
-    const time = typeof result.execution_time_ms === 'number' ? `${Math.round(result.execution_time_ms as number)}ms` : '';
+    const time = typeof result.execution_time_ms === 'number' ? formatDuration(result.execution_time_ms as number) : '';
     return `**${agentLabel}** — ${calibrated ? `Confidence: ${confidence}` : `Agent-reported confidence; not calibrated`}${time ? ` · ${time}` : ''}`;
 }
 
@@ -454,10 +512,11 @@ function buildSynthesisMessage(completedResults: AgentResult[], taskList: TaskPl
     let dealScore: number | null = null;
     let sourceCount = 0;
     let synthesisIncomplete = false;
+    const reconciliationNotes = new Set<string>();
 
     const addMetric = (metric: string, value: unknown, period: unknown, source: string) => {
         if ((typeof value === 'number' && Number.isFinite(value)) || (typeof value === 'string' && value.trim())) {
-            metrics.push({ metric, value: String(value), period: typeof period === 'string' ? period : 'Not established', source });
+            metrics.push({ metric, value: formatMetricValue(metric, value), period: typeof period === 'string' ? period : 'Not established', source });
         }
     };
 
@@ -490,6 +549,17 @@ function buildSynthesisMessage(completedResults: AgentResult[], taskList: TaskPl
             addMetric('Long-term debt', balance.long_term_debt, balance.debt_fiscal_year, label);
             const sourceRows = Array.isArray(data.sources) ? data.sources : [];
             sourceCount += sourceRows.filter(source => source && typeof source === 'object' && 'url' in source).length;
+        }
+
+        if (agent === 'valuation_agent' && data.valuations && typeof data.valuations === 'object') {
+            const v = data.valuations as Record<string, { value?: unknown }>;
+            if (typeof v.dcf?.value === 'number') addMetric('DCF enterprise value', v.dcf.value, 'Current', label);
+            if (typeof v.comparable_companies?.value === 'number') addMetric('Comparable-companies value', v.comparable_companies.value, 'Current', label);
+            if (typeof data.weighted_estimate === 'number') addMetric('Weighted valuation estimate', data.weighted_estimate, 'Current', label);
+        }
+        for (const issue of Array.isArray(data.reconciliation) ? data.reconciliation : []) {
+            const text = issue && typeof issue === 'object' ? String((issue as Record<string, unknown>).message || '') : '';
+            if (text) reconciliationNotes.add(text);
         }
 
         const riskRows = [data.risks, data.key_risks, data.top_risks].filter(Array.isArray).flat() as unknown[];
@@ -537,6 +607,7 @@ function buildSynthesisMessage(completedResults: AgentResult[], taskList: TaskPl
         md += `\n\n### Evidence Snapshot\n\n| Measure | Recorded value | Period | Producing agent |\n| --- | ---: | --- | --- |\n`;
         for (const metric of uniqueMetrics.slice(0, 12)) md += `| ${metric.metric} | ${metric.value} | ${metric.period} | ${metric.source} |\n`;
     }
+    if (reconciliationNotes.size) md += `\n\n### Agents Disagree — Resolve Before Relying On These Figures\n\n${[...reconciliationNotes].map(item => `- ${item}`).join('\n')}`;
     if (findings.length) md += `\n\n### Derived Findings\n\n${findings.slice(0, 4).map(item => `- ${item}`).join('\n')}`;
     if (risks.length) md += `\n\n### Key Risks\n\n${risks.slice(0, 5).map(item => `- ${item}`).join('\n')}`;
     if (limitations.size) md += `\n\n### Diligence Gaps and Caveats\n\n${[...limitations].slice(0, 6).map(item => `- ${item}`).join('\n')}`;
@@ -569,7 +640,7 @@ function FocusModePopover({ value, onChange, open, onToggle }: {
             <button
                 onClick={onToggle}
                 className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all duration-200 
-                    bg-white/5 hover:bg-white/10 border border-white/10 hover:border-white/20 ${current.color}`}
+                    bg-muted/60 hover:bg-accent border border-border hover:border-foreground/25 ${current.color}`}
             >
                 <CurrentIcon className="h-3.5 w-3.5" />
                 <span>{current.label}</span>
@@ -577,7 +648,7 @@ function FocusModePopover({ value, onChange, open, onToggle }: {
             </button>
 
             {open && (
-                <div className="absolute bottom-full left-0 mb-2 w-72 rounded-xl border border-white/10 bg-[#1a1a2e]/95 backdrop-blur-xl shadow-2xl shadow-black/50 z-50 overflow-hidden animate-in fade-in slide-in-from-bottom-2 duration-200">
+                <div className="absolute bottom-full left-0 mb-2 w-72 rounded-xl border border-border bg-popover shadow-fluent-lg z-50 overflow-hidden animate-in fade-in slide-in-from-bottom-2 duration-200">
                     {FOCUS_MODES.map((mode) => {
                         const Icon = mode.icon;
                         const isActive = mode.value === value;
@@ -586,17 +657,17 @@ function FocusModePopover({ value, onChange, open, onToggle }: {
                                 key={mode.value}
                                 onClick={() => { onChange(mode.value); onToggle(); }}
                                 className={`w-full flex items-start gap-3 px-4 py-3 text-left transition-all duration-150 
-                                    ${isActive ? 'bg-white/10' : 'hover:bg-white/5'}`}
+                                    ${isActive ? 'bg-muted' : 'hover:bg-muted'}`}
                             >
                                 <Icon className={`h-4 w-4 mt-0.5 ${mode.color}`} />
                                 <div>
                                     <div className="flex items-center gap-2">
-                                        <span className={`text-sm font-semibold ${isActive ? 'text-white' : 'text-white/80'}`}>{mode.label}</span>
+                                        <span className={`text-sm font-semibold ${isActive ? 'text-foreground' : 'text-foreground'}`}>{mode.label}</span>
                                         {mode.badge && (
-                                            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 font-medium">{mode.badge}</span>
+                                            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-700 font-medium">{mode.badge}</span>
                                         )}
                                     </div>
-                                    <span className="text-xs text-white/50 leading-tight">{mode.desc}</span>
+                                    <span className="text-xs text-muted-foreground leading-tight">{mode.desc}</span>
                                 </div>
                             </button>
                         );
@@ -616,15 +687,15 @@ function SourceToggles({ active, onToggle }: { active: DataSource[]; onToggle: (
         <div className="relative">
             <button
                 onClick={() => setOpen(!open)}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all duration-200 bg-white/5 hover:bg-white/10 border border-white/10 hover:border-white/20 text-blue-400"
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all duration-200 bg-muted/60 hover:bg-accent border border-border hover:border-foreground/25 text-blue-700"
             >
                 <Database className="h-3.5 w-3.5" />
                 <span>Sources</span>
-                <span className="text-[10px] bg-blue-500/20 text-blue-300 rounded-full px-1.5">{active.length}</span>
+                <span className="text-[10px] bg-blue-500/20 text-blue-700 rounded-full px-1.5">{active.length}</span>
             </button>
 
             {open && (
-                <div className="absolute bottom-full left-0 mb-2 w-52 rounded-xl border border-white/10 bg-[#1a1a2e]/95 backdrop-blur-xl shadow-2xl shadow-black/50 z-50 overflow-hidden animate-in fade-in slide-in-from-bottom-2 duration-200">
+                <div className="absolute bottom-full left-0 mb-2 w-52 rounded-xl border border-border bg-popover shadow-fluent-lg z-50 overflow-hidden animate-in fade-in slide-in-from-bottom-2 duration-200">
                     {DATA_SOURCES.map((src) => {
                         const Icon = src.icon;
                         const isActive = active.includes(src.value);
@@ -632,14 +703,14 @@ function SourceToggles({ active, onToggle }: { active: DataSource[]; onToggle: (
                             <button
                                 key={src.value}
                                 onClick={() => onToggle(src.value)}
-                                className="w-full flex items-center justify-between px-4 py-2.5 hover:bg-white/5 transition-colors"
+                                className="w-full flex items-center justify-between px-4 py-2.5 hover:bg-muted transition-colors"
                             >
                                 <div className="flex items-center gap-2.5">
-                                    <Icon className={`h-4 w-4 ${isActive ? 'text-blue-400' : 'text-white/40'}`} />
-                                    <span className={`text-sm ${isActive ? 'text-white' : 'text-white/50'}`}>{src.label}</span>
+                                    <Icon className={`h-4 w-4 ${isActive ? 'text-blue-700' : 'text-muted-foreground/70'}`} />
+                                    <span className={`text-sm ${isActive ? 'text-foreground' : 'text-muted-foreground'}`}>{src.label}</span>
                                 </div>
                                 <div className={`w-8 h-4.5 rounded-full transition-colors duration-200 flex items-center px-0.5 
-                                    ${isActive ? 'bg-blue-500' : 'bg-white/10'}`}>
+                                    ${isActive ? 'bg-blue-500' : 'bg-muted'}`}>
                                     <div className={`w-3.5 h-3.5 rounded-full bg-white transition-transform duration-200 
                                         ${isActive ? 'translate-x-3.5' : 'translate-x-0'}`} />
                                 </div>
@@ -693,10 +764,14 @@ export function ChatWindow() {
     const [activeDealId, setActiveDealId] = useState<string | null>(activeConv?.dealId || null);
     const [dealCompleted, setDealCompleted] = useState(false);
     const completedResultsRef = useRef<AgentResult[]>([]);
+    // Stop button: cancels in-flight requests and skips the remaining work.
+    const abortRef = useRef<AbortController | null>(null);
+    const stopRequestedRef = useRef(false);
     const taskListRef = useRef<TaskPlanItem[]>([]);
     const [collapsedAgents, setCollapsedAgents] = useState<Record<string, boolean>>({});
     const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
     const [followUps, setFollowUps] = useState<string[]>([]);
+    const [exporting, setExporting] = useState<'docx' | 'json' | null>(null);
     const [copiedId, setCopiedId] = useState<string | null>(null);
     const [ratedIds, setRatedIds] = useState<Record<number, 'up' | 'down'>>({});
     const [editingMsgId, setEditingMsgId] = useState<string | null>(null);
@@ -805,7 +880,7 @@ export function ChatWindow() {
                 : 'Score: ' + data.final_score + '/100';
             addMessageRef.current({
                 role: 'system',
-                content: '🎉 **Deal Analysis Complete**\n\n' + scoreLine + '\n' + data.recommendation,
+                content: '**Deal Analysis Complete**\n\n' + scoreLine + '\n' + data.recommendation,
             });
             setPhase('idle');
         });
@@ -969,6 +1044,8 @@ export function ChatWindow() {
         setInput('');
         setFollowUps([]);
         setCollapsedAgents({});
+        stopRequestedRef.current = false;
+        abortRef.current = new AbortController();
         setPhase('brainstorming');
 
         const lastAgentMsg = messages.slice().reverse().find(m => m.role === 'agent' || m.role === 'assistant');
@@ -1052,6 +1129,7 @@ export function ChatWindow() {
                 });
                 try {
                     const response = await fetch(`${API_BASE}/api/v1/chat/respond`, {
+                    signal: abortRef.current?.signal,
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -1103,6 +1181,7 @@ export function ChatWindow() {
                 });
 
                 const clarifyRes = await fetch(`${API_BASE}/api/v1/chat/clarify`, {
+                    signal: abortRef.current?.signal,
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         prompt: currentPrompt,
@@ -1205,6 +1284,7 @@ export function ChatWindow() {
             let planRecovered = false;
             try {
                 planRes = await fetch(`${API_BASE}/api/v1/chat/plan`, {
+                    signal: abortRef.current?.signal,
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         prompt: currentPrompt, deal_id: dealId,
@@ -1397,6 +1477,7 @@ export function ChatWindow() {
 
             const taskOutcomes = new Map<string, 'done' | 'blocked'>();
             for (const taskWave of executionWaves) {
+                if (stopRequestedRef.current) break;
                 const priorOutputs: Record<string, unknown> = {};
                 for (const result of completedResults) {
                     if (result._agent_type && result.data) priorOutputs[result._agent_type] = result.data;
@@ -1409,7 +1490,15 @@ export function ChatWindow() {
                     role: 'agent', agentName: agentLabel,
                     content: `⏳ **${task.title}** — Analyzing...`, status: 'thinking',
                 });
-                const unmetDependencies = (task.depends_on || []).filter(id => taskOutcomes.get(id) !== 'done');
+                let unmetDependencies = (task.depends_on || []).filter(id => taskOutcomes.get(id) !== 'done');
+                if (task.assigned_agent === 'investment_memo_agent' && unmetDependencies.length) {
+                    // Final synthesis may run on partial inputs once every prerequisite
+                    // has finished and at least one succeeded.
+                    const deps = task.depends_on || [];
+                    const allFinished = deps.every(id => taskOutcomes.has(id));
+                    const anyDone = deps.some(id => taskOutcomes.get(id) === 'done');
+                    if (allFinished && anyDone) unmetDependencies = [];
+                }
                 if (unmetDependencies.length) {
                     failedCount++;
                     taskResult = { error: 'blocked_by_failed_dependencies', blocked_by: unmetDependencies };
@@ -1421,6 +1510,7 @@ export function ChatWindow() {
                   try {
                     await new Promise(resolve => setTimeout(resolve, 500));
                     const taskRes = await fetch(`${API_BASE}/api/v1/chat/execute-task`, {
+                    signal: abortRef.current?.signal,
                         method: 'POST', headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             agent_type: task.assigned_agent, task: task.description,
@@ -1595,9 +1685,20 @@ export function ChatWindow() {
                 ).catch(() => { });
             }
 
+            if (stopRequestedRef.current) {
+                addMessage({ role: 'system', content: 'Stopped. Results from agents that already finished are kept above.' });
+                setPhase('idle');
+                return;
+            }
+
             // ─── Synthesis (Perplexity-style) ───
             setPhase('synthesizing');
-            const companyName = extractCompanyName(userText);
+            // The last reply may be "skip" or "go ahead"; the target is named in the first message.
+            let companyName = extractCompanyName(userText);
+            if (companyName === 'Target Company') {
+                const firstPrompt = messages.find(message => message.role === 'user')?.content;
+                if (typeof firstPrompt === 'string') companyName = extractCompanyName(firstPrompt);
+            }
             const synthesisContent = buildSynthesisMessage(completedResults, taskList, companyName, failedCount);
             addMessage({
                 role: 'agent', agentName: 'DealForge Summary',
@@ -1616,6 +1717,11 @@ export function ChatWindow() {
             setFollowUps(suggestions);
 
         } catch (err) {
+            if (stopRequestedRef.current || (err instanceof DOMException && err.name === 'AbortError')) {
+                addMessage({ role: 'system', content: 'Stopped. Anything already completed is kept above.' });
+                setPhase('idle');
+                return;
+            }
             addMessage({
                 role: 'system',
                 content: `❌ Error: ${err instanceof Error ? err.message : 'Connection failed'}. Make sure the backend is running.`,
@@ -1627,6 +1733,8 @@ export function ChatWindow() {
     }
 
     async function handleExport(format: 'json' | 'docx' = 'json') {
+        if (exporting) return;
+        setExporting(format);
         try {
             const dealId = activeDealId;
             if (format === 'docx') {
@@ -1643,9 +1751,17 @@ export function ChatWindow() {
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `DealForge-${dealId.slice(0, 8)}.docx`;
+                a.download = filenameFromDisposition(response.headers.get('Content-Disposition'))
+                    || `DealForge-${dealId.slice(0, 8)}.docx`;
                 a.click();
                 window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+                if (response.headers.get('X-Release-Status') === 'draft-not-approved') {
+                    addMessage({
+                        role: 'system',
+                        content: 'Word report downloaded as a draft. It is not approved for client release; a reviewer approves it from the Dashboard.',
+                        status: 'done',
+                    });
+                }
                 return;
             }
             if (!dealId) throw new Error('Save or complete an analysis before downloading its structured data.');
@@ -1666,6 +1782,8 @@ export function ChatWindow() {
             window.setTimeout(() => URL.revokeObjectURL(url), 1000);
         } catch (error) {
             addMessage({ role: 'system', content: `Export failed: ${error instanceof Error ? error.message : 'Could not create analysis export.'}`, status: 'error' });
+        } finally {
+            setExporting(null);
         }
     }
 
@@ -1681,6 +1799,12 @@ export function ChatWindow() {
     };
 
     const handleRegenerate = (msg: Message) => handleSend(msg.content, true);
+
+    const handleStop = () => {
+        stopRequestedRef.current = true;
+        abortRef.current?.abort();
+        approvalRequest?.resolve(false);
+    };
 
     // Handle rating agent output (thumbs up/down) — selection persists per action
     const handleRateOutput = async (actionId: number | undefined, rating: number) => {
@@ -1704,24 +1828,25 @@ export function ChatWindow() {
 
     // ─── Markdown renderer ───
 
-    function renderMarkdown(text: string) {
+    function renderMarkdown(text: string, cite?: { msgId: string; items: SourceItem[] }) {
+        const source = cite ? linkCitations(text, cite.items.length) : text;
         return (
             <ReactMarkdown
                 remarkPlugins={[remarkGfm]}
                 components={{
-                    h1: ({ children }) => <h1 className="text-xl font-bold mt-4 mb-2 text-white">{children}</h1>,
-                    h2: ({ children }) => <h2 className="text-lg font-bold mt-3 mb-1.5 text-white/90">{children}</h2>,
-                    h3: ({ children }) => <h3 className="text-base font-bold mt-2 mb-1 text-white/85">{children}</h3>,
+                    h1: ({ children }) => <h1 className="text-xl font-bold mt-4 mb-2 text-foreground">{children}</h1>,
+                    h2: ({ children }) => <h2 className="text-lg font-bold mt-3 mb-1.5 text-foreground">{children}</h2>,
+                    h3: ({ children }) => <h3 className="text-base font-bold mt-2 mb-1 text-foreground">{children}</h3>,
                     p: ({ children }) => <p className="mb-2 leading-relaxed">{children}</p>,
-                    strong: ({ children }) => <strong className="font-semibold text-white">{children}</strong>,
-                    em: ({ children }) => <em className="italic text-white/70">{children}</em>,
+                    strong: ({ children }) => <strong className="font-semibold text-foreground">{children}</strong>,
+                    em: ({ children }) => <em className="italic text-foreground">{children}</em>,
                     pre: ({ children }) => <>{children}</>,
                     code: ({ className, children, ...props }) => {
                         const isBlock = className?.includes('language-');
                         return isBlock ? (
                             <CodeBlock className={className}>{children}</CodeBlock>
                         ) : (
-                            <code className="bg-white/10 px-1.5 py-0.5 rounded text-xs font-mono text-cyan-300" {...props}>{children}</code>
+                            <code className="bg-muted px-1.5 py-0.5 rounded text-xs font-mono text-cyan-700" {...props}>{children}</code>
                         );
                     },
                     ul: ({ children }) => <ul className="list-disc pl-5 space-y-1 mb-2">{children}</ul>,
@@ -1729,16 +1854,20 @@ export function ChatWindow() {
                     li: ({ children }) => <li className="leading-relaxed">{children}</li>,
                     table: ({ children }) => (
                         <div className="overflow-x-auto my-2">
-                            <table className="min-w-full border border-white/10 text-xs">{children}</table>
+                            <table className="min-w-full border border-border text-xs">{children}</table>
                         </div>
                     ),
-                    th: ({ children }) => <th className="border border-white/10 px-2 py-1 bg-white/5 font-semibold text-left text-white/80">{children}</th>,
-                    td: ({ children }) => <td className="border border-white/10 px-2 py-1 text-white/70">{children}</td>,
-                    blockquote: ({ children }) => <blockquote className="border-l-4 border-cyan-500/30 pl-3 italic text-white/50 my-2">{children}</blockquote>,
-                    a: ({ href, children }) => <a href={href} className="text-cyan-400 underline hover:text-cyan-300" target="_blank" rel="noreferrer">{children}</a>,
+                    th: ({ children }) => <th className="border border-border px-2 py-1 bg-muted/60 font-semibold text-left text-foreground">{children}</th>,
+                    td: ({ children }) => <td className="border border-border px-2 py-1 text-foreground">{children}</td>,
+                    blockquote: ({ children }) => <blockquote className="border-l-4 border-cyan-500/30 pl-3 italic text-muted-foreground my-2">{children}</blockquote>,
+                    a: ({ href, children }) => {
+                        const n = cite ? citationIndex(href) : null;
+                        if (cite && n) return <CitationPill n={n} msgId={cite.msgId} item={cite.items[n - 1]} />;
+                        return <a href={href} className="text-cyan-700 underline hover:text-cyan-700" target="_blank" rel="noreferrer">{children}</a>;
+                    },
                 }}
             >
-                {text}
+                {source}
             </ReactMarkdown>
         );
     }
@@ -1756,6 +1885,11 @@ export function ChatWindow() {
         const agentStyle = AGENT_STYLES[agentKey] || AGENT_STYLES.system;
         const AgentIcon = agentStyle.icon;
         const isEditing = editingMsgId === msg.id;
+        // A 'thinking' message with nothing running is left over from an interrupted run.
+        const isLive = msg.status === 'thinking' && isProcessing;
+        const isStale = msg.status === 'thinking' && !isProcessing;
+        const explicitCites = normalizeCitations(msg.metadata?.citations);
+        const messageCites = explicitCites.length ? explicitCites : deriveEvidenceCitations(msg.metadata);
         const sourcePrompt = messages.find(message => message.role === 'user')?.content || '';
         const conversationCompany = sourcePrompt ? extractCompanyName(sourcePrompt) : 'Target Company';
         const isSummaryMessage = msg.metadata?._isSynthesis || msg.agentName === 'DealForge Summary';
@@ -1801,12 +1935,12 @@ export function ChatWindow() {
         return (
             <div key={msg.id} className={`flex gap-3 group ${isUser ? 'flex-row-reverse' : ''} animate-in fade-in slide-in-from-bottom-2 duration-300`}>
                 {/* Avatar (shadcn Avatar + initials fallback) */}
-                <Avatar className={`flex-shrink-0 w-9 h-9 rounded-xl shadow-lg
+                <Avatar className={`flex-shrink-0 w-8 h-8 rounded-full shadow-sm
                     ${isUser
-                        ? 'bg-gradient-to-br from-indigo-500 to-purple-600 shadow-indigo-500/20'
+                        ? 'bg-primary'
                         : `bg-gradient-to-br ${agentStyle.gradient} ${agentStyle.glow}`
                     }`}>
-                    <AvatarFallback className="bg-transparent text-white rounded-xl" delayMs={600}>
+                    <AvatarFallback className="bg-transparent text-white rounded-full" delayMs={600}>
                         {isUser
                             ? <User className="h-4 w-4 text-white" />
                             : <span className="flex items-center gap-1" title={agentName}>
@@ -1816,26 +1950,29 @@ export function ChatWindow() {
                     </AvatarFallback>
                 </Avatar>
 
-                <div className={`max-w-[85%] flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
+                <div className={`min-w-0 max-w-[85%] flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
                     {/* Agent Header with Rating Buttons */}
                     {!isUser && msg.agentName && (
                         <div className="flex items-center justify-between w-full mb-1.5">
                             <div className="flex items-center gap-2">
-                                <span className="text-xs font-semibold text-white/60">{msg.agentName}</span>
-                            {msg.status === 'thinking' && (
-                                <span className="flex items-center gap-1 text-xs text-violet-400">
+                                <span className="text-xs font-semibold text-muted-foreground">{msg.agentName}</span>
+                            {isStale && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-700 font-medium">Interrupted</span>
+                            )}
+                            {isLive && (
+                                <span className="flex items-center gap-1 text-xs text-violet-700">
                                     <Loader2 className="h-3 w-3 animate-spin" />
                                     <span>Thinking<AnimatedDots /></span>
                                 </span>
                             )}
                             {msg.status === 'done' && (
-                                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 font-medium">Done</span>
+                                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-700 font-medium">Done</span>
                             )}
                             {msg.status === 'error' && (
-                                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-red-500/15 text-red-400 font-medium">Error</span>
+                                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-red-500/15 text-red-700 font-medium">Error</span>
                             )}
                             {typeof msg.provider === 'string' && msg.provider && (
-                                <span className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-white/5 text-white/40 font-medium">
+                                <span className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-muted/60 text-muted-foreground/70 font-medium">
                                     {msg.provider === 'ollama' || msg.provider === 'lmstudio' ? <Cpu className="h-2.5 w-2.5" /> : <Cloud className="h-2.5 w-2.5" />}
                                     {msg.provider}
                                 </span>
@@ -1849,14 +1986,14 @@ export function ChatWindow() {
                                     <div className="flex items-center gap-0.5">
                                         <button
                                             onClick={() => handleRateOutput(actionId, 5)}
-                                            className={`p-1 rounded hover:bg-green-500/20 transition-colors ${vote === 'up' ? 'text-green-400 bg-green-500/10' : 'text-white/30 hover:text-green-400'}`}
+                                            className={`p-1 rounded hover:bg-green-500/20 transition-colors ${vote === 'up' ? 'text-green-700 bg-green-500/10' : 'text-muted-foreground/70 hover:text-green-700'}`}
                                             title="Good output"
                                         >
                                             <ThumbsUp className="h-3 w-3" />
                                         </button>
                                         <button
                                             onClick={() => handleRateOutput(actionId, 1)}
-                                            className={`p-1 rounded hover:bg-red-500/20 transition-colors ${vote === 'down' ? 'text-red-400 bg-red-500/10' : 'text-white/30 hover:text-red-400'}`}
+                                            className={`p-1 rounded hover:bg-red-500/20 transition-colors ${vote === 'down' ? 'text-red-700 bg-red-500/10' : 'text-muted-foreground/70 hover:text-red-700'}`}
                                             title="Poor output"
                                         >
                                             <ThumbsDown className="h-3 w-3" />
@@ -1871,41 +2008,41 @@ export function ChatWindow() {
                     {isEditing ? (
                         <div className="w-full flex flex-col gap-2 mt-1">
                             <textarea
-                                className="w-full text-sm p-3 rounded-xl border border-white/10 resize-none focus:outline-none focus:ring-1 focus:ring-cyan-500/50 min-h-[100px] text-white bg-white/5"
+                                className="w-full text-sm p-3 rounded-xl border border-border resize-none focus:outline-none focus:ring-1 focus:ring-cyan-500/50 min-h-[100px] text-foreground bg-muted/60"
                                 value={editValue} onChange={(e) => setEditValue(e.target.value)} autoFocus
                             />
                             <div className="flex justify-end gap-2">
-                                <Button size="sm" variant="ghost" onClick={() => setEditingMsgId(null)} className="text-white/50 hover:text-white">Cancel</Button>
-                                <Button size="sm" onClick={() => handleEditSubmit(msg)} className="bg-cyan-500/20 text-cyan-400 hover:bg-cyan-500/30">Save</Button>
+                                <Button size="sm" variant="ghost" onClick={() => setEditingMsgId(null)} className="text-muted-foreground hover:text-foreground">Cancel</Button>
+                                <Button size="sm" onClick={() => handleEditSubmit(msg)} className="bg-cyan-500/20 text-cyan-700 hover:bg-cyan-500/30">Save</Button>
                             </div>
                         </div>
                     ) : displayedAgentSummary ? (
                         /* ─── Collapsible Agent Panel ─── */
                         <div className={`rounded-2xl text-sm leading-relaxed transition-all duration-300
-                            bg-white/[0.04] backdrop-blur-sm rounded-bl-md border border-white/[0.06] text-white/80 hover:border-white/10 overflow-hidden`}>
+                            bg-muted/60 backdrop-blur-sm rounded-bl-md border border-border text-foreground hover:border-border overflow-hidden`}>
                             <button
                                 onClick={() => setCollapsedAgents(prev => ({ ...prev, [msg.id]: !prev[msg.id] }))}
-                                className="w-full flex items-center justify-between px-4 py-3 hover:bg-white/[0.03] transition-colors cursor-pointer"
+                                className="w-full flex items-center justify-between px-4 py-3 hover:bg-muted transition-colors cursor-pointer"
                             >
                                 <span>{renderMarkdown(displayedAgentSummary)}</span>
                                 {collapsedAgents[msg.id]
-                                    ? <ChevronDown className="h-4 w-4 text-white/40 flex-shrink-0" />
-                                    : <ChevronUp className="h-4 w-4 text-white/40 flex-shrink-0" />
+                                    ? <ChevronDown className="h-4 w-4 text-muted-foreground/70 flex-shrink-0" />
+                                    : <ChevronUp className="h-4 w-4 text-muted-foreground/70 flex-shrink-0" />
                                 }
                             </button>
                             {!collapsedAgents[msg.id] && (
-                                <div className="px-4 pb-3 border-t border-white/[0.06] pt-3 animate-in fade-in slide-in-from-top-1 duration-200">
+                                <div className="px-4 pb-3 border-t border-border pt-3 animate-in fade-in slide-in-from-top-1 duration-200">
                                     {renderMarkdown(typeof msg.metadata?._agentDetail === 'string' ? msg.metadata._agentDetail : '')}
                                 </div>
                             )}
                         </div>
                     ) : (
-                        <div className={`rounded-2xl px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap transition-all duration-300
+                        <div className={`max-w-full overflow-x-auto break-words rounded-lg px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap transition-all duration-300
                             ${isUser
-                                ? 'bg-gradient-to-r from-indigo-600/80 to-purple-600/80 text-white rounded-br-md border border-indigo-500/20 shadow-lg shadow-indigo-500/10'
-                                : 'bg-white/[0.04] backdrop-blur-sm rounded-bl-md border border-white/[0.06] text-white/80 hover:border-white/10'
-                            } ${msg.status === 'thinking' ? 'animate-pulse' : ''}`}>
-                            {renderMarkdown(displayedContent)}
+                                ? 'bg-accent text-foreground rounded-br-sm border border-primary/20'
+                                : 'bg-card rounded-bl-sm border border-border text-foreground shadow-sm'
+                            } ${isLive ? 'animate-pulse' : ''}`}>
+                            {renderMarkdown(displayedContent, messageCites.length ? { msgId: msg.id, items: messageCites } : undefined)}
                             
                             {/* Scrum Master QA Controls (Tier 1 Enhancement) */}
                             {msg.metadata?.pending_clarification === true && (
@@ -1917,7 +2054,7 @@ export function ChatWindow() {
                                             if (chatInput?.value.trim()) handleSend();
                                             else handleSend('confirm');
                                         }}
-                                        className="bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 border border-emerald-500/30 gap-1.5"
+                                        className="bg-emerald-500/20 text-emerald-700 hover:bg-emerald-500/30 border border-emerald-500/30 gap-1.5"
                                     >
                                         <CheckCircle2 className="h-3.5 w-3.5" />
                                         Answer & Continue
@@ -1936,7 +2073,7 @@ export function ChatWindow() {
                                             size="sm"
                                             variant="ghost"
                                             onClick={() => handleSend('more')}
-                                            className="text-cyan-400 hover:bg-cyan-500/10 gap-1.5"
+                                            className="text-cyan-700 hover:bg-cyan-500/10 gap-1.5"
                                         >
                                             <Sparkles className="h-3.5 w-3.5" />
                                             Ask More
@@ -1951,7 +2088,7 @@ export function ChatWindow() {
                                     <Button
                                         size="sm"
                                         onClick={() => handleSend('confirm')}
-                                        className="bg-indigo-500/20 text-indigo-400 hover:bg-indigo-500/30 border border-indigo-500/30 gap-1.5"
+                                        className="bg-indigo-500/20 text-indigo-700 hover:bg-indigo-500/30 border border-indigo-500/30 gap-1.5"
                                     >
                                         <Zap className="h-3.5 w-3.5" />
                                         Confirm & Proceed
@@ -1963,7 +2100,7 @@ export function ChatWindow() {
                                             const chatInput = document.getElementById('chat-input') as HTMLTextAreaElement;
                                             chatInput?.focus();
                                         }}
-                                        className="border-white/10 text-white/60 hover:text-white"
+                                        className="border-border text-muted-foreground hover:text-foreground"
                                     >
                                         Modify Assumptions
                                     </Button>
@@ -1973,40 +2110,22 @@ export function ChatWindow() {
                     )}
 
 
-                    {/* Sources / citations (RAG v2) + confidence */}
+                    {/* Sources (numbered cards the inline [n] pills point at), verification, confidence */}
                     {!isUser && !isEditing && (() => {
-                        const cites = normalizeCitations(msg.metadata?.citations);
                         const conf = isUncalibratedSourceReport
                             ? undefined
                             : msg.metadata?.confidence;
-                        if (cites.length === 0 && typeof conf !== 'number') return null;
+                        if (messageCites.length === 0 && typeof conf !== 'number' && !msg.metadata?.grounding && !msg.metadata?.audit && !msg.metadata?.reconciliation) return null;
                         return (
                             <div className="mt-2 w-full space-y-1.5">
                                 {typeof conf === 'number' && (
-                                    <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400 font-medium">
+                                    <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-cyan-500/10 text-cyan-700 font-medium">
                                         <CheckCircle2 className="h-2.5 w-2.5" />
                                         Confidence {Math.round(conf * 100)}%
                                     </span>
                                 )}
-                                {cites.length > 0 && (
-                                    <details className="rounded-xl border border-white/[0.06] bg-white/[0.02] overflow-hidden">
-                                        <summary className="flex items-center gap-1.5 px-3 py-2 text-[11px] font-medium text-white/50 hover:text-white/80 cursor-pointer list-none">
-                                            <Quote className="h-3 w-3 text-cyan-400" />
-                                            Sources ({cites.length})
-                                        </summary>
-                                        <ul className="px-3 pb-2.5 space-y-1.5">
-                                            {cites.map((c, i) => (
-                                                <li key={i} className="flex items-start gap-1.5 text-[11px] leading-relaxed text-white/60">
-                                                    <span className="flex-shrink-0 w-4 h-4 rounded bg-cyan-500/15 text-cyan-400 text-[9px] font-bold flex items-center justify-center mt-0.5">{i + 1}</span>
-                                                    <span>
-                                                        <span className="font-semibold text-white/75">{c.label}</span>
-                                                        {c.source && <span className="text-white/40"> — {c.source}</span>}
-                                                    </span>
-                                                </li>
-                                            ))}
-                                        </ul>
-                                    </details>
-                                )}
+                                <SourceCards items={messageCites} msgId={msg.id} />
+                                <ProvenanceBar data={msg.metadata} />
                             </div>
                         );
                     })()}
@@ -2014,17 +2133,17 @@ export function ChatWindow() {
                     {/* Action Buttons */}
                     {!isEditing && (
                         <div className={`flex items-center gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity ${isUser ? 'flex-row-reverse' : ''}`}>
-                            <span className="text-[10px] text-white/30 px-1">
+                            <span className="text-[10px] text-muted-foreground/70 px-1">
                                 {timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                             </span>
-                            <button className="p-1 rounded-md text-white/30 hover:text-white/60 hover:bg-white/5 transition-colors" onClick={() => handleCopy(messageContent, msg.id)} title="Copy">
-                                {copiedId === msg.id ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+                            <button className="p-1 rounded-md text-muted-foreground/70 hover:text-muted-foreground hover:bg-muted transition-colors" onClick={() => handleCopy(messageContent, msg.id)} title="Copy">
+                                {copiedId === msg.id ? <Check className="h-3 w-3 text-emerald-700" /> : <Copy className="h-3 w-3" />}
                             </button>
                             {Boolean(msg.metadata?.excel_model_base64) && (
                                 <a
                                     href={`data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${msg.metadata?.excel_model_base64 as string}`}
                                     download={`Financial_Model_${(msg.metadata?.deal_id as string) || 'export'}.xlsx`}
-                                    className="p-1 text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/10 rounded-md transition-colors"
+                                    className="p-1 text-emerald-700 hover:text-emerald-700 hover:bg-emerald-500/10 rounded-md transition-colors"
                                     title="Download Excel Model"
                                 >
                                     <Download className="h-3 w-3" />
@@ -2032,10 +2151,10 @@ export function ChatWindow() {
                             )}
                             {isUser && !isProcessing && (
                                 <>
-                                    <button className="p-1 rounded-md text-white/30 hover:text-white/60 hover:bg-white/5 transition-colors" onClick={() => { setEditingMsgId(msg.id); setEditValue(messageContent); }} title="Edit">
+                                    <button className="p-1 rounded-md text-muted-foreground/70 hover:text-muted-foreground hover:bg-muted transition-colors" onClick={() => { setEditingMsgId(msg.id); setEditValue(messageContent); }} title="Edit">
                                         <Edit2 className="h-3 w-3" />
                                     </button>
-                                    <button className="p-1 rounded-md text-white/30 hover:text-white/60 hover:bg-white/5 transition-colors" onClick={() => handleRegenerate(msg)} title="Regenerate">
+                                    <button className="p-1 rounded-md text-muted-foreground/70 hover:text-muted-foreground hover:bg-muted transition-colors" onClick={() => handleRegenerate(msg)} title="Regenerate">
                                         <RotateCcw className="h-3 w-3" />
                                     </button>
                                 </>
@@ -2045,7 +2164,7 @@ export function ChatWindow() {
                                 if (!lastUser) return null;
                                 return (
                                     <button
-                                        className="flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] text-amber-400 hover:text-amber-300 hover:bg-amber-500/10 transition-colors"
+                                        className="flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] text-amber-700 hover:text-amber-700 hover:bg-amber-500/10 transition-colors"
                                         onClick={() => handleSend(lastUser.content, true)}
                                         title="Retry last request"
                                     >
@@ -2069,34 +2188,40 @@ export function ChatWindow() {
     // ═══════════════════════════════════════
 
     return (
-        <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-slate-950">
+        <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-background">
             {/* Header */}
-            <div className="flex min-h-16 shrink-0 items-center justify-between gap-3 border-b border-white/10 px-4 sm:px-6">
+            <div className="flex min-h-16 shrink-0 items-center justify-between gap-3 border-b border-border px-4 sm:px-6">
                 <div className="min-w-0">
-                    <h2 className="truncate text-base font-semibold text-white sm:text-lg">
+                    <h2 className="truncate text-base font-semibold text-foreground sm:text-lg">
                         {activeConv?.title || 'Deal analysis'}
                     </h2>
-                    <div className="mt-1 flex items-center gap-2 text-xs text-white/50">
+                    <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
                         <span className={`h-2 w-2 rounded-full ${isProcessing ? 'animate-pulse bg-amber-400' : 'bg-emerald-400'}`} />
                         <span>{isProcessing ? `${phaseLabel.text}${phase === 'executing' ? ` · ${executingProgress.done}/${executingProgress.total} agents` : ''}` : dealCompleted ? 'Analysis complete' : 'Ready for analysis'}</span>
-                        {activeDealId && <span className="hidden border-l border-white/20 pl-2 sm:inline">Deal {activeDealId.substring(0, 8)}</span>}
-                        {currentTurnAgentError && <span className="border-l border-white/20 pl-2 text-rose-300">Agent error in this turn</span>}
+                        {activeDealId && <span className="hidden border-l border-border pl-2 sm:inline">Deal {activeDealId.substring(0, 8)}</span>}
+                        {currentTurnAgentError && <span className="border-l border-border pl-2 text-rose-700">Agent error in this turn</span>}
                     </div>
                 </div>
                 {messages.length > 1 && (
                     <div className="flex shrink-0 items-center gap-1.5">
-                        <Button variant="outline" size="sm" onClick={() => handleExport('docx')} title="Download Word report (.docx)" className="h-8 border-white/15 bg-transparent px-2.5 text-white/75 hover:bg-white/10 hover:text-white sm:px-3">
-                            <FileText className="h-3.5 w-3.5 sm:mr-2" /><span className="hidden sm:inline">Report</span>
+                        <Button variant="outline" size="sm" onClick={() => handleExport('docx')} disabled={exporting !== null} aria-busy={exporting === 'docx'} title="Download Word report (.docx)" className="h-8 border-border bg-transparent px-2.5 text-foreground hover:bg-accent hover:text-foreground sm:px-3">
+                            {exporting === 'docx'
+                                ? <Loader2 className="h-3.5 w-3.5 animate-spin sm:mr-2" />
+                                : <FileText className="h-3.5 w-3.5 sm:mr-2" />}
+                            <span className="hidden sm:inline">{exporting === 'docx' ? 'Preparing…' : 'Report'}</span>
                         </Button>
-                        <Button variant="outline" size="sm" onClick={() => handleExport('json')} title="Export structured analysis data" className="h-8 border-white/15 bg-transparent px-2.5 text-white/75 hover:bg-white/10 hover:text-white sm:px-3">
-                            <Download className="h-3.5 w-3.5 sm:mr-2" /><span className="hidden sm:inline">Data</span>
+                        <Button variant="outline" size="sm" onClick={() => handleExport('json')} disabled={exporting !== null} aria-busy={exporting === 'json'} title="Export structured analysis data" className="h-8 border-border bg-transparent px-2.5 text-foreground hover:bg-accent hover:text-foreground sm:px-3">
+                            {exporting === 'json'
+                                ? <Loader2 className="h-3.5 w-3.5 animate-spin sm:mr-2" />
+                                : <Download className="h-3.5 w-3.5 sm:mr-2" />}
+                            <span className="hidden sm:inline">{exporting === 'json' ? 'Preparing…' : 'Data'}</span>
                         </Button>
                     </div>
                 )}
             </div>
 
             {/* Chat Container */}
-            <div className="flex-1 min-h-0 flex flex-col overflow-hidden rounded-2xl border border-white/[0.06] bg-[#0d0d1a]/80 backdrop-blur-xl shadow-2xl shadow-black/30">
+            <div className="flex-1 min-h-0 flex flex-col overflow-hidden rounded-lg border border-border bg-card shadow-fluent">
 
                 {/* Messages */}
                 <ScrollArea className="min-h-0 flex-1" type="always">
@@ -2118,7 +2243,7 @@ export function ChatWindow() {
                             type="button"
                             onClick={scrollToBottom}
                             aria-label="Jump to latest message"
-                            className="pointer-events-auto absolute -top-12 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-white/15 bg-slate-900/95 px-3 py-1.5 text-xs text-white/80 shadow-lg backdrop-blur transition-colors hover:bg-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400"
+                            className="pointer-events-auto absolute -top-12 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground shadow-fluent-lg transition-colors hover:bg-primary/90 focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring"
                         >
                             <ChevronDown className="h-3.5 w-3.5" /> Jump to latest
                         </button>
@@ -2127,12 +2252,12 @@ export function ChatWindow() {
 
                 {approvalRequest && (
                     <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-amber-300/20 bg-amber-300/[0.06] px-4 py-3 sm:px-6" role="status">
-                        <div className="flex min-w-0 items-center gap-2 text-sm text-amber-100">
-                            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-300" />
+                        <div className="flex min-w-0 items-center gap-2 text-sm text-amber-800">
+                            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-700" />
                             <span>{approvalRequest.label ?? `Review the ${approvalRequest.taskCount}-task plan above. Nothing runs until you approve.`}</span>
                         </div>
                         <div className="ml-auto flex shrink-0 items-center gap-2">
-                            <Button variant="outline" size="sm" onClick={() => approvalRequest.resolve(false)} className="border-white/15 bg-transparent text-white/75 hover:bg-white/10">
+                            <Button variant="outline" size="sm" onClick={() => approvalRequest.resolve(false)} className="border-border bg-transparent text-foreground hover:bg-accent">
                                 Cancel
                             </Button>
                             <Button size="sm" disabled={!approvalArmed} onClick={() => approvalRequest.resolve(true)}>
@@ -2144,17 +2269,17 @@ export function ChatWindow() {
 
                 {/* Follow-up Suggestions */}
                 {followUps.length > 0 && !isProcessing && (
-                    <div className="shrink-0 border-t border-white/10 px-4 py-3 sm:px-6">
+                    <div className="shrink-0 border-t border-border px-4 py-3 sm:px-6">
                         <div className="flex items-center gap-2 mb-2">
-                            <HelpCircle className="h-3.5 w-3.5 text-cyan-400" />
-                            <span className="text-xs font-semibold text-cyan-400">Follow-up questions</span>
+                            <HelpCircle className="h-3.5 w-3.5 text-cyan-700" />
+                            <span className="text-xs font-semibold text-cyan-700">Follow-up questions</span>
                         </div>
                         <div className="flex flex-wrap gap-2">
                             {followUps.map((q, i) => (
                                 <button key={i} onClick={() => handleSend(q)}
-                                    className="text-xs px-3 py-1.5 rounded-full border border-white/10 bg-white/[0.03] hover:bg-white/[0.08] hover:border-cyan-500/30 transition-all duration-200 flex items-center gap-1 text-white/60 hover:text-white group"
+                                    className="text-xs px-3 py-1.5 rounded-full border border-border bg-muted/60 hover:bg-accent hover:border-cyan-500/30 transition-all duration-200 flex items-center gap-1 text-muted-foreground hover:text-foreground group"
                                 >
-                                    <ChevronRight className="h-3 w-3 text-white/30 group-hover:text-cyan-400 transition-colors" />
+                                    <ChevronRight className="h-3 w-3 text-muted-foreground/70 group-hover:text-cyan-700 transition-colors" />
                                     {q}
                                 </button>
                             ))}
@@ -2166,19 +2291,19 @@ export function ChatWindow() {
                 {uploadedFiles.length > 0 && (
                     <div className="px-5 pb-2 flex flex-wrap gap-2">
                         {uploadedFiles.map((f, i) => (
-                            <span key={i} className="inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-lg bg-white/5 border border-white/10 text-white/60">
+                            <span key={i} className="inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-lg bg-muted/60 border border-border text-muted-foreground">
                                 <Paperclip className="h-3 w-3" />
                                 {f.name}
-                                <button onClick={() => setUploadedFiles(prev => prev.filter((_, j) => j !== i))} aria-label={`Remove ${f.name}`} className="ml-1 text-white/30 hover:text-white/60">×</button>
+                                <button onClick={() => setUploadedFiles(prev => prev.filter((_, j) => j !== i))} aria-label={`Remove ${f.name}`} className="ml-1 text-muted-foreground/70 hover:text-muted-foreground">×</button>
                             </span>
                         ))}
                     </div>
                 )}
 
                 {/* ═══ Input Area ═══ */}
-                <div className="shrink-0 border-t border-white/10 bg-slate-950 px-3 py-3 sm:px-6 sm:py-4">
+                <div className="shrink-0 border-t border-border bg-background px-3 py-3 sm:px-6 sm:py-4">
                     {/* Textarea */}
-                    <div className="relative rounded-xl border border-white/10 bg-white/[0.03] focus-within:border-cyan-500/30 focus-within:bg-white/[0.05] transition-all duration-300">
+                    <div className="relative rounded-xl border border-border bg-muted/60 focus-within:border-cyan-500/30 focus-within:bg-muted transition-all duration-300">
                         <textarea
                             ref={textareaRef}
                             id="chat-input"
@@ -2187,22 +2312,33 @@ export function ChatWindow() {
                             onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); handleSend(); } }}
                             aria-label="Message DealForge"
                             placeholder={followUps.length > 0 && !isProcessing ? 'Ask a follow-up...' : 'Ask anything...'}
-                            className="w-full min-h-[48px] max-h-[150px] resize-none bg-transparent px-4 py-3.5 pr-12 text-sm text-white placeholder:text-white/30 focus:outline-none"
+                            className="w-full min-h-[48px] max-h-[150px] resize-none bg-transparent px-4 py-3.5 pr-12 text-sm text-foreground placeholder:text-muted-foreground/70 focus:outline-none"
                             rows={1}
                             disabled={isProcessing}
                         />
 
-                        {/* Send button inside textarea */}
-                        <button
-                            onClick={() => handleSend()}
-                            aria-label={isProcessing ? 'Working' : 'Send message'}
-                            disabled={isProcessing || (!input.trim() && uploadedFiles.length === 0)}
-                            className="absolute right-3 bottom-3 w-8 h-8 rounded-lg flex items-center justify-center transition-all duration-200
-                                disabled:opacity-30 disabled:cursor-not-allowed
-                                bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white shadow-lg shadow-cyan-500/20"
-                        >
-                            {isProcessing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-                        </button>
+                        {/* Send / Stop */}
+                        {isProcessing ? (
+                            <button
+                                onClick={handleStop}
+                                aria-label="Stop generating"
+                                title="Stop"
+                                className="absolute right-3 bottom-3 w-8 h-8 rounded-lg flex items-center justify-center transition-all duration-200 bg-muted hover:bg-accent text-foreground border border-border"
+                            >
+                                <Square className="h-3.5 w-3.5 fill-current" />
+                            </button>
+                        ) : (
+                            <button
+                                onClick={() => handleSend()}
+                                aria-label="Send message"
+                                disabled={!input.trim() && uploadedFiles.length === 0}
+                                className="absolute right-3 bottom-3 w-8 h-8 rounded-lg flex items-center justify-center transition-all duration-200
+                                    disabled:opacity-30 disabled:cursor-not-allowed
+                                    bg-primary hover:bg-primary/90 text-primary-foreground shadow-sm"
+                            >
+                                <Send className="h-4 w-4" />
+                            </button>
+                        )}
                     </div>
 
                     {/* Toolbar Row */}
@@ -2226,7 +2362,7 @@ export function ChatWindow() {
                             <button
                                 onClick={() => fileInputRef.current?.click()}
                                 aria-label="Attach files"
-                                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all duration-200 bg-white/5 hover:bg-white/10 border border-white/10 hover:border-white/20 text-white/50 hover:text-white/70"
+                                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all duration-200 bg-muted/60 hover:bg-accent border border-border hover:border-foreground/25 text-muted-foreground hover:text-foreground"
                             >
                                 <Paperclip className="h-3.5 w-3.5" />
                             </button>
@@ -2246,7 +2382,7 @@ export function ChatWindow() {
                                 </span>
                             )}
                             {phase === 'idle' && activeDealId && (
-                                <span className="text-[10px] text-white/20">Deal {activeDealId.substring(0, 8)}</span>
+                                <span className="text-[10px] text-muted-foreground/70">Deal {activeDealId.substring(0, 8)}</span>
                             )}
                         </div>
                     </div>

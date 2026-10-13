@@ -3,6 +3,8 @@
 import os
 from typing import List, Dict, Any, Optional, AsyncGenerator
 import json
+import re
+import asyncio
 import structlog
 from app.config import get_settings
 
@@ -288,20 +290,52 @@ Respond ONLY with the JSON, no other text.
             raise
 
 
+# A chat product behind a proxy reports its own failures as an ordinary 200 reply. Short
+# replies that read like that are failures, never an answer to hand to the next stage.
+_CHAT_FAILURE = re.compile(
+    r"(something went wrong|encountered an error|an error occurred|try (?:your request|again)|"
+    r"i(?:'m| am) (?:sorry|unable|having trouble)|can(?:'|no)t (?:help|assist) with that|"
+    r"unable to (?:process|complete|generate)|rate limit|too many requests)",
+    re.IGNORECASE,
+)
+_CHAT_FAILURE_MAX_CHARS = 400
+
+
+def looks_like_chat_failure(text: str) -> bool:
+    """True for a short canned error such as "Sorry, something went wrong. Please try again."."""
+    body = (text or "").strip()
+    return 0 < len(body) <= _CHAT_FAILURE_MAX_CHARS and bool(_CHAT_FAILURE.search(body))
+
+
 class OpenAIClient:
     """Client for OpenAI API (GPT-4, Codex)"""
 
-    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        provider: str = "openai",
+    ):
         from openai import AsyncOpenAI
 
         settings = get_settings()
-        self.client = AsyncOpenAI(
-            api_key=api_key or settings.OPENAI_API_KEY,
-            timeout=60.0,
-            max_retries=0,
-        )
+        request_timeout = 60.0
+        if provider == "custom_endpoint":
+            # A proxy in front of a chat product can be slow; stay inside the agent deadline.
+            configured_timeout = max(30.0, float(getattr(settings, "CUSTOM_ENDPOINT_TIMEOUT_SECONDS", 155)))
+            agent_timeout = max(30.0, float(getattr(settings, "AGENT_TIMEOUT_SECONDS", 180)))
+            request_timeout = min(configured_timeout, agent_timeout - 25.0)
+        options = {
+            "api_key": api_key or ("local-endpoint" if provider == "custom_endpoint" else settings.OPENAI_API_KEY),
+            "timeout": request_timeout,
+            "max_retries": 0,
+        }
+        if base_url:
+            options["base_url"] = base_url.rstrip("/")
+        self.client = AsyncOpenAI(**options)
         self.model = model or settings.OPENAI_MODEL
-        self.provider = "openai"
+        self.provider = provider
         self.max_context = 128000
 
     async def generate(
@@ -340,6 +374,14 @@ class OpenAIClient:
             params["tool_choice"] = "auto"
 
         response = await self.client.chat.completions.create(**params)
+        if self.provider == "custom_endpoint" and looks_like_chat_failure(response.choices[0].message.content or ""):
+            await asyncio.sleep(2)  # one retry: the proxy's canned errors are usually transient
+            response = await self.client.chat.completions.create(**params)
+            if looks_like_chat_failure(response.choices[0].message.content or ""):
+                raise ValueError(
+                    "Custom endpoint returned an error message instead of an answer: "
+                    + (response.choices[0].message.content or "").strip()[:120]
+                )
 
         message = response.choices[0].message
 

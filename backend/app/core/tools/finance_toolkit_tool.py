@@ -24,6 +24,22 @@ def _try_import_toolkit():
         return None
 
 
+def _jsonable(node: Any) -> Any:
+    """Recursively make a DataFrame.to_dict() result serialisable (tuple/Timestamp keys, NaN)."""
+    import math
+
+    if isinstance(node, dict):
+        return {
+            (" | ".join(map(str, k)) if isinstance(k, tuple) else str(k) if not isinstance(k, (str, int, float, bool)) else k):
+            _jsonable(v) for k, v in node.items()
+        }
+    if isinstance(node, (list, tuple)):
+        return [_jsonable(v) for v in node]
+    if isinstance(node, float) and (math.isnan(node) or math.isinf(node)):
+        return None
+    return node if isinstance(node, (str, int, float, bool)) or node is None else str(node)
+
+
 class FinanceAnalysisTool(BaseTool):
     """Comprehensive financial analysis via FinanceToolkit (150+ ratios, DCF, WACC)."""
 
@@ -72,6 +88,18 @@ class FinanceAnalysisTool(BaseTool):
                     "description": "Number of years of historical data to analyze (max 10 for free tier)",
                     "default": 3,
                 },
+                "growth_rate": {
+                    "type": "number",
+                    "description": "DCF only: annual free-cash-flow growth over the forecast (e.g. 0.12). Defaults to an assumption.",
+                },
+                "perpetual_growth_rate": {
+                    "type": "number",
+                    "description": "DCF only: terminal growth (e.g. 0.025). Defaults to 0.025.",
+                },
+                "wacc": {
+                    "type": "number",
+                    "description": "DCF only: discount rate (e.g. 0.096). Defaults to an assumption.",
+                },
             },
             "required": ["tickers"],
         }
@@ -83,6 +111,9 @@ class FinanceAnalysisTool(BaseTool):
         sub_type: str = "valuation",
         quarterly: bool = False,
         years_history: int = 3,
+        growth_rate: Optional[float] = None,
+        perpetual_growth_rate: Optional[float] = None,
+        wacc: Optional[float] = None,
         **kwargs,
     ) -> ToolResult:
         Toolkit = _try_import_toolkit()
@@ -146,23 +177,40 @@ class FinanceAnalysisTool(BaseTool):
                 # Usually columns are ('ReturnOnEquity', 'AAPL') or similar depending on transposition
                 # We'll just dump to string representation if it's too complex, or to_dict
                 try:
-                    result_data = ratios_df.to_dict()
+                    result_data = _jsonable(ratios_df.to_dict())
                 except:
                     result_data = {"raw_data": ratios_df.to_json()}
 
             elif analysis_type == "dcf":
                 # Assuming simple growth rates for the intrinsic valuation out out of box
                 # In a real scenario, these could be parameters
-                dcf_df = toolkit.models.get_intrinsic_valuation()
-                result_data = dcf_df.to_dict()
+                # The library requires all three inputs. Anything the caller did not supply is an
+                # explicit, reported assumption rather than a hidden default.
+                assumed = {}
+                g_rate, p_rate, d_rate = growth_rate, perpetual_growth_rate, wacc
+                if g_rate is None:
+                    g_rate, assumed["growth_rate"] = 0.08, "default 8% (not supplied)"
+                if p_rate is None:
+                    p_rate, assumed["perpetual_growth_rate"] = 0.025, "default 2.5% (not supplied)"
+                if d_rate is None:
+                    d_rate, assumed["wacc"] = 0.10, "default 10% (not supplied)"
+                dcf_df = toolkit.models.get_intrinsic_valuation(
+                    growth_rate=g_rate,
+                    perpetual_growth_rate=p_rate,
+                    weighted_average_cost_of_capital=d_rate,
+                )
+                result_data = _jsonable(dcf_df.to_dict())
+                result_data["_inputs"] = {
+                    "growth_rate": g_rate, "perpetual_growth_rate": p_rate, "wacc": d_rate, "assumed": assumed,
+                }
 
             elif analysis_type == "wacc":
                 wacc_df = toolkit.models.get_weighted_average_cost_of_capital()
-                result_data = wacc_df.to_dict()
+                result_data = _jsonable(wacc_df.to_dict())
 
             elif analysis_type == "dupont":
                 dupont_df = toolkit.models.get_extended_dupont_analysis()
-                result_data = dupont_df.to_dict()
+                result_data = _jsonable(dupont_df.to_dict())
 
             elif analysis_type == "fundamentals":
                 is_df = toolkit.get_income_statement()

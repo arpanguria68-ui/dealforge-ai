@@ -263,7 +263,7 @@ export function RAGDashboard() {
             {/* Header */}
             <div className="flex items-center justify-between">
                 <div>
-                    <h2 className="text-3xl font-bold tracking-tight bg-gradient-to-r from-cyan-500 via-blue-600 to-violet-600 bg-clip-text text-transparent">
+                    <h2 className="text-2xl font-semibold tracking-tight text-foreground">
                         Knowledge Base
                     </h2>
                     <p className="text-muted-foreground text-sm mt-0.5">

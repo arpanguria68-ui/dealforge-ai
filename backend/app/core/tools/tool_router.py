@@ -933,6 +933,8 @@ AGENT_TOOL_MAP: Dict[str, List[str]] = {
         "market_data",
         "peer_discovery",
         "finance_analysis",
+        "fetch_financial_statements",
+        "finnhub_data",
     ],
     "complex_reasoning": [
         "web_search",
@@ -1365,6 +1367,28 @@ class ToolRouter:
         "none": [],
     }
 
+    # Wording that means "go and fetch this": the matching tools are offered even when the
+    # classifier picked a different single family for the task.
+    _RETRIEVAL_HINTS = (
+        (("share price", "stock price", "quote", "market cap", "trading at", "beta", "multiple", "ev/"),
+         ("finnhub_data", "market_data")),
+        (("sec ", "10-k", "10-q", "filing", "financial statement", "revenue", "gross margin", "operating income",
+          "free cash flow", "cash flow", "balance sheet", "historical"),
+         ("fetch_financial_statements", "company_data")),
+        (("peer", "comparable", "comps"), ("peer_discovery", "finnhub_data")),
+        (("news", "headline", "latest", "web search", "recent"), ("web_search",)),
+    )
+
+    def _with_retrieval_tools(self, names: List[str], task: str, agent_name: Optional[str], max_tools: int) -> List[str]:
+        text = (task or "").lower()
+        allowed = set(AGENT_TOOL_MAP.get(agent_name or "", []))
+        extra: List[str] = []
+        for terms, tools in self._RETRIEVAL_HINTS:
+            if any(term in text for term in terms):
+                extra.extend(tool for tool in tools if tool in self.tools and tool in allowed and tool not in extra)
+        merged = list(dict.fromkeys(extra + list(names)))
+        return merged[: max(max_tools, len(extra))]
+
     async def suggest_tools(
         self, task: str, agent_name: Optional[str] = None, max_tools: int = 8
     ) -> List[str]:
@@ -1387,11 +1411,11 @@ class ToolRouter:
             ]
             res = await get_laya_client().suggest_tool_family(task or "", catalog)
             if res is None:
-                return fallback
+                return self._with_retrieval_tools(fallback, task, agent_name, max_tools)
             if res.confidence < 0.55:
-                return fallback
+                return self._with_retrieval_tools(fallback, task, agent_name, max_tools)
             if res.answer == "none" and res.confidence >= 0.55:
-                return []
+                return self._with_retrieval_tools([], task, agent_name, max_tools)
             if res.answer == "none":
                 return fallback
             family_tools = self.LAYA_FAMILY_TOOLS.get(str(res.answer), [])
@@ -1412,10 +1436,10 @@ class ToolRouter:
                 available_count=len(available_tools),
                 confidence=res.confidence,
             )
-            return names[:max_tools]
+            return self._with_retrieval_tools(names[:max_tools], task, agent_name, max_tools)
         except Exception as e:
             self.logger.warning("laya_suggest_tools_failed", error=str(e))
-        return fallback
+        return self._with_retrieval_tools(fallback, task, agent_name, max_tools)
 
     def _keyword_tool_shortlist(
         self, task: str, agent_name: Optional[str], max_tools: int

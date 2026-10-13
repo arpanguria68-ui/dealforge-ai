@@ -34,7 +34,7 @@ class FinnhubTool(BaseTool):
                 },
                 "endpoint": {
                     "type": "string",
-                    "enum": ["quote", "company-news", "profile2", "metric"],
+                    "enum": ["quote", "company-news", "profile2", "metric", "peers"],
                     "description": "Finnhub API endpoint (quote for live prices, company-news for news)",
                     "default": "quote",
                 },
@@ -68,7 +68,9 @@ class FinnhubTool(BaseTool):
                 error="Finnhub API key is not configured. Please set it in Settings.",
             )
 
-        base_url = f"https://finnhub.io/api/v1/{endpoint}"
+        # Finnhub serves these under /stock/; the short names are our API.
+        path = {"metric": "stock/metric", "profile2": "stock/profile2", "peers": "stock/peers"}.get(endpoint, endpoint)
+        base_url = f"https://finnhub.io/api/v1/{path}"
         params = {"symbol": symbol, "token": api_key}
 
         if endpoint == "company-news":

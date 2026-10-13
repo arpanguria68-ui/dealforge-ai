@@ -118,6 +118,62 @@ DEAL_ANALYSIS_TEMPLATE = [
 
 SPEED_MODE_AGENTS = {"financial_analyst", "risk_assessor", "market_researcher"}
 
+_MODEL_BUILDERS = {"dcf_lbo_architect", "advanced_financial_modeler"}
+_LBO_REQUEST = re.compile(r"\blbo\b|leveraged\s+buy[- ]?out|take[- ]private", re.IGNORECASE)
+
+
+def ensure_requested_lbo(tasks: List[Dict[str, Any]], prompt: str, company: str) -> List[Dict[str, Any]]:
+    """An explicitly requested LBO needs a task that builds one.
+
+    Planners sometimes drop it while keeping the valuation and risk tasks. Added only when
+    the prompt names an LBO / take-private and no planned task already covers it.
+    """
+    if not _LBO_REQUEST.search(prompt or ""):
+        return tasks
+    for task in tasks:
+        text = f"{task.get('title', '')} {task.get('description', '')}".casefold()
+        mentions_model = bool(re.search(r"\blbo\b|leveraged\s+buy-?out|\bdcf\b", text))
+        agent = str(task.get("assigned_agent", "")).casefold()
+        if agent == "advanced_financial_modeler" and mentions_model:
+            # The advanced modeler produces ratio analytics (Altman Z, DuPont, EVA), not DCF/LBO models.
+            task["assigned_agent"] = "dcf_lbo_architect"
+            agent = "dcf_lbo_architect"
+        if agent == "dcf_lbo_architect":
+            return tasks
+    return tasks + [{
+        "title": "DCF and LBO Model",
+        "description": (
+            f"Build the DCF and the leveraged-buyout model for {company}: sources and uses, debt tranches, "
+            "exit assumptions, sponsor IRR and MOIC. Entry value must sit above the current market "
+            "enterprise value (a take-private premium). Use the shared valuation assumptions."
+        ),
+        "assigned_agent": "dcf_lbo_architect",
+        "priority": "high",
+        "risk_flag": "Added automatically: the request names an LBO and the generated plan omitted it.",
+    }]
+
+
+def ensure_valuation_for_models(tasks: List[Dict[str, Any]], company: str) -> List[Dict[str, Any]]:
+    """A plan that builds a DCF/LBO needs the valuation agent too.
+
+    It supplies the sourced WACC, growth and market enterprise value the modelling agents
+    share, and the market value the LBO entry is checked against. Added once, never
+    duplicated.
+    """
+    agents = {str(t.get("assigned_agent", "")).casefold() for t in tasks}
+    if not agents & _MODEL_BUILDERS or "valuation_agent" in agents:
+        return tasks
+    return tasks + [{
+        "title": "Valuation: Comparable Companies and Market-Implied Value",
+        "description": (
+            f"Value {company} with sourced inputs: peer multiples, beta-based WACC, free cash flow from filings "
+            "and the current market enterprise value. These become the shared assumptions for the DCF and LBO."
+        ),
+        "assigned_agent": "valuation_agent",
+        "priority": "high",
+        "risk_flag": "Added automatically: the plan builds a DCF/LBO and needs sourced valuation inputs.",
+    }]
+
 
 def wire_stage_dependencies(items: List[Any]) -> None:
     """Turn the approved task plan into an analysis-to-synthesis dependency DAG."""
@@ -131,8 +187,13 @@ def wire_stage_dependencies(items: List[Any]) -> None:
     curator_agent_ids = ids_by_agent.get("data_curator", []) + ids_by_agent.get("data_curator_agent", [])
     # Data-curator tasks can either gather source inputs or synthesize completed
     # analyses. Only the latter belong at the end of the dependency graph.
-    collection_terms = ("collect", "collection", "gather", "fetch", "retrieve", "ingest")
-    source_terms = ("financial data", "financial statement", "financial records", "source data")
+    # Stems, so "retrieval" / "gathering" / "extraction" count like the verb forms.
+    collection_terms = ("collect", "gather", "fetch", "retriev", "ingest", "pull", "extract", "acquisition of data")
+    source_terms = (
+        "financial data", "financial statement", "financial records", "source data",
+        "financial metrics", "market data", "share price", "market cap", "comparable compan",
+        "peer multiples", "valuation multiples", "filings",
+    )
     data_collection_ids = []
     for item in items:
         title = str(getattr(item, "title", "")).casefold()
@@ -173,6 +234,10 @@ def wire_stage_dependencies(items: List[Any]) -> None:
             required = [candidate for candidate in by_id if candidate != item.id]
         elif item.id in modeling_ids:
             required = data_collection_ids or foundation_ids
+            if agent in {"dcf_lbo_architect", "advanced_financial_modeler"}:
+                # Run after the valuation agent so every DCF/LBO starts from its WACC and growth
+                # (shared_assumptions_note) instead of picking its own.
+                required = required + ids_by_agent.get("valuation_agent", [])
         else:
             required = list(getattr(item, "depends_on", []) or [])
         item.depends_on = list(dict.fromkeys(
@@ -700,6 +765,8 @@ Return ONLY the JSON array, no other text."""
         # Create the todo list
         deal_id = context.get("deal_id", "scratch")
         tasks = select_tasks_for_focus_mode(tasks, context.get("focus_mode", "quality"))
+        if not focused and not re.search(r"(?<!\w)exactly\s+\w+\s+(?:separate\s+)?(?:workstreams?|tasks?)(?!\w)", task, re.I):
+            tasks = ensure_valuation_for_models(ensure_requested_lbo(tasks, task, company_name), company_name)
         tm = get_task_manager()
         todo_list = await tm.create_todo_list(
             deal_id=deal_id,
@@ -1486,7 +1553,8 @@ Return ONLY the JSON array, no other text."""
 
         # Build the assumptions summary
         summary = {
-            "confirmation_required": True,
+            # Nothing was skipped (the user opted out up front): nothing to confirm, go straight to planning.
+            "confirmation_required": bool(skipped_questions),
             "skipped_count": len(skipped_questions),
             "researched_count": len([r for r in research_results if r.get("finding")]),
             "assumptions": [],

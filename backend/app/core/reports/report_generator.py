@@ -32,11 +32,19 @@ def _safe_get(data: Dict, *keys, default="N/A"):
     return current if current is not None else default
 
 
+from app.core.reports.docx_rendering import add_inline, add_markdown, agent_lines, render_payload  # noqa: E402
+from app.core.reports.report_editor import deterministic_edit, section_for  # noqa: E402
+from app.core.reports.result_views import enrich_deal_from_results, revenue_bridge  # noqa: E402
+from app.core.text_clean import strip_latex  # noqa: E402
+
+
 def _clean_text(text: Any) -> str:
     """Sanitize text for PDF/PPTX (handle smart quotes, non-ASCII chars)."""
     if text is None:
         return ""
-    s = str(text)
+    from app.core.text_clean import strip_latex
+
+    s = strip_latex(str(text))
     # Replace common Unicode "smart" characters with ASCII equivalents
     replacements = {
         "\u2013": "-",  # en dash
@@ -164,6 +172,7 @@ def generate_pptx(
     from pptx.dml.color import RGBColor
     from pptx.enum.text import PP_ALIGN
 
+    deal = enrich_deal_from_results(deal, agent_results)
     prs = Presentation()
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
@@ -218,7 +227,7 @@ def generate_pptx(
         tf = txBox.text_frame
         tf.word_wrap = True
         p = tf.paragraphs[0]
-        p.text = text
+        p.text = strip_latex(text) if isinstance(text, str) else text
         p.font.size = Pt(font_size)
         p.font.bold = bold
         p.font.color.rgb = color
@@ -238,7 +247,7 @@ def generate_pptx(
         Inches(2),
         Inches(11),
         Inches(1.5),
-        deal.get("name", "Deal Analysis"),
+        deal.get("target_company") or deal.get("name", "Deal Analysis"),
         font_size=36,
         bold=True,
         color=WHITE,
@@ -322,19 +331,36 @@ def generate_pptx(
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     add_title_bar(slide, "Recorded Financial Metrics & Evidence", f"Target: {deal.get('target_company', 'N/A')}")
     recorded_metrics = _prioritize_financial_points(_curated_financial_points(analyst_data))
-    metrics_text = "\n".join(
-        f"{point.get('metric', 'Metric').replace('_', ' ').title()}: "
-        f"{_report_percent(point['value']) if str(point.get('metric', '')).endswith('_percent') else _report_currency(point['value'])}"
-        f" | {point.get('period') or 'Period not established'}"
-        f" | {point.get('basis', 'unverified')}"
-        f" | {point.get('source_id') or 'No citation'}"
-        for point in recorded_metrics[:14]
-    )
-    add_text_box(
-        slide, Inches(0.8), Inches(1.6), Inches(11.8), Inches(4.8),
-        metrics_text or "No structured financial data points were recorded. Forecasts are omitted rather than estimated.",
-        font_size=14,
-    )
+    metric_rows = recorded_metrics[:12]
+    if metric_rows:
+        shape = slide.shapes.add_table(
+            len(metric_rows) + 1, 5, Inches(0.6), Inches(1.45), Inches(12.1), Inches(0.36) * (len(metric_rows) + 1)
+        )
+        table = shape.table
+        for col, head in enumerate(("Metric", "Value", "Period", "Evidence basis", "Source")):
+            table.cell(0, col).text = head
+        for row_index, point in enumerate(metric_rows, 1):
+            metric = str(point.get("metric", "Metric"))
+            cells = (
+                metric.replace("_", " ").replace("yoy", "YoY").title(),
+                _report_percent(point["value"]) if metric.endswith("_percent") else _report_currency(point["value"]),
+                str(point.get("period") or "Not established"),
+                str(point.get("basis", "unverified")).replace("_", " "),
+                str(point.get("source_id") or "No citation"),
+            )
+            for col, value in enumerate(cells):
+                table.cell(row_index, col).text = value
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.text_frame.paragraphs:
+                    for run in para.runs:
+                        run.font.size = Pt(11)
+    else:
+        add_text_box(
+            slide, Inches(0.8), Inches(1.6), Inches(11.8), Inches(4.8),
+            "No structured financial data points were recorded. Forecasts are omitted rather than estimated.",
+            font_size=14,
+        )
     add_text_box(
         slide, Inches(0.8), Inches(6.5), Inches(11.8), Inches(0.5),
         "Recorded values are not verified unless a source citation is shown.",
@@ -343,7 +369,6 @@ def generate_pptx(
 
     # ─── Slide 3b: Infographic Financials (Waterfall) ───
     try:
-        from app.core.reports.infographic_engine import InfographicEngine
         fact_base = deal.get("fact_base", {})
         metrics_fb = fact_base.get("metrics", {})
         if metrics_fb.get("historical_revenue"):
@@ -351,10 +376,9 @@ def generate_pptx(
             add_title_bar(slide, "Revenue Bridge & Growth Trajectory", f"Target: {deal.get('target_company', 'N/A')}")
             
             rev_data = metrics_fb.get("historical_revenue", [])
-            labels_wf = [r.get("year", f"Y{i}") for i, r in enumerate(rev_data)]
-            values_wf = [r.get("amount", 0) for i, r in enumerate(rev_data)]
+            labels_wf, values_wf = revenue_bridge(rev_data)
             
-            chart_bytes = InfographicEngine.revenue_waterfall(labels_wf, values_wf, "Revenue Trajectory")
+            chart_bytes = InfographicEngine.revenue_waterfall(labels_wf, values_wf, "Revenue Trajectory ($M)")
             slide.shapes.add_picture(io.BytesIO(chart_bytes), Inches(2), Inches(1.5), Inches(9), Inches(5))
     except Exception as e:
         logger.error("pptx_waterfall_error", error=str(e))
@@ -363,7 +387,6 @@ def generate_pptx(
     valuations = deal.get("valuation_output", {}).get("valuations", []) or deal.get("financial_output", {}).get("valuations", [])
     if valuations:
         try:
-            from app.core.reports.infographic_engine import InfographicEngine
             slide = prs.slides.add_slide(prs.slide_layouts[6])
             add_title_bar(slide, "Valuation Summary (Football Field)", f"Implied EV Range")
             
@@ -372,12 +395,64 @@ def generate_pptx(
             
             chart_bytes = InfographicEngine.football_field_chart(
                 valuations=valuations,
+                unit=(deal.get("valuation_output") or {}).get("unit", "$B"),
                 title="Valuation Range Analysis",
-                current_price=deal.get("current_price")
+                current_price=deal.get("current_price"),
+                reference_lines=(deal.get("valuation_output") or {}).get("reference_lines")
             )
             slide.shapes.add_picture(io.BytesIO(chart_bytes), Inches(2), Inches(1.5), Inches(9), Inches(5))
         except Exception as e:
             logger.error("pptx_football_field_error", error=str(e))
+
+    # ─── Slide 3d: Valuation summary table ───
+    val_rows = (deal.get("valuation_output") or {}).get("valuations") or []
+    val_unit = (deal.get("valuation_output") or {}).get("unit", "$B")
+    val_audit = next((
+        (r.get("data") or {}).get("audit") for r in reversed(agent_results)
+        if r.get("agent_type") == "valuation_agent" and isinstance((r.get("data") or {}).get("audit"), dict)
+    ), None)
+    if isinstance(val_rows, list) and val_rows and all(isinstance(v, dict) and {"low", "high"} <= set(v) for v in val_rows):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        add_title_bar(slide, "Valuation Summary", f"Enterprise value ranges ({val_unit}) from recorded agent output")
+        shape = slide.shapes.add_table(len(val_rows) + 1, 4, Inches(0.6), Inches(1.5), Inches(12.1), Inches(0.45) * (len(val_rows) + 1))
+        table = shape.table
+        for col, head in enumerate(("Method", "Low", "Mid", "High")):
+            table.cell(0, col).text = head
+        for row_index, row in enumerate(val_rows, 1):
+            mid = row.get("mid", (row["low"] + row["high"]) / 2)
+            for col, value in enumerate((str(row.get("method", "Method")), row["low"], mid, row["high"])):
+                table.cell(row_index, col).text = value if isinstance(value, str) else f"{val_unit[:1]}{value:,.2f}{val_unit[1:]}"
+        if val_audit:
+            notes = []
+            if val_audit.get("sources"):
+                notes.append("Data: " + "; ".join(map(str, val_audit["sources"])))
+            if val_audit.get("assumptions"):
+                notes.append("Assumptions (not observed data): " + "; ".join(map(str, val_audit["assumptions"][:6])))
+            if val_audit.get("missing"):
+                notes.append("Not retrieved: " + "; ".join(map(str, val_audit["missing"])))
+            add_text_box(slide, Inches(0.6), Inches(4.2), Inches(12.1), Inches(2.6), "\n".join(notes), font_size=12, color=SECONDARY)
+
+    # ─── Key messages and edited findings (full output lives in the Word report) ───
+    editorial_ppt = analyst_data.get("_editorial") or deterministic_edit(
+        agent_results, None, analyst_data.get("_evidence_brief", {})
+    )
+    if editorial_ppt.get("key_messages"):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        add_title_bar(slide, "Key Messages", f"Target: {deal.get('target_company', 'Unknown')}")
+        add_text_box(
+            slide, Inches(0.7), Inches(1.5), Inches(12), Inches(5.5),
+            "\n\n".join(f"\u2022 {m}" for m in editorial_ppt["key_messages"]), font_size=16,
+        )
+    edited_sections = [sec for sec in editorial_ppt.get("sections", []) if sec.get("points")]
+    for start in range(0, len(edited_sections), 2):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        add_title_bar(slide, "Key Findings by Agent", "Edited summary; full agent output is in the Word report appendix")
+        for col, sec in enumerate(edited_sections[start:start + 2]):
+            left = Inches(0.6 + col * 6.2)
+            add_text_box(slide, left, Inches(1.45), Inches(5.9), Inches(0.5),
+                         str(sec["agent"]).replace("_", " ").title(), font_size=16, bold=True, color=SECONDARY)
+            add_text_box(slide, left, Inches(2.05), Inches(5.9), Inches(5.0),
+                         "\n\n".join(f"\u2022 {pt}" for pt in sec["points"][:4]), font_size=15)
 
     # ─── Slide 4: Risk Matrix ───
     risk_matrix = []
@@ -392,10 +467,11 @@ def generate_pptx(
         
         y_offset = 1.5
         for risk in risk_matrix[:4]: # Top 4
-            r_title = risk.get("risk", "Unknown Risk")
+            r_title = _clip(risk.get("risk") or risk.get("name") or risk.get("title") or risk.get("description")
+                            or "Unnamed risk", 120)
             r_sev = _severity_label(risk.get("severity", "Medium"))
-            r_mit = risk.get("mitigation") or "N/A"
-            r_evid = risk.get("evidence") or "Analysis pending further diligence."
+            r_mit = _clip(_plain_text(risk.get("mitigation")) or "Not recorded", 260)
+            r_evid = _clip(_plain_text(risk.get("evidence")) or "Not recorded", 260)
 
             color = ACCENT_RED if r_sev.lower() in ("high", "critical") else SECONDARY
             
@@ -508,8 +584,17 @@ def generate_pptx(
             color=BLACK,
         )
     else:
-        rec = deal.get("final_recommendation") or "No recommendation recorded; human review required."
-        rec_color = ACCENT if deal.get("final_recommendation") else SECONDARY
+        recorded = deal.get("final_recommendation")
+        if recorded and re.search(r"tasks completed; deal not scored", str(recorded)):
+            recorded = None   # a progress note, not a recommendation
+        draft = _memo_recommendation(agent_results)
+        if recorded:
+            rec = recorded
+        elif draft:
+            rec = f"IC memo draft: {_clip(draft, 220)}"
+        else:
+            rec = "No recommendation recorded; human review required."
+        rec_color = ACCENT if recorded else SECONDARY
 
         add_text_box(
             slide,
@@ -529,16 +614,21 @@ def generate_pptx(
             Inches(11),
             Inches(1),
             rec,
-            font_size=24,
+            font_size=24 if len(rec) < 90 else 18,
             bold=True,
             color=rec_color,
         )
+        if draft and not recorded:
+            add_text_box(
+                slide, Inches(1), Inches(3.35), Inches(11), Inches(0.4),
+                "Model-generated draft from the investment memo agent. It is not an approved decision and "
+                "needs reviewer sign-off.", font_size=12, color=SECONDARY,
+            )
 
         # Score Waterfall in PPTX
         scoring_data = deal.get("scoring_output", {})
         if scoring_data and scoring_data.get("components"):
             try:
-                from app.core.reports.infographic_engine import InfographicEngine
                 slide = prs.slides.add_slide(prs.slide_layouts[6])
                 add_title_bar(slide, "Deal Score Analysis (Quantitative Bridge)", "Score Build-up & Risk Impact")
                 
@@ -722,6 +812,7 @@ def generate_excel(
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
 
+    deal = enrich_deal_from_results(deal, agent_results)
     wb = Workbook()
 
     # ─── Styles ───
@@ -767,7 +858,7 @@ def generate_excel(
 
     score = deal.get("final_score")
     score_text = f"{round(score * 100)}%" if score is not None else "Pending"
-    rec = deal.get("final_recommendation") or "No recommendation recorded; human review required"
+    rec, _recorded = _recommendation_text(deal, agent_results)
 
     ws1["A3"] = "Target Company"
     ws1["B3"] = deal.get("target_company", "N/A")
@@ -794,7 +885,7 @@ def generate_excel(
     ws1["A12"] = "Question"
     ws1["B12"] = exec_sum.get("question", "N/A")
     ws1["A13"] = "Answer"
-    ws1["B13"] = deal.get("final_recommendation") or "No recommendation recorded; human review required"
+    ws1["B13"] = rec
     for r in range(10, 14):
         ws1[f"B{r}"].alignment = Alignment(wrap_text=True)
 
@@ -840,33 +931,105 @@ def generate_excel(
     ws3["A1"] = "DCF Assumptions & Valuation"
     ws3["A1"].font = section_font
     
-    ws3["A3"] = "Model status"
-    ws3["B3"] = "Not calculated"
-    ws3["A4"] = "Required inputs"
-    ws3["B4"] = "Source-backed forecast free cash flows, WACC, terminal growth, net debt, valuation date"
-    ws3["B4"].alignment = Alignment(wrap_text=True)
-    ws3["A6"] = "No valuation is presented until transaction-specific assumptions and source data are supplied."
+    val_audit = val_data.get("audit") if isinstance(val_data.get("audit"), dict) else {}
+    val_methods = val_data.get("valuations") if isinstance(val_data.get("valuations"), dict) else {}
+    dcf_point = (val_methods.get("dcf") or {}).get("value")
+    if isinstance(dcf_point, (int, float)):
+        ws3.column_dimensions["A"].width = 46
+        ws3.column_dimensions["B"].width = 22
+        row = 3
+        for name, value in (
+            ("Model status", "Calculated by the valuation agent from recorded inputs"),
+            ("DCF enterprise value", dcf_point),
+            ("Comparable-companies enterprise value", (val_methods.get("comparable_companies") or {}).get("value")),
+            ("Weighted estimate", val_data.get("weighted_estimate")),
+        ):
+            if value is None:
+                continue
+            ws3.cell(row=row, column=1, value=name)
+            cell = ws3.cell(row=row, column=2, value=value)
+            if isinstance(value, (int, float)):
+                cell.number_format = '$#,##0'
+            row += 1
+        wacc_build = val_audit.get("wacc_build") or {}
+        if wacc_build:
+            row += 1
+            ws3.cell(row=row, column=1, value="WACC build").font = section_font
+            row += 1
+            for key, value in wacc_build.items():
+                ws3.cell(row=row, column=1, value=key.replace("_", " ").title())
+                cell = ws3.cell(row=row, column=2, value=value)
+                if key != "beta":
+                    cell.number_format = '0.00%'
+                row += 1
+        flows = ((val_audit.get("inputs") or {}).get("financial_data") or {}).get("projected_cash_flows") or []
+        if flows:
+            row += 1
+            ws3.cell(row=row, column=1, value="Projected free cash flow").font = section_font
+            row += 1
+            for year, flow in enumerate(flows, 1):
+                ws3.cell(row=row, column=1, value=f"Year {year}")
+                ws3.cell(row=row, column=2, value=flow).number_format = '$#,##0'
+                row += 1
+        for title, key in (("Assumptions (not observed data)", "assumptions"), ("Data sources", "sources"), ("Not retrieved", "missing")):
+            items = val_audit.get(key) or []
+            if items:
+                row += 1
+                ws3.cell(row=row, column=1, value=title).font = section_font
+                row += 1
+                for item in items:
+                    ws3.cell(row=row, column=1, value=str(item))
+                    row += 1
+    else:
+        ws3["A3"] = "Model status"
+        ws3["B3"] = "Not calculated"
+        ws3["A4"] = "Required inputs"
+        ws3["B4"] = "Source-backed forecast free cash flows, WACC, terminal growth, net debt, valuation date"
+        ws3["B4"].alignment = Alignment(wrap_text=True)
+        ws3["A6"] = "No valuation is presented until transaction-specific assumptions and source data are supplied."
 
     # ─── Sheet 4: Comparable Companies ───
     ws4 = wb.create_sheet("Comps")
-    headers4 = ["Company", "Revenue ($M)", "EBITDA ($M)", "EV/Rev", "EV/EBITDA", "P/E"]
-    for col, h in enumerate(headers4, 1):
-        ws4.cell(row=1, column=col, value=h)
-    style_header(ws4, 1, len(headers4))
-    
     comps = val_data.get("comparables", [])
-    r = 2
-    for c in comps:
-        ws4.cell(row=r, column=1, value=c.get("name", "Unspecified peer"))
-        ws4.cell(row=r, column=2, value=c.get("revenue"))
-        ws4.cell(row=r, column=3, value=c.get("ebitda"))
-        ws4.cell(row=r, column=4, value=c.get("ev_rev"))
-        ws4.cell(row=r, column=5, value=c.get("ev_ebitda"))
-        ws4.cell(row=r, column=6, value=c.get("pe"))
-        r += 1
-
-    if not comps:
-        ws4.cell(row=2, column=1, value="No sourced comparable-company data recorded")
+    market_inputs = ((val_data.get("audit") or {}).get("inputs") or {}).get("market_data") or {}
+    peers = market_inputs.get("peers") or []
+    if not comps and peers:
+        headers4 = ["Ticker", "EV/Revenue (TTM)", "EV/FCF (TTM)", "Source"]
+        for col, h in enumerate(headers4, 1):
+            ws4.cell(row=1, column=col, value=h)
+            ws4.column_dimensions[get_column_letter(col)].width = 22
+        style_header(ws4, 1, len(headers4))
+        r = 2
+        for peer in peers:
+            ws4.cell(row=r, column=1, value=peer.get("ticker"))
+            ws4.cell(row=r, column=2, value=peer.get("ev_revenue")).number_format = '0.00"x"'
+            ws4.cell(row=r, column=3, value=peer.get("ev_fcf")).number_format = '0.00"x"'
+            ws4.cell(row=r, column=4, value="Finnhub stock/metric")
+            r += 1
+        median_multiple = market_inputs.get("ev_revenue_median")
+        if median_multiple:
+            ws4.cell(row=r, column=1, value="Median").font = bold_font
+            ws4.cell(row=r, column=2, value=median_multiple).number_format = '0.00"x"'
+            revenue = ((val_data.get("audit") or {}).get("inputs") or {}).get("financial_data", {}).get("revenue")
+            if isinstance(revenue, (int, float)):
+                ws4.cell(row=r + 1, column=1, value="Implied EV (median x revenue)").font = bold_font
+                ws4.cell(row=r + 1, column=2, value=revenue * median_multiple).number_format = '$#,##0'
+    else:
+        headers4 = ["Company", "Revenue ($M)", "EBITDA ($M)", "EV/Rev", "EV/EBITDA", "P/E"]
+        for col, h in enumerate(headers4, 1):
+            ws4.cell(row=1, column=col, value=h)
+        style_header(ws4, 1, len(headers4))
+        r = 2
+        for c in comps:
+            ws4.cell(row=r, column=1, value=c.get("name", "Unspecified peer"))
+            ws4.cell(row=r, column=2, value=c.get("revenue"))
+            ws4.cell(row=r, column=3, value=c.get("ebitda"))
+            ws4.cell(row=r, column=4, value=c.get("ev_rev"))
+            ws4.cell(row=r, column=5, value=c.get("ev_ebitda"))
+            ws4.cell(row=r, column=6, value=c.get("pe"))
+            r += 1
+        if not comps:
+            ws4.cell(row=2, column=1, value="No sourced comparable-company data recorded")
 
     # ─── Sheet 5: LBO Returns ───
     ws5 = wb.create_sheet("LBO Returns")
@@ -875,12 +1038,35 @@ def generate_excel(
     ws5["A1"] = "LBO Returns Analysis"
     ws5["A1"].font = section_font
 
-    ws5["A3"] = "Model status"
-    ws5["B3"] = "Not calculated"
-    ws5["A4"] = "Required inputs"
-    ws5["B4"] = "Entry/exit valuation, financing mix, holding period, debt paydown, and transaction fees"
-    ws5["B4"].alignment = Alignment(wrap_text=True)
-    ws5["A6"] = "Returns are not estimated without transaction-specific assumptions."
+    lbo_rows = _lbo_rows(agent_results)
+    if lbo_rows:
+        ws5.column_dimensions["A"].width = 38
+        ws5.column_dimensions["B"].width = 28
+        ws5["A3"] = "Model status"
+        ws5["B3"] = "Recorded by the modelling agent; assumptions listed below"
+        row_no = 5
+        for label_text, value in lbo_rows:
+            ws5.cell(row=row_no, column=1, value=label_text)
+            if value is None:
+                ws5.cell(row=row_no - 0, column=1).font = bold_font
+            else:
+                cell = ws5.cell(row=row_no, column=2, value=value)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    lowered = label_text.lower()
+                    if "pct" in lowered or "irr" in lowered or "%" in lowered or "premium" in lowered:
+                        cell.number_format = '0.00"%"' if abs(value) > 1 else "0.00%"
+                    elif "moic" in lowered or "multiple" in lowered:
+                        cell.number_format = '0.00"x"'
+                    elif abs(value) >= 1000:
+                        cell.number_format = '$#,##0'
+            row_no += 1
+    else:
+        ws5["A3"] = "Model status"
+        ws5["B3"] = "Not calculated"
+        ws5["A4"] = "Required inputs"
+        ws5["B4"] = "Entry/exit valuation, financing mix, holding period, debt paydown, and transaction fees"
+        ws5["B4"].alignment = Alignment(wrap_text=True)
+        ws5["A6"] = "Returns are not estimated without transaction-specific assumptions."
 
     # ─── Sheet 6: Risk Matrix ───
     ws6 = wb.create_sheet("Risk Matrix")
@@ -897,13 +1083,24 @@ def generate_excel(
     risks = risk_data.get("risks", [])
     if not risks:
         risks = analyst_data.get("risk_matrix", [])
-        
+    if not risks:
+        # No risk-assessor task: the register built from every agent's recorded risks, as in the Word report.
+        from app.core.reports.document_workflow import collect_risk_register
+
+        risks = [
+            {"risk": entry["risk"], "category": entry.get("category"),
+             "severity": entry.get("severity"), "mitigation": entry.get("mitigation")}
+            for entry in collect_risk_register(agent_results, [])
+        ]
+
     if not risks:
         ws6.cell(row=2, column=1, value="No structured risk findings recorded")
     for r, risk in enumerate(risks, 2):
         name = risk.get("risk", risk.get("description", f"Risk {r-1}"))
-        cat = str(risk.get("category") or "General")
-        sev = risk.get("severity", "Not rated")
+        cat = str(risk.get("category") or "General").replace("_", " ")
+        sev = risk.get("severity")
+        if sev is None or sev == "":
+            sev = "Not rated"
         if isinstance(sev, (int, float)) and not isinstance(sev, bool):
             sev = _severity_label(sev)
         mit = risk.get("mitigation") or ""
@@ -944,7 +1141,9 @@ def generate_excel(
         ws7.cell(row=r, column=1, value=result.get("agent_type", "unknown").replace("_", " ").title())
         ws7.cell(row=r, column=2, value=_confidence_label(result))
         ws7.cell(row=r, column=3, value=result.get("execution_time_ms", 0))
-        ws7.cell(row=r, column=4, value=result.get("reasoning", "")[:500])
+        lines = agent_lines(result, limit=25)
+        detail = "\n".join(("  " * depth) + ("- " if kind == "b" else "") + text for kind, depth, text in lines)
+        ws7.cell(row=r, column=4, value=detail[:3000]).alignment = Alignment(wrap_text=True, vertical="top")
 
     # ─── Sheet 8: Sources & References ───
     ws8 = wb.create_sheet("Sources & References")
@@ -990,6 +1189,24 @@ def generate_excel(
     if row == 2:
         ws8.cell(row=row, column=5, value="No source references or provenance records captured")
 
+    editorial_x = analyst_data.get("_editorial") or deterministic_edit(
+        agent_results, None, analyst_data.get("_evidence_brief", {})
+    )
+    wsb = wb.create_sheet("Editor Brief", 1)
+    wsb.column_dimensions["A"].width = 26
+    wsb.column_dimensions["B"].width = 110
+    wsb.append(["Section", "Point"])
+    style_header(wsb, 1, 2)
+    for message in editorial_x.get("key_messages", []):
+        wsb.append(["Key message", message])
+    for sec in editorial_x.get("sections", []):
+        for point in sec.get("points", []):
+            wsb.append([str(sec.get("agent", "")).replace("_", " ").title(), point])
+    wsb.append(["Editor", "Model editor, figures checked against agent output" if editorial_x.get("editor") == "llm"
+                else "Rule-based selection (model editor unavailable)"])
+    for row in wsb.iter_rows(min_row=2):
+        row[1].alignment = Alignment(wrap_text=True, vertical="top")
+
     ws9 = wb.create_sheet("Evidence Brief")
     ws9.column_dimensions["A"].width = 24
     ws9.column_dimensions["B"].width = 100
@@ -1029,6 +1246,7 @@ def generate_pdf(
     - Embedded Infographics (Football Field, Waterfall, etc.)
     - Agent-by-agent findings
     """
+    deal = enrich_deal_from_results(deal, agent_results)
     buf = io.BytesIO()
     
     # Load Branding
@@ -1104,7 +1322,7 @@ def generate_pdf(
 
     # --- COVER PAGE ---
     Story.append(Spacer(1, 200))
-    Story.append(Paragraph(_clean_text(deal.get("name", "Deal Analysis Report")), styles["CoverTitle"]))
+    Story.append(Paragraph(_clean_text(deal.get("target_company") or deal.get("name", "Deal Analysis Report")), styles["CoverTitle"]))
     Story.append(Paragraph("Strategic Investment Analysis", styles["CoverSubtitle"]))
     Story.append(Spacer(1, 40))
     
@@ -1216,7 +1434,6 @@ def generate_pdf(
         Story.append(Spacer(1, 10))
         Story.append(Paragraph("Deal Score Components (Score Waterfall)", styles["AgentHeader"]))
         try:
-            from app.core.reports.infographic_engine import InfographicEngine
             comp_list = scoring_data.get("components", [])
             labels_sw = [c.get("name") for c in comp_list]
             values_sw = [c.get("score") for c in comp_list]
@@ -1247,13 +1464,12 @@ def generate_pdf(
             # Prepare data for Revenue Waterfall or Trend
             rev_data = metrics.get("historical_revenue", [])
             if len(rev_data) >= 2:
-                labels = [r.get("year", f"Y{i}") for i, r in enumerate(rev_data)]
-                values = [r.get("amount", 0) for r in rev_data]
+                labels, values = revenue_bridge(rev_data)
                 
                 chart_bytes = InfographicEngine.revenue_waterfall(
                     labels=labels,
                     values=values,
-                    title=f"{target} Revenue Trend"
+                    title=f"{target} Revenue Trend ($M)"
                 )
                 img = Image(io.BytesIO(chart_bytes), width=450, height=250)
                 Story.append(img)
@@ -1282,8 +1498,10 @@ def generate_pdf(
             if valuations:
                 chart_bytes = InfographicEngine.football_field_chart(
                     valuations=valuations,
+                    unit=(deal.get("valuation_output") or {}).get("unit", "$B"),
                     title="Valuation Range Analysis",
-                    current_price=deal.get("current_price")
+                    current_price=deal.get("current_price"),
+                reference_lines=(deal.get("valuation_output") or {}).get("reference_lines")
                 )
                 img = Image(io.BytesIO(chart_bytes), width=450, height=250)
                 Story.append(img)
@@ -1294,24 +1512,38 @@ def generate_pdf(
     Story.append(PageBreak())
 
     # --- AGENT FINDINGS ---
+    sourced_values = {
+        float(point["value"]) for point in analyst_data.get("_evidence_brief", {}).get("data_points", [])
+        if point.get("source_id") and isinstance(point.get("value"), (int, float))
+    }
+
+    def _pdf_escape(text: str) -> str:
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    editorial_pdf = analyst_data.get("_editorial") or deterministic_edit(
+        agent_results, sourced_values, analyst_data.get("_evidence_brief", {})
+    )
+    if editorial_pdf.get("key_messages"):
+        Story.append(Paragraph("Key Messages", styles["AgentHeader"]))
+        for message in editorial_pdf["key_messages"]:
+            Story.append(Paragraph("&bull; " + _pdf_escape(_clean_text(message)), styles["BodyTextBullet"]))
+        Story.append(Spacer(1, 12))
+
     for result in agent_results:
-        agent_type = result.get("agent_type", "Agent")
-        label = agent_type.replace("_", " ").title()
-        reasoning = _clean_text(result.get("summary") or result.get("reasoning", "No analysis available."))[:1200]
-
-        Story.append(Paragraph(label, styles["AgentHeader"]))
-
-        # Format reasoning into paragraphs
-        paragraphs = [p for p in reasoning.split("\n") if p.strip()]
-        for p in paragraphs:
-            clean_p = p.replace("<", "&lt;").replace(">", "&gt;")
-            if clean_p.startswith("#"):
-                Story.append(Paragraph("<b>" + clean_p.lstrip("#").strip() + "</b>", styles["BodyTextCustom"]))
-            elif clean_p.startswith("-") or clean_p.startswith("*"):
-                Story.append(Paragraph("• " + clean_p[1:].strip(), styles["BodyTextBullet"]))
+        agent_label = result.get("agent_type", "Agent").replace("_", " ").title()
+        Story.append(Paragraph(agent_label, styles["AgentHeader"]))
+        if result.get("task_title"):
+            Story.append(Paragraph(f"<i>Task: {_pdf_escape(_clean_text(result['task_title']))}</i>", styles["BodyTextCustom"]))
+        points = section_for(editorial_pdf, result.get("agent_type"))
+        lines = [("b", 0, point) for point in points] if points else agent_lines(result, verified=sourced_values, limit=12)
+        for kind, depth, text in lines:
+            text = _pdf_escape(_clean_text(text))
+            if kind == "h":
+                Story.append(Paragraph(f"<b>{text}</b>", styles["BodyTextCustom"]))
+            elif kind == "b":
+                Story.append(Paragraph(("&nbsp;" * 4 * depth) + "&bull; " + text, styles["BodyTextBullet"]))
             else:
-                Story.append(Paragraph(clean_p, styles["BodyTextCustom"]))
-
+                Story.append(Paragraph(text, styles["BodyTextCustom"]))
         Story.append(Spacer(1, 15))
 
     # --- PROVENANCE & FOOTNOTES ---
@@ -1448,6 +1680,7 @@ def generate_docx(
             "Install it with: pip install python-docx"
         )
 
+    deal = enrich_deal_from_results(deal, agent_results)
     doc = DocxDocument()
 
     blueprint = analyst_data.get("_report_blueprint", {})
@@ -1588,11 +1821,14 @@ def generate_docx(
         toc_sections.append("Risk Assessment")
     if has_visuals:
         toc_sections.append("Visual Analysis")
+    if agent_results:
+        toc_sections.append("Appendix: Full Agent Output")
     toc_sections.append("References and Provenance")
+    section_numbers = {name: n for n, name in enumerate(toc_sections, 1)}
     for section in toc_sections:
-        entry = doc.add_paragraph(style="List Bullet")
+        entry = doc.add_paragraph()
         entry.paragraph_format.space_after = DocxPt(2)
-        entry.add_run(section).font.size = DocxPt(10)
+        entry.add_run(f"{section_numbers[section]}.  {section}").font.size = DocxPt(10)
 
     doc.add_page_break()
 
@@ -1657,6 +1893,13 @@ def generate_docx(
 
     doc.add_paragraph()  # spacer
 
+    # Editor stage: a short, de-duplicated brief instead of every agent payload.
+    editorial = analyst_data.get("_editorial") or deterministic_edit(agent_results, {float(point["value"]) for point in analyst_data.get("_evidence_brief", {}).get("data_points", []) if point.get("source_id") and isinstance(point.get("value"), (int, float))}, evidence_brief)
+    if editorial.get("key_messages"):
+        doc.add_heading("Key Messages", level=2)
+        for message in editorial["key_messages"]:
+            add_inline(doc.add_paragraph(style="List Bullet"), message)
+
     chat_context = analyst_data.get("_chat_context", {})
     if chat_context.get("mandate") or chat_context.get("chat_summary"):
         doc.add_heading("Mandate & Chat Context", level=2)
@@ -1665,7 +1908,7 @@ def generate_docx(
             doc.add_paragraph(_clean_text(chat_context["mandate"]))
         if chat_context.get("chat_summary"):
             doc.add_paragraph("DealForge chat synthesis (not independently verified):", style="Heading 3")
-            doc.add_paragraph(_clean_text(chat_context["chat_summary"]))
+            add_markdown(doc, chat_context["chat_summary"], heading_offset=4)
         doc.add_paragraph(
             "Chat text is included for scope and continuity only. It is not a primary source; "
             "verify every factual claim against the cited records below."
@@ -1726,7 +1969,6 @@ def generate_docx(
     scoring_data = deal.get("scoring_output", {})
     if scoring_data and scoring_data.get("components"):
         try:
-            from app.core.reports.infographic_engine import InfographicEngine
             doc.add_heading("Deal Score Composition", level=2)
             comp_list = scoring_data.get("components", [])
             labels_sw = [c.get("name") for c in comp_list]
@@ -1756,7 +1998,7 @@ def generate_docx(
 
     if evidence_brief.get("data_points"):
         doc.add_page_break()
-        doc.add_heading("2. Financial Metrics and Source Status", level=1)
+        doc.add_heading(f"{section_numbers['Financial Metrics and Source Status']}. Financial Metrics and Source Status", level=1)
         metrics_table = doc.add_table(rows=1, cols=5, style="Table Grid")
         metrics_table.alignment = WD_TABLE_ALIGNMENT.CENTER
         for cell, label in zip(metrics_table.rows[0].cells, ("Metric", "Value", "Period", "Evidence basis", "Source")):
@@ -1787,40 +2029,36 @@ def generate_docx(
 
     if agent_results:
         doc.add_page_break()
-        doc.add_heading("3. Agent Findings", level=1)
+        doc.add_heading(f"{section_numbers['Agent Findings']}. Agent Findings", level=1)
 
     for idx, result in enumerate(agent_results, 1):
         agent_type = result.get("agent_type", "Agent")
-        label = agent_type.replace("_", " ").title()
+        agent_label = agent_type.replace("_", " ").title()
         confidence_pct = _confidence_label(result)
         provider = result.get("provider", "unknown")
-        reasoning = _clean_text(result.get("summary") or result.get("reasoning", "No analysis data available."))[:1200]
 
-        doc.add_heading(
-            f"3.{idx}  {label}", level=2
-        )
+        doc.add_heading(f"{section_numbers['Agent Findings']}.{idx}  {agent_label}", level=2)
 
-        # Confidence & provider metadata
         p_meta = doc.add_paragraph()
-        run_meta = p_meta.add_run(
-            f"Confidence: {confidence_pct}  |  Provider: {provider}"
-        )
+        run_meta = p_meta.add_run(f"Confidence: {confidence_pct}  |  Provider: {provider}")
         run_meta.font.size = DocxPt(10)
         run_meta.font.italic = True
         run_meta.font.color.rgb = DocxRGBColor(0x60, 0x60, 0x60)
         run_meta.font.name = "Calibri"
+        if result.get("task_title"):
+            p_task = doc.add_paragraph()
+            run_task = p_task.add_run(f"Task: {result['task_title']}")
+            run_task.font.size = DocxPt(10)
+            run_task.font.italic = True
 
-        # Reasoning body — split into paragraphs
-        paragraphs = [p for p in reasoning.split("\n") if p.strip()]
-        for para_text in paragraphs:
-            clean_para = para_text.strip()
-            if clean_para.startswith("#"):
-                # Sub-heading within agent output
-                doc.add_heading(
-                    clean_para.lstrip("#").strip(), level=3
-                )
-            else:
-                doc.add_paragraph(clean_para)
+        points = section_for(editorial, agent_type)
+        if points:
+            for point in points:
+                add_inline(doc.add_paragraph(style="List Bullet"), point)
+        else:
+            p_none = doc.add_paragraph()
+            run_none = p_none.add_run("No decision-relevant findings selected; the full output is in the appendix.")
+            run_none.italic = True
 
     # ═══════════════════════════════════════════
     #  RISK MATRIX
@@ -1828,7 +2066,7 @@ def generate_docx(
 
     if risk_matrix:
         doc.add_page_break()
-        doc.add_heading("4. Risk Assessment", level=1)
+        doc.add_heading(f"{section_numbers['Risk Assessment']}. Risk Assessment", level=1)
         # Create table with Evidence column
         risk_table = doc.add_table(rows=1, cols=4, style="Table Grid")
         risk_table.alignment = WD_TABLE_ALIGNMENT.CENTER
@@ -1858,19 +2096,20 @@ def generate_docx(
     # ═══════════════════════════════════════════
     if has_visuals:
         doc.add_page_break()
-        doc.add_heading("5. Visual Analysis", level=1)
-        from app.core.reports.infographic_engine import InfographicEngine
+        doc.add_heading(f"{section_numbers['Visual Analysis']}. Visual Analysis", level=1)
     
     if valuations:
         try:
-            doc.add_heading("5.1 Valuation Range Analysis (Football Field)", level=2)
+            doc.add_heading(f"{section_numbers.get('Visual Analysis', 5)}.1 Valuation Range Analysis (Football Field)", level=2)
             if isinstance(valuations, dict):
                 valuations = [{"method": k, **v} for k, v in valuations.items() if isinstance(v, dict)]
             
             chart_bytes = InfographicEngine.football_field_chart(
                 valuations=valuations,
+                unit=(deal.get("valuation_output") or {}).get("unit", "$B"),
                 title="Valuation Range Analysis",
-                current_price=deal.get("current_price")
+                current_price=deal.get("current_price"),
+                reference_lines=(deal.get("valuation_output") or {}).get("reference_lines")
             )
             from io import BytesIO
             img_stream = BytesIO(chart_bytes)
@@ -1884,12 +2123,11 @@ def generate_docx(
     metrics_fb = fact_base.get("metrics", {})
     if metrics_fb.get("historical_revenue"):
         try:
-            doc.add_heading("5.2 Financial Growth Trajectory", level=2)
+            doc.add_heading(f"{section_numbers.get('Visual Analysis', 5)}.2 Financial Growth Trajectory", level=2)
             rev_data = metrics_fb.get("historical_revenue", [])
-            labels_wf = [r.get("year", f"Y{i}") for i, r in enumerate(rev_data)]
-            values_wf = [r.get("amount", 0) for i, r in enumerate(rev_data)]
+            labels_wf, values_wf = revenue_bridge(rev_data)
             
-            chart_bytes = InfographicEngine.revenue_waterfall(labels_wf, values_wf, "Revenue Trajectory")
+            chart_bytes = InfographicEngine.revenue_waterfall(labels_wf, values_wf, "Revenue Trajectory ($M)")
             from io import BytesIO
             img_stream = BytesIO(chart_bytes)
             doc.add_picture(img_stream, width=DocxInches(6))
@@ -1899,10 +2137,50 @@ def generate_docx(
     doc.add_page_break()
 
     # ═══════════════════════════════════════════
+    #  APPENDIX: FULL AGENT OUTPUT (the findings above are the edited summary)
+    # ═══════════════════════════════════════════
+    if agent_results:
+        doc.add_page_break()
+        appendix_no = section_numbers["Appendix: Full Agent Output"]
+        doc.add_heading(f"{appendix_no}. Appendix: Full Agent Output", level=1)
+        p_app = doc.add_paragraph()
+        run_app = p_app.add_run(
+            "Complete recorded output of each agent, kept for verification. The Agent Findings section is the edited summary."
+        )
+        run_app.italic = True
+        for idx, result in enumerate(agent_results, 1):
+            agent_type = result.get("agent_type", "Agent")
+            doc.add_heading(f"{appendix_no}.{idx}  {agent_type.replace('_', ' ').title()}", level=2)
+            payload = result.get("data") if isinstance(result.get("data"), dict) else {}
+            memo_text = payload.get("memo") if isinstance(payload.get("memo"), str) else ""
+            if memo_text:
+                add_markdown(doc, memo_text, heading_offset=3)
+                check = payload.get("grounding") if isinstance(payload.get("grounding"), dict) else None
+                if check and check.get("status") == "low_grounding":
+                    p_check = doc.add_paragraph()
+                    run_check = p_check.add_run(
+                        f"Figure check: {check.get('figures_grounded')} of {check.get('figures_total')} figures match "
+                        "recorded evidence; verify the rest before relying on them."
+                    )
+                    run_check.italic = True
+            elif payload:
+                sourced_values = {
+                    float(point["value"]) for point in evidence_brief.get("data_points", [])
+                    if point.get("source_id") and isinstance(point.get("value"), (int, float))
+                }
+                render_payload(doc, payload, verified=sourced_values)
+            else:
+                add_markdown(
+                    doc, result.get("reasoning") or result.get("summary") or "No analysis data available.",
+                    heading_offset=3,
+                )
+
+
+    # ═══════════════════════════════════════════
     #  REFERENCES / PROVENANCE
     # ═══════════════════════════════════════════
 
-    doc.add_heading("References and Provenance", level=1)
+    doc.add_heading(f"{section_numbers['References and Provenance']}. References and Provenance", level=1)
 
     evidence_sources = analyst_data.get("_evidence_brief", {}).get("sources", [])
     if evidence_sources:
@@ -1980,6 +2258,78 @@ def generate_docx(
     return buf.read()
 
 
+def _lbo_rows(agent_results: List[Dict[str, Any]]) -> List[tuple]:
+    """(label, value) rows for the workbook's LBO sheet; a ``None`` value marks a section heading."""
+    for result in agent_results or []:
+        data = result.get("data") if isinstance(result, dict) else None
+        if not isinstance(data, dict):
+            continue
+        for key, node in data.items():
+            if "lbo" in str(key).lower() and isinstance(node, dict) and node:
+                rows: List[tuple] = []
+
+                def walk(current: Dict[str, Any], depth: int = 0) -> None:
+                    for name, value in current.items():
+                        title = str(name).replace("_", " ").strip().title()
+                        if isinstance(value, dict):
+                            rows.append((title, None))
+                            walk(value, depth + 1)
+                        elif isinstance(value, list) and value and all(isinstance(v, dict) for v in value):
+                            rows.append((title, None))
+                            for index, item in enumerate(value[:10], 1):
+                                rows.append((f"{title} {index}", ", ".join(f"{k}: {v}" for k, v in item.items())))
+                        elif isinstance(value, list):
+                            rows.append((title, "; ".join(str(v) for v in value)))
+                        elif isinstance(value, (int, float, str)) and not isinstance(value, bool):
+                            rows.append((title, value))
+
+                walk(node)
+                return rows
+    return []
+
+
+def _recommendation_text(deal: Dict[str, Any], agent_results: List[Dict[str, Any]]) -> tuple:
+    """(text, recorded): the deal's recorded recommendation, else the memo's labelled draft, else a notice.
+
+    "10/10 tasks completed; deal not scored" is a progress note, not a recommendation.
+    """
+    recorded = (deal or {}).get("final_recommendation")
+    if recorded and re.search(r"tasks completed; deal not scored", str(recorded)):
+        recorded = None
+    if recorded:
+        return str(recorded), True
+    draft = _memo_recommendation(agent_results)
+    if draft:
+        return f"IC memo draft: {_clip(draft, 220)} (model-generated; not an approved decision)", False
+    return "No recommendation recorded; human review required.", False
+
+
+def _memo_recommendation(agent_results: List[Dict[str, Any]]) -> str:
+    """The memo agent's stated recommendation line, or "" when the memo has none."""
+    for result in agent_results or []:
+        data = result.get("data") if isinstance(result, dict) else None
+        memo = data.get("memo") if isinstance(data, dict) else None
+        if isinstance(memo, str):
+            match = re.search(r"RECOMMENDATION\s*:\s*\*{0,2}\s*([^\n]+)", memo, flags=re.IGNORECASE)
+            if match:
+                return re.sub(r"[*_`]+", "", match.group(1)).strip()
+    return ""
+
+
+def _plain_text(value: Any) -> str:
+    """Lists of strings read as sentences, not as a Python list literal."""
+    if isinstance(value, (list, tuple)):
+        return " ".join(str(item).strip() for item in value if str(item).strip())
+    if isinstance(value, dict):
+        return "; ".join(f"{k}: {v}" for k, v in value.items())
+    return str(value).strip() if value is not None else ""
+
+
+def _clip(text: Any, limit: int) -> str:
+    text = str(text).strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
 def _severity_label(value: Any) -> str:
     """Agents report severity as words or numbers (1-5 or 1-10); render a label.
 
@@ -2010,11 +2360,13 @@ def _report_currency(value: Any) -> str:
     if value is None:
         return "Not established"
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if abs(value) >= 1_000_000_000:
-            return f"${value / 1_000_000_000:,.1f}bn"
-        if abs(value) >= 1_000_000:
-            return f"${value / 1_000_000:,.1f}m"
-        return f"${value:,.0f}"
+        sign = "-" if value < 0 else ""
+        magnitude = abs(value)
+        if magnitude >= 1_000_000_000:
+            return f"{sign}${magnitude / 1_000_000_000:,.1f}bn"
+        if magnitude >= 1_000_000:
+            return f"{sign}${magnitude / 1_000_000:,.2f}m"
+        return f"{sign}${magnitude:,.0f}"
     return str(value)
 
 

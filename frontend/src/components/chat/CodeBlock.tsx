@@ -27,20 +27,20 @@ export function CodeBlock({ className, children }: CodeBlockProps) {
     }
 
     return (
-        <div className="my-2 min-w-[min(20rem,100%)] overflow-hidden rounded-lg border border-white/5 bg-black/40">
-            <div className="flex items-center justify-between gap-4 border-b border-white/5 px-3 py-1 text-[10px] uppercase tracking-wide text-white/40">
+        <div className="my-2 min-w-[min(20rem,100%)] overflow-hidden rounded-lg border border-border bg-foreground/30">
+            <div className="flex items-center justify-between gap-4 border-b border-border px-3 py-1 text-[10px] uppercase tracking-wide text-muted-foreground/70">
                 <span>{language || 'code'}</span>
                 <button
                     type="button"
                     onClick={copy}
                     aria-label={copied ? 'Copied' : 'Copy code'}
-                    className="flex items-center gap-1 rounded px-1.5 py-0.5 normal-case text-white/50 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400"
+                    className="flex items-center gap-1 rounded px-1.5 py-0.5 normal-case text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400"
                 >
-                    {copied ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+                    {copied ? <Check className="h-3 w-3 text-emerald-700" /> : <Copy className="h-3 w-3" />}
                     {copied ? 'Copied' : 'Copy'}
                 </button>
             </div>
-            <pre className="overflow-x-auto p-3 text-xs text-emerald-300">
+            <pre className="overflow-x-auto p-3 text-xs text-emerald-700">
                 <code className={className}>{children}</code>
             </pre>
         </div>

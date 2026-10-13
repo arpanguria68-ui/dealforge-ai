@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quality & controls · DealForge AI</title>
+<meta name="description" content="How DealForge AI verifies agent output: grounding, reconciliation, deterministic repair, review gate and provenance.">
+<meta property="og:title" content="Quality &amp; controls · DealForge AI">
+<meta property="og:description" content="How DealForge AI verifies agent output: grounding, reconciliation, deterministic repair, review gate and provenance.">
+<meta property="og:image" content="../assets/img/poster-full.jpg">
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="bar"><div class="wrap">
+<a class="brand" href="../index.html"><span class="mark">DF</span>DealForge AI</a>
+<nav aria-label="Main"><a href="../index.html">Overview</a><a href="../docs/product-tour.html">Product tour</a><a href="../docs/architecture.html">Architecture</a><a href="../docs/agents.html">Agents</a><a href="../docs/tools-and-data.html">Tools &amp; data</a><a href="../docs/quality-and-controls.html" class=on>Quality &amp; controls</a><a href="../docs/reports.html">Reports</a><a href="../docs/api.html">API</a><a href="../docs/getting-started.html">Get started</a></nav>
+<a class="gh" href="https://github.com/arpanguria68-ui/dealforge-ai">GitHub</a>
+</div></header>
+<main id="main"><div class="wrap docs"><aside class="side" aria-label="Documentation"><h4>Start here</h4><a href="../docs/getting-started.html">Getting started</a><a href="../docs/product-tour.html">Product tour</a><h4>How it works</h4><a href="../docs/architecture.html">Architecture</a><a href="../docs/agents.html">Agent catalog</a><a href="../docs/tools-and-data.html">Tools &amp; data sources</a><h4>Trust</h4><a href="../docs/quality-and-controls.html" class=on>Quality &amp; controls</a><a href="../docs/reports.html">Reports &amp; review gate</a><h4>Reference</h4><a href="../docs/api.html">API reference</a><a href="../docs/status.html">Status &amp; limits</a></aside><article class="doc">
+<h1>Quality &amp; controls</h1>
+<p>Language models make confident mistakes. DealForge puts deterministic checks around them and shows the results to the user, instead of hoping the prompts are good enough.</p>
+<div class="tw"><table class=""><thead><tr><th>Control</th><th>What it does</th><th>Where</th></tr></thead><tbody><tr><td><strong>Approval gate</strong></td><td>Plans are shown first; execution requires approve. The server rejects execution for a list that is not approved or whose dependencies are not done.</td><td><code>/chat/execute-task</code>, UI</td></tr><tr><td><strong>Dependency ordering</strong></td><td>Data → modelling → synthesis; DCF/LBO agents wait for the valuation agent so they share its inputs.</td><td><code>project_manager.wire_stage_dependencies</code></td></tr><tr><td><strong>Shared assumptions</strong></td><td>WACC, terminal growth, horizon, starting growth, base FCF and market EV from the valuation audit are injected into every DCF/LBO prompt.</td><td><code>valuation_inputs.shared_assumptions_note</code></td></tr><tr><td><strong>Evidence brief</strong></td><td>All data points are collected with period, source link and basis (reported, derived, unverified). Duplicates across agents ("2025" vs "FY2025", rounded vs exact) collapse to one.</td><td><code>reports/evidence_brief.py</code></td></tr><tr><td><strong>Memo grounding</strong></td><td>Each figure in the memo is matched to recorded output; the grounded/total count is stored (for example 46 of 51) with the ungrounded figures listed. Citing a vendor that no tool returned is flagged.</td><td><code>validation/memo_grounding.py</code></td></tr><tr><td><strong>Cross-agent reconciliation</strong></td><td>Two DCF enterprise values more than 15% apart; an LBO entering below 95% of market EV or more than 60% above it; a DCF bridge whose PV of cash flows plus PV of terminal value is not within 5% of its enterprise value.</td><td><code>validation/reconciliation.py</code></td></tr><tr><td><strong>Deterministic repair</strong></td><td>If an LBO was requested but missing, one is built from sourced inputs; if a DCF bridge does not add up it is recomputed. Every assumption is listed in the output.</td><td><code>core/lbo.py</code>, <code>dcf_lbo_architect.py</code></td></tr><tr><td><strong>Unusable-reply rejection</strong></td><td>Empty, canned-error or off-topic short replies are failures: retried once and never stored as analysis or as the memo.</td><td><code>llm/gemini_client.py</code>, <code>investment_memo_agent.py</code></td></tr><tr><td><strong>Tool-outcome recording</strong></td><td>Success/failure per call, shown on the dashboard and available per agent result.</td><td><code>agents/base.py</code></td></tr><tr><td><strong>Review gate</strong></td><td>Reports carry a release status; unapproved reports download only as drafts (<code>_DRAFT_not_approved</code>, <code>X-Release-Status: draft-not-approved</code>), including from the chat Report button.</td><td><code>main.py</code>, <code>document_store.py</code></td></tr><tr><td><strong>Provenance trail</strong></td><td>Tool, parameters, raw response, timestamp and freshness per call; export at <code>/deals/{id}/provenance/export</code>.</td><td><code>core/provenance.py</code></td></tr><tr><td><strong>Input guards</strong></td><td>Prompt validation, JSON body size limit, upload path guards, optional admin bearer token for report endpoints.</td><td><code>chat_guard.py</code>, <code>path_guard.py</code></td></tr></tbody></table></div>
+<h2>What a reconciliation flag looks like</h2>
+<p>These are real warnings from a Sprout Social run, as shown on the dashboard row and in the Word report:</p>
+<pre><code>Two DCFs differ by 23% ($675.0M vs $829.0M). Their WACC, growth and cash-flow
+assumptions must be reconciled.
+dcf_lbo_architect: PV of cash flows ($1.11B) plus PV of terminal value ($1.03B) is
+$2.14B, not the stated enterprise value $829.0M. The DCF is internally inconsistent.</code></pre>
+<p>The second warning is now repaired automatically (the bridge is recomputed from the shared assumptions and the repair is noted). The first is intentionally <em>flagged, not forced</em>: two agents with different methodologies disagree, and a human decides which to trust.</p>
+<figure><img src="../assets/img/dashboard-pipeline.webp" data-zoom="../assets/img/dashboard-pipeline.webp" alt="Review required: the chips and the amber bullets come from the checks above." loading="lazy"><figcaption>Review required: the chips and the amber bullets come from the checks above.</figcaption></figure>
+<h2>Deterministic LBO assumptions</h2>
+<p>When the deterministic LBO is used, it states: entry at a 30% premium to market EV, 40% debt at 9% interest, 25% tax, 75% of post-interest cash flow sweeping the debt, five years, exit at the entry EV/FCF multiple (no multiple expansion), FCF growth fading from the observed rate to 2.5%. Change them in <code>backend/app/core/lbo.py</code>.</p>
+<h2>What these checks cannot do</h2>
+<ul><li>They verify consistency with recorded evidence, not truth: if a tool returned a wrong number, the number is "grounded".</li>
+<li>Reconciliation compares enterprise values and bridges it can parse; models that bury figures under unfamiliar keys are not compared.</li>
+<li>Model confidence is not calibrated, and the app says so.</li></ul>
+</article></div></main>
+<footer><div class="wrap"><span>DealForge AI · multi-agent M&amp;A deal analysis · all figures in the demos come from public filings (Sprout Social, NASDAQ: SPT).</span>
+<span><a href="https://github.com/arpanguria68-ui/dealforge-ai">Source</a> · <a href="../docs/status.html">Status &amp; limits</a> · <a href="../docs/getting-started.html">Get started</a></span></div></footer>
+<script src="../assets/js/site.js"></script>
+</body>
+</html>

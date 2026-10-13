@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Product tour · DealForge AI</title>
+<meta name="description" content="A guided tour of the DealForge AI chat, dashboard, task board and reports with real screenshots and a recorded run.">
+<meta property="og:title" content="Product tour · DealForge AI">
+<meta property="og:description" content="A guided tour of the DealForge AI chat, dashboard, task board and reports with real screenshots and a recorded run.">
+<meta property="og:image" content="../assets/img/poster-full.jpg">
+<link rel="stylesheet" href="../assets/css/site.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="bar"><div class="wrap">
+<a class="brand" href="../index.html"><span class="mark">DF</span>DealForge AI</a>
+<nav aria-label="Main"><a href="../index.html">Overview</a><a href="../docs/product-tour.html" class=on>Product tour</a><a href="../docs/architecture.html">Architecture</a><a href="../docs/agents.html">Agents</a><a href="../docs/tools-and-data.html">Tools &amp; data</a><a href="../docs/quality-and-controls.html">Quality &amp; controls</a><a href="../docs/reports.html">Reports</a><a href="../docs/api.html">API</a><a href="../docs/getting-started.html">Get started</a></nav>
+<a class="gh" href="https://github.com/arpanguria68-ui/dealforge-ai">GitHub</a>
+</div></header>
+<main id="main"><div class="wrap docs"><aside class="side" aria-label="Documentation"><h4>Start here</h4><a href="../docs/getting-started.html">Getting started</a><a href="../docs/product-tour.html" class=on>Product tour</a><h4>How it works</h4><a href="../docs/architecture.html">Architecture</a><a href="../docs/agents.html">Agent catalog</a><a href="../docs/tools-and-data.html">Tools &amp; data sources</a><h4>Trust</h4><a href="../docs/quality-and-controls.html">Quality &amp; controls</a><a href="../docs/reports.html">Reports &amp; review gate</a><h4>Reference</h4><a href="../docs/api.html">API reference</a><a href="../docs/status.html">Status &amp; limits</a></aside><article class="doc">
+<h1>Product tour</h1>
+<p>Everything on this page is a real capture from the running application, using public Sprout Social (NASDAQ: SPT) data.</p>
+<h2>See a run, end to end</h2>
+<div class="frame big-video"><div class="chrome"><i></i><i></i><i></i></div><video controls preload="none" poster="../assets/img/poster-chat.jpg"><source src="../assets/video/chat-walkthrough.mp4" type="video/mp4"></video></div>
+<p>The video combines screenshots of the prompt, plan and approval gate, a screen recording of the agents executing (sped up 10x, since real execution takes minutes), and screenshots of the finished brief.</p>
+
+<h2>1 · Chat: from a brief to an approved plan</h2>
+<figure><img src="../assets/img/chat-welcome.webp" data-zoom="../assets/img/chat-welcome.webp" alt="The Chat tab. Conversations on the left, the agent thread in the middle, the composer with focus mode (Speed / Balanced / Quality) and Sources at the bottom." loading="lazy"><figcaption>The Chat tab. Conversations on the left, the agent thread in the middle, the composer with focus mode (Speed / Balanced / Quality) and Sources at the bottom.</figcaption></figure>
+<figure><img src="../assets/img/chat-typed.webp" data-zoom="../assets/img/chat-typed.webp" alt="Describe the deal in plain language. If you say you do not want questions, the clarification step is skipped." loading="lazy"><figcaption>Describe the deal in plain language. If you say you do not want questions, the clarification step is skipped.</figcaption></figure>
+<figure><img src="../assets/img/chat-thinking.webp" data-zoom="../assets/img/chat-thinking.webp" alt="The Scrum Master (ProjectManager agent) reasons about data needs and builds the plan." loading="lazy"><figcaption>The Scrum Master (ProjectManager agent) reasons about data needs and builds the plan.</figcaption></figure>
+<figure><img src="../assets/img/chat-plan.webp" data-zoom="../assets/img/chat-plan.webp" alt="The plan: each task shows its title, the specialist agent that owns it and a priority. A valuation agent is added automatically when a DCF or LBO is planned." loading="lazy"><figcaption>The plan: each task shows its title, the specialist agent that owns it and a priority. A valuation agent is added automatically when a DCF or LBO is planned.</figcaption></figure>
+<figure><img src="../assets/img/chat-approval.webp" data-zoom="../assets/img/chat-approval.webp" alt="The approval gate. The warning bar and the Approve &amp;amp; run button are the only way to start execution. Cancel discards the plan." loading="lazy"><figcaption>The approval gate. The warning bar and the Approve &amp; run button are the only way to start execution. Cancel discards the plan.</figcaption></figure>
+<div class="note ok"><p><strong>Why this matters:</strong> agents call paid APIs and run for minutes. The plan is shown first so you control scope and cost, and you can also edit the plan on the Task Board before approving.</p></div>
+
+<h2>2 · Agents at work</h2>
+<p>After approval, tasks run in dependency order. Data tasks first, then valuation, then the DCF/LBO and risk agents that depend on it, then the memo. Independent tasks run in parallel. Each agent posts a card to the thread when it finishes, with its provider, duration, a note that confidence is <em>not calibrated</em>, and validation status.</p>
+<figure><img src="../assets/img/chat-done-agents.webp" data-zoom="../assets/img/chat-done-agents.webp" alt="Agent cards in the thread: what each agent was asked, its result summary and the validation line (for example "no arithmetic inconsistencies found in the fields checked")." loading="lazy"><figcaption>Agent cards in the thread: what each agent was asked, its result summary and the validation line (for example "no arithmetic inconsistencies found in the fields checked").</figcaption></figure>
+
+<h2>3 · The brief</h2>
+<p>When every task has returned, the chat builds an executive brief from recorded outputs only: an evidence snapshot with formatted values and periods, derived findings, key risks, and, when agents disagree, an <strong>Agents Disagree</strong> section with the exact warnings.</p>
+<figure><img src="../assets/img/chat-done-brief.webp" data-zoom="../assets/img/chat-done-brief.webp" alt="The brief. Values are reproduced from agent outputs; missing values are never filled in, and model confidence is labelled as uncalibrated." loading="lazy"><figcaption>The brief. Values are reproduced from agent outputs; missing values are never filled in, and model confidence is labelled as uncalibrated.</figcaption></figure>
+<p>Below the brief you will see <strong>Report</strong> and <strong>Data</strong> buttons (Word report and structured JSON). Until a reviewer approves, the Word report downloads as <code>…_DRAFT_not_approved.docx</code> and the chat tells you so.</p>
+
+<h2>4 · Dashboard</h2>
+<figure><img src="../assets/img/dashboard-overview.webp" data-zoom="../assets/img/dashboard-overview.webp" alt="Overview: active, completed and needs-review counts, Valuation vs Market EV per deal, agent utilization, deal pipeline and a live agent-activity feed." loading="lazy"><figcaption>Overview: active, completed and needs-review counts, Valuation vs Market EV per deal, agent utilization, deal pipeline and a live agent-activity feed.</figcaption></figure>
+<figure><img src="../assets/img/dashboard-pipeline.webp" data-zoom="../assets/img/dashboard-pipeline.webp" alt="A pipeline row. Chips show the weighted valuation, DCF, comps and market EV, how many figures are sourced (for example 64/77), tool-call success, and a Review required flag. The amber bullets are the actual reconciliation warnings." loading="lazy"><figcaption>A pipeline row. Chips show the weighted valuation, DCF, comps and market EV, how many figures are sourced (for example 64/77), tool-call success, and a Review required flag. The amber bullets are the actual reconciliation warnings.</figcaption></figure>
+<figure><img src="../assets/img/dashboard-activity.webp" data-zoom="../assets/img/dashboard-activity.webp" alt="The agent-activity feed (right) lists each agent completion with its provider." loading="lazy"><figcaption>The agent-activity feed (right) lists each agent completion with its provider.</figcaption></figure>
+<p><strong>View Analysis</strong> opens the deal: you can preview the document plan, add a free-text request ("focus on LBO returns for the IC"), toggle <em>fill gaps</em> (research missing items), generate the four documents, approve them for release and download drafts or the bundle.</p>
+
+<h2>5 · Task Board</h2>
+<figure><img src="../assets/img/taskboard.webp" data-zoom="../assets/img/taskboard.webp" alt="Every plan the Project Manager has produced, with status and task counts. Create a plan for any deal ID and company name." loading="lazy"><figcaption>Every plan the Project Manager has produced, with status and task counts. Create a plan for any deal ID and company name.</figcaption></figure>
+<figure><img src="../assets/img/taskboard-plan.webp" data-zoom="../assets/img/taskboard-plan.webp" alt="An expanded plan. Edit and delete icons on each task, drag handles, priority tags, the owning agent, + Add Task, and the green Approve button for draft plans." loading="lazy"><figcaption>An expanded plan. Edit and delete icons on each task, drag handles, priority tags, the owning agent, + Add Task, and the green Approve button for draft plans.</figcaption></figure>
+<p>Plans can be edited (title, description, agent, priority), extended with your own tasks, reordered, approved and executed from here or from the chat. These actions map to the <code>/api/v1/tasks/…</code> endpoints.</p>
+
+<h2>6 · Reports</h2>
+<p>From a finished analysis the app generates Word, PowerPoint, Excel and PDF. See <a href="reports.html">Reports &amp; review gate</a> for the full pipeline and gallery.</p>
+<figure><img src="../assets/img/report-deck-football.webp" data-zoom="../assets/img/report-deck-football.webp" alt="PowerPoint football field with the current market EV and LBO entry as reference lines." loading="lazy"><figcaption>PowerPoint football field with the current market EV and LBO entry as reference lines.</figcaption></figure>
+</article></div></main>
+<footer><div class="wrap"><span>DealForge AI · multi-agent M&amp;A deal analysis · all figures in the demos come from public filings (Sprout Social, NASDAQ: SPT).</span>
+<span><a href="https://github.com/arpanguria68-ui/dealforge-ai">Source</a> · <a href="../docs/status.html">Status &amp; limits</a> · <a href="../docs/getting-started.html">Get started</a></span></div></footer>
+<script src="../assets/js/site.js"></script>
+</body>
+</html>

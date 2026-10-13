@@ -25,7 +25,7 @@ export function StarterPrompts({ hasDeal, onPick }: StarterPromptsProps) {
                     key={prompt}
                     type="button"
                     onClick={() => onPick(prompt)}
-                    className="rounded-full border border-white/10 bg-white/[0.03] px-3.5 py-1.5 text-xs text-white/65 transition-colors hover:border-cyan-500/30 hover:bg-white/[0.07] hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400"
+                    className="rounded-full border border-border bg-muted/60 px-3.5 py-1.5 text-xs text-foreground transition-colors hover:border-cyan-500/30 hover:bg-muted hover:text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400"
                 >
                     {prompt}
                 </button>

@@ -13,9 +13,30 @@ import {
     Download, FileSpreadsheet, Presentation, Archive, Loader2
 } from 'lucide-react';
 import {
-    BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell
+    BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
 } from 'recharts';
 import { API_BASE, withAdminAuth } from '@/lib/api-base';
+
+interface DealInsights {
+    valuation?: { dcf?: number; comps?: number; weighted?: number };
+    market_ev?: number;
+    grounding?: { grounded?: number; total?: number };
+    tools?: { ok: number; failed: number };
+    reconciliation?: string[];
+    needs_review?: boolean;
+}
+
+/** A deal record that was created but never had an agent run (abandoned or test sessions). */
+const isNeverStarted = (deal: { status: string; agents_run?: string[] }): boolean =>
+    deal.status === 'created' && !(deal.agents_run && deal.agents_run.length);
+
+const money = (value?: number): string => {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return '—';
+    const abs = Math.abs(value);
+    if (abs >= 1e9) return `$${(value / 1e9).toFixed(2)}B`;
+    if (abs >= 1e6) return `$${(value / 1e6).toFixed(0)}M`;
+    return `$${value.toLocaleString()}`;
+};
 
 interface DealRecord {
     id: string;
@@ -27,6 +48,7 @@ interface DealRecord {
     current_stage: string;
     final_score: number | null;
     agents_run: string[];
+    insights?: DealInsights;
     created_at: string;
     updated_at: string;
 }
@@ -76,6 +98,8 @@ interface Metrics {
     completed_deals: number;
     avg_confidence: number | null;
     high_risk_alerts: number;
+    needs_review_deals?: number;
+    inactive_deals?: number;
     deals: DealRecord[];
     agent_activity: AgentEvent[];
 }
@@ -302,10 +326,13 @@ function DealDetailPanel({
         }
     };
 
-    const handleDownload = async (format: 'pdf' | 'pptx' | 'xlsx' | 'docx') => {
+    const handleDownload = async (format: 'pdf' | 'pptx' | 'xlsx' | 'docx', draft = false) => {
         try {
-            // Hit the new download endpoint
-            const res = await fetch(`${API_BASE}/api/v1/deals/${deal.id}/documents/${format}`, withAdminAuth());
+            // Hit the new download endpoint (draft=true: internal copy of a report not yet approved)
+            const res = await fetch(
+                `${API_BASE}/api/v1/deals/${deal.id}/documents/${format}${draft ? '?draft=true' : ''}`,
+                withAdminAuth(),
+            );
             
             // Fallback to old endpoint if 404 (optional, but new system is better)
             if (res.status === 404) {
@@ -799,7 +826,7 @@ function DealDetailPanel({
                                 size="sm" 
                                 className="w-full gap-2 shadow-lg shadow-primary/20"
                                 onClick={handleGenerate}
-                                disabled={isGenerating || deal.status !== 'completed' && deal.status !== 'ready'}
+                                disabled={isGenerating || !['completed', 'ready', 'needs_review'].includes(deal.status)}
                             >
                                 {isGenerating ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
                                 {isGenerating ? 'Generating Artifacts...' : docRequest.trim() ? 'Generate Document' : 'Generate All Reports'}
@@ -811,7 +838,7 @@ function DealDetailPanel({
                                 <div className="flex items-start justify-between gap-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
                                     <div>
                                         <p className="text-sm font-medium text-amber-700 dark:text-amber-400">Client delivery locked · review required</p>
-                                        <p className="text-xs text-muted-foreground">Downloads remain blocked until a reviewer attests to the evidence and caveats.</p>
+                                        <p className="text-xs text-muted-foreground">You can download a DRAFT of each file for internal review now. Client copies unlock after a reviewer approves.</p>
                                     </div>
                                     <Button size="sm" variant="outline" onClick={handleApproveReports}>Approve</Button>
                                 </div>
@@ -837,9 +864,8 @@ function DealDetailPanel({
                                             variant="ghost" 
                                             size="icon" 
                                             className="h-8 w-8 hover:bg-primary hover:text-white transition-colors"
-                                            onClick={() => handleDownload(doc.format)}
-                                            disabled={doc.release_status !== 'approved'}
-                                            title={doc.release_status !== 'approved' ? 'Reviewer approval required before download' : `Download ${doc.format.toUpperCase()}`}
+                                            onClick={() => handleDownload(doc.format, doc.release_status !== 'approved')}
+                                            title={doc.release_status !== 'approved' ? `Download ${doc.format.toUpperCase()} DRAFT (not approved for client release)` : `Download ${doc.format.toUpperCase()}`}
                                         >
                                             <Download className="h-4 w-4" />
                                         </Button>
@@ -889,6 +915,7 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
     const [error, setError] = useState<string | null>(null);
     const [selectedDeal, setSelectedDeal] = useState<DealRecord | null>(null);
     const [searchTerm, setSearchTerm] = useState('');
+    const [showInactive, setShowInactive] = useState(false);
 
     const fetchMetrics = useCallback(async () => {
         try {
@@ -929,7 +956,7 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
 
             <div className="flex items-center justify-between">
                 <div className="flex flex-col space-y-1">
-                    <h2 className="text-3xl font-bold tracking-tight bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent dark:from-blue-400 dark:to-indigo-400">
+                    <h2 className="text-2xl font-semibold tracking-tight text-foreground">
                         Overview
                     </h2>
                     <p className="text-muted-foreground text-sm">
@@ -959,7 +986,7 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
 
             {/* KPI Cards */}
             <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-                <Card className="hover:shadow-md transition-all duration-200">
+                <Card className="transition-shadow hover:shadow-fluent">
                     <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                         <CardTitle className="text-sm font-medium">Active Deals</CardTitle>
                         <Briefcase className="h-4 w-4 text-blue-500" />
@@ -969,12 +996,12 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
                             {loading ? <span className="animate-pulse">—</span> : (metrics?.active_deals ?? 0)}
                         </div>
                         <p className="text-xs text-muted-foreground">
-                            {metrics?.total_deals ?? 0} total in pipeline
+                            In analysis · {metrics?.total_deals ?? 0} total, {metrics?.inactive_deals ?? 0} never started
                         </p>
                     </CardContent>
                 </Card>
 
-                <Card className="hover:shadow-md transition-all duration-200">
+                <Card className="transition-shadow hover:shadow-fluent">
                     <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                         <CardTitle className="text-sm font-medium">Mean Agent Score</CardTitle>
                         <Target className="h-4 w-4 text-green-500" />
@@ -987,20 +1014,20 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
                     </CardContent>
                 </Card>
 
-                <Card className="hover:shadow-md transition-all duration-200">
+                <Card className="transition-shadow hover:shadow-fluent">
                     <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                        <CardTitle className="text-sm font-medium">Risk Alerts</CardTitle>
+                        <CardTitle className="text-sm font-medium">Needs Review</CardTitle>
                         <AlertTriangle className="h-4 w-4 text-red-500" />
                     </CardHeader>
                     <CardContent>
                         <div className="text-2xl font-bold">
-                            {loading ? <span className="animate-pulse">—</span> : (metrics?.high_risk_alerts ?? 0)}
+                            {loading ? <span className="animate-pulse">—</span> : (metrics?.needs_review_deals ?? 0)}
                         </div>
-                        <p className="text-xs text-muted-foreground">Deal score below 50%</p>
+                        <p className="text-xs text-muted-foreground">Awaiting reviewer approval or flagged by checks</p>
                     </CardContent>
                 </Card>
 
-                <Card className="hover:shadow-md transition-all duration-200">
+                <Card className="transition-shadow hover:shadow-fluent">
                     <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                         <CardTitle className="text-sm font-medium">Completed</CardTitle>
                         <CheckCircle className="h-4 w-4 text-amber-500" />
@@ -1017,41 +1044,39 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
             {/* Analytics Charts */}
             {metrics && metrics.deals.length > 0 && (
                 <div className="grid gap-4 md:grid-cols-2">
-                    {/* Deal Score Distribution */}
+                    {/* Valuation vs market enterprise value (recorded values only) */}
                     <Card>
                         <CardHeader className="pb-2">
-                            <CardTitle className="text-sm font-medium">Deal Score Distribution</CardTitle>
-                            <CardDescription>Final scores across all analyzed deals</CardDescription>
+                            <CardTitle className="text-sm font-medium">Valuation vs Market EV</CardTitle>
+                            <CardDescription>Weighted valuation estimate against current market enterprise value ($M)</CardDescription>
                         </CardHeader>
                         <CardContent>
-                            <ResponsiveContainer width="100%" height={200}>
-                                <BarChart
-                                    data={[...metrics.deals]
-                                        .filter(d => d.final_score !== null)
-                                        .map(d => ({
-                                            name: d.name.length > 12 ? d.name.slice(0, 12) + '…' : d.name,
-                                            score: Math.round((d.final_score ?? 0) * (d.final_score! > 1 ? 1 : 100)),
-                                        }))}
-                                    margin={{ top: 4, right: 8, left: -20, bottom: 4 }}
-                                >
-                                    <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
-                                    <XAxis dataKey="name" tick={{ fontSize: 10 }} />
-                                    <YAxis domain={[0, 100]} tick={{ fontSize: 10 }} />
-                                    <Tooltip
-                                        formatter={(v: number) => [`${v}/100`, 'Score']}
-                                        contentStyle={{ fontSize: 12 }}
-                                    />
-                                    <Bar dataKey="score" radius={[4, 4, 0, 0]}>
-                                        {[...metrics.deals]
-                                            .filter(d => d.final_score !== null)
-                                            .map((d, i) => {
-                                                const s = Math.round((d.final_score ?? 0) * (d.final_score! > 1 ? 1 : 100));
-                                                const color = s >= 70 ? '#22c55e' : s >= 50 ? '#f59e0b' : '#ef4444';
-                                                return <Cell key={i} fill={color} />;
-                                            })}
-                                    </Bar>
-                                </BarChart>
-                            </ResponsiveContainer>
+                            {(() => {
+                                const rows = [...metrics.deals]
+                                    .filter(d => d.insights?.valuation?.weighted)
+                                    .sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)))
+                                    .slice(0, 6)
+                                    .map(d => ({
+                                        name: `${d.target_company} ${d.id.slice(0, 4)}`,
+                                        weighted: Math.round((d.insights!.valuation!.weighted as number) / 1e6),
+                                        market: d.insights!.market_ev ? Math.round(d.insights!.market_ev / 1e6) : undefined,
+                                    }));
+                                if (!rows.length) {
+                                    return <p className="py-16 text-center text-xs text-muted-foreground">No valuation recorded yet. Run a deal with a valuation agent.</p>;
+                                }
+                                return (
+                                    <ResponsiveContainer width="100%" height={200}>
+                                        <BarChart data={rows} margin={{ top: 4, right: 8, left: -10, bottom: 4 }}>
+                                            <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
+                                            <XAxis dataKey="name" tick={{ fontSize: 10 }} />
+                                            <YAxis tick={{ fontSize: 10 }} />
+                                            <Tooltip formatter={(v: number, n: string) => [`$${v}M`, n === 'weighted' ? 'Weighted valuation' : 'Market EV']} contentStyle={{ fontSize: 12 }} />
+                                            <Bar dataKey="weighted" fill="#0f6cbd" radius={[4, 4, 0, 0]} />
+                                            <Bar dataKey="market" fill="#94a3b8" radius={[4, 4, 0, 0]} />
+                                        </BarChart>
+                                    </ResponsiveContainer>
+                                );
+                            })()}
                         </CardContent>
                     </Card>
 
@@ -1084,7 +1109,7 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
                                     <XAxis type="number" tick={{ fontSize: 10 }} allowDecimals={false} />
                                     <YAxis type="category" dataKey="name" tick={{ fontSize: 9 }} width={100} />
                                     <Tooltip formatter={(v: number) => [v, 'Runs']} contentStyle={{ fontSize: 12 }} />
-                                    <Bar dataKey="count" fill="#6366f1" radius={[0, 4, 4, 0]} />
+                                    <Bar dataKey="count" fill="#0f6cbd" radius={[0, 4, 4, 0]} />
                                 </BarChart>
                             </ResponsiveContainer>
                         </CardContent>
@@ -1094,12 +1119,22 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
 
             <div className="grid gap-4 md:grid-cols-7">
                 {/* Deal List */}
-                <Card className="col-span-4 md:col-span-5 hover:shadow-lg transition-all duration-300 border-t-4 border-t-primary">
+                <Card className="col-span-4 md:col-span-5 transition-shadow hover:shadow-fluent">
                     <CardHeader className="pb-3">
                         <div className="flex items-center justify-between">
                             <div>
                                 <CardTitle>Deal Pipeline</CardTitle>
-                                <CardDescription>Most recent activity at the top.</CardDescription>
+                                <CardDescription>
+                                    Most recent activity at the top.
+                                    {(metrics?.inactive_deals ?? 0) > 0 && (
+                                        <button
+                                            className="ml-2 underline underline-offset-2 hover:text-foreground"
+                                            onClick={() => setShowInactive(v => !v)}
+                                        >
+                                            {showInactive ? 'Hide' : 'Show'} {metrics?.inactive_deals} never-started
+                                        </button>
+                                    )}
+                                </CardDescription>
                             </div>
                             <div className="relative w-full max-w-xs">
                                 <Activity className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
@@ -1135,7 +1170,8 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
                             ) : (
                                 <div className="space-y-4">
                                     {(metrics?.deals || [])
-                                        .filter(d => 
+                                        .filter(d => showInactive || searchTerm || !isNeverStarted(d))
+                                        .filter(d =>
                                             d.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
                                             d.target_company.toLowerCase().includes(searchTerm.toLowerCase()) ||
                                             d.industry.toLowerCase().includes(searchTerm.toLowerCase())
@@ -1181,6 +1217,43 @@ export function Dashboard({ onNavigate }: { onNavigate?: (page: 'chat' | 'dashbo
                                                     </div>
                                                 )}
                                             </div>
+
+                                            {deal.insights && (
+                                                <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px]">
+                                                    {deal.insights.valuation?.weighted !== undefined && (
+                                                        <span className="rounded-md bg-indigo-500/10 px-2 py-0.5 text-indigo-700" title="Weighted DCF / comps estimate">
+                                                            Valuation {money(deal.insights.valuation.weighted)}
+                                                        </span>
+                                                    )}
+                                                    {deal.insights.valuation?.dcf !== undefined && (
+                                                        <span className="rounded-md bg-muted px-2 py-0.5">DCF {money(deal.insights.valuation.dcf)}</span>
+                                                    )}
+                                                    {deal.insights.valuation?.comps !== undefined && (
+                                                        <span className="rounded-md bg-muted px-2 py-0.5">Comps {money(deal.insights.valuation.comps)}</span>
+                                                    )}
+                                                    {deal.insights.market_ev !== undefined && (
+                                                        <span className="rounded-md bg-muted px-2 py-0.5">Market EV {money(deal.insights.market_ev)}</span>
+                                                    )}
+                                                    {deal.insights.grounding?.total ? (
+                                                        <span className="rounded-md bg-emerald-500/10 px-2 py-0.5 text-emerald-700" title="Memo figures traced to recorded evidence">
+                                                            {deal.insights.grounding.grounded}/{deal.insights.grounding.total} figures sourced
+                                                        </span>
+                                                    ) : null}
+                                                    {deal.insights.tools && (
+                                                        <span className="rounded-md bg-muted px-2 py-0.5" title="Tool calls recorded by the agents">
+                                                            {deal.insights.tools.ok} tool calls ok{deal.insights.tools.failed ? `, ${deal.insights.tools.failed} failed` : ''}
+                                                        </span>
+                                                    )}
+                                                    {deal.insights.needs_review && (
+                                                        <span className="rounded-md bg-amber-500/15 px-2 py-0.5 text-amber-700">Review required</span>
+                                                    )}
+                                                </div>
+                                            )}
+                                            {deal.insights?.reconciliation?.length ? (
+                                                <ul className="mt-1.5 list-disc pl-5 text-[11px] text-amber-700">
+                                                    {deal.insights.reconciliation.map((message, i) => <li key={i}>{message}</li>)}
+                                                </ul>
+                                            ) : null}
 
                                             <div className="flex items-center justify-between pt-2">
                                                 <span className="text-xs text-muted-foreground font-mono">{deal.target_company} · {deal.industry}</span>

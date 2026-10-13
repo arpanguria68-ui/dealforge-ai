@@ -684,7 +684,7 @@ export function SettingsPage() {
     return (
         <div className="space-y-6">
             <div className="flex flex-col space-y-2">
-                <h2 className="text-3xl font-bold tracking-tight bg-gradient-to-r from-violet-600 to-fuchsia-600 bg-clip-text text-transparent dark:from-violet-400 dark:to-fuchsia-400">
+                <h2 className="text-2xl font-semibold tracking-tight text-foreground">
                     Settings
                 </h2>
                 <p className="text-muted-foreground">
@@ -696,7 +696,7 @@ export function SettingsPage() {
             <ApiUsageMonitor />
 
             {/* ===== API Keys Section ===== */}
-            <Card className="border-t-4 border-t-blue-500">
+            <Card>
                 <CardHeader>
                     <CardTitle className="flex items-center gap-2">
                         <Key className="h-5 w-5 text-blue-500" />
@@ -1072,7 +1072,7 @@ export function SettingsPage() {
             </Card>
 
             {/* ===== External API Providers Section ===== */}
-            <Card className="border-t-4 border-t-teal-500">
+            <Card>
                 <CardHeader>
                     <CardTitle className="flex items-center gap-2">
                         <Database className="h-5 w-5 text-teal-500" />
@@ -1201,7 +1201,7 @@ export function SettingsPage() {
             </Card>
 
             {/* ===== Web Search Strategy Section ===== */}
-            <Card className="border-t-4 border-t-orange-500 overflow-hidden">
+            <Card className="overflow-hidden">
                 <CardHeader className="pb-3">
                     <CardTitle className="flex items-center gap-2">
                         <RefreshCw className="h-5 w-5 text-orange-500" />
@@ -1278,7 +1278,7 @@ export function SettingsPage() {
             </Card>
 
             {/* ===== Cloud Model Selection ===== */}
-            <Card className="border-t-4 border-t-cyan-500">
+            <Card>
                 <CardHeader>
                     <div className="flex items-center justify-between">
                         <div>
@@ -1478,7 +1478,7 @@ export function SettingsPage() {
             </Card>
 
             {/* ===== Local LLMs Section ===== */}
-            <Card className="border-t-4 border-t-purple-500">
+            <Card>
                 <CardHeader>
                     <CardTitle className="flex items-center gap-2">
                         <Cpu className="h-5 w-5 text-purple-500" />
@@ -1565,7 +1565,7 @@ export function SettingsPage() {
             </Card>
 
             {/* ===== Model Routing Section ===== */}
-            <Card className="border-t-4 border-t-amber-500">
+            <Card>
                 <CardHeader>
                     <div className="flex items-center justify-between">
                         <div>
@@ -1646,7 +1646,7 @@ export function SettingsPage() {
             </Card>
 
             {/* ===== PageIndex RAG Section ===== */}
-            <Card className="border-t-4 border-t-emerald-500">
+            <Card>
                 <CardHeader>
                     <CardTitle className="flex items-center gap-2">
                         <Shield className="h-5 w-5 text-emerald-500" />
@@ -1670,7 +1670,7 @@ export function SettingsPage() {
             </Card>
 
             {/* ===== Laya System-1 + RAG Tuning ===== */}
-            <Card className="border-t-4 border-t-violet-500">
+            <Card>
                 <CardHeader>
                     <div className="flex items-center justify-between">
                         <div>
@@ -1917,7 +1917,7 @@ export function SettingsPage() {
             </Card>
 
             {/* ===== Document Design & Branding ===== */}
-            <Card className="border-t-4 border-t-pink-500">
+            <Card>
                 <CardHeader>
                     <CardTitle className="flex items-center gap-2">
                         <Palette className="h-5 w-5 text-pink-500" />

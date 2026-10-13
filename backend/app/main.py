@@ -214,7 +214,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
+    expose_headers=["Content-Disposition", "X-Release-Status"],
 )
 
 # Request body size guard for JSON APIs (uploads have their own limit above).
@@ -516,6 +516,61 @@ async def get_deal_agent_messages(deal_id: str):
     return {"deal_id": deal_id, "messages": messages}
 
 
+def summarize_deal_insights(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Decision-grade facts for a dashboard row, read from the agents' recorded results.
+
+    ``results`` are ``{"agent_type", "data"}`` records. Only recorded values are reported:
+    a missing valuation stays absent rather than being estimated.
+    """
+    from app.core.validation.reconciliation import reconcile
+
+    insights: Dict[str, Any] = {}
+    market_ev = None
+    tools_ok = tools_failed = 0
+    review = False
+    for record in results:
+        data = record.get("data")
+        if not isinstance(data, dict):
+            continue
+        for call in data.get("tools_used") or []:
+            if isinstance(call, dict):
+                if call.get("success"):
+                    tools_ok += 1
+                else:
+                    tools_failed += 1
+        if data.get("human_review_required"):
+            review = True
+        if record.get("agent_type") == "valuation_agent":
+            valuations = data.get("valuations") if isinstance(data.get("valuations"), dict) else {}
+            dcf = (valuations.get("dcf") or {}).get("value")
+            comps = (valuations.get("comparable_companies") or {}).get("value")
+            valuation = {
+                key: value for key, value in (
+                    ("dcf", dcf), ("comps", comps), ("weighted", data.get("weighted_estimate"))
+                ) if isinstance(value, (int, float)) and abs(value) >= 1e6  # smaller: unit unknown
+            }
+            if valuation:
+                insights["valuation"] = valuation
+            market = (((data.get("audit") or {}).get("inputs") or {}).get("market_data") or {})
+            if isinstance(market.get("enterprise_value"), (int, float)):
+                market_ev = float(market["enterprise_value"])
+                insights["market_ev"] = market_ev
+        if record.get("agent_type") == "investment_memo_agent":
+            grounding = data.get("grounding") if isinstance(data.get("grounding"), dict) else {}
+            if grounding.get("figures_total"):
+                insights["grounding"] = {
+                    "grounded": grounding.get("figures_grounded"), "total": grounding.get("figures_total"),
+                }
+    issues = reconcile(results, market_ev=market_ev)
+    if issues:
+        insights["reconciliation"] = [issue["message"] for issue in issues][:3]
+    if tools_ok or tools_failed:
+        insights["tools"] = {"ok": tools_ok, "failed": tools_failed}
+    if review or issues:
+        insights["needs_review"] = True
+    return insights
+
+
 @app.get("/api/v1/dashboard/metrics")
 async def dashboard_metrics():
     """Return live dashboard KPIs and agent activity feed"""
@@ -547,8 +602,31 @@ async def dashboard_metrics():
     high_risk = sum(
         1 for d in deals if d.get("final_score") is not None and d["final_score"] < 0.5
     )
-    active = sum(1 for d in deals if d["status"] in ("created", "running"))
+    inactive = sum(1 for d in deals if d["status"] == "created" and not d.get("agents_run"))
+    active = sum(1 for d in deals if d["status"] in ("created", "running")) - inactive
     completed = sum(1 for d in deals if d["status"] == "completed")
+    needs_review = sum(1 for d in deals if d.get("status") == "needs_review")
+
+    # Recorded results for the most recent deals only; older runs stay as they were.
+    recent = sorted(
+        (d for d in deals if d.get("agents_run")), key=lambda d: str(d.get("updated_at") or ""), reverse=True
+    )[:12]
+    try:
+        from app.core.tasks.task_manager import get_task_manager
+
+        manager = get_task_manager()
+        for deal in recent:
+            records: List[Dict[str, Any]] = []
+            for todo in await manager.get_lists_for_deal(deal["id"]):
+                records += [
+                    {"agent_type": item.assigned_agent, "data": item.result}
+                    for item in todo.items if item.status == "done" and isinstance(item.result, dict)
+                ]
+            insights = summarize_deal_insights(records) if records else {}
+            if insights:
+                deal["insights"] = insights
+    except Exception as exc:
+        logger.warning("dashboard_insights_unavailable", error=str(exc))
 
     return {
         "total_deals": total,
@@ -556,6 +634,8 @@ async def dashboard_metrics():
         "completed_deals": completed,
         "avg_confidence": avg_confidence,
         "high_risk_alerts": high_risk,
+        "needs_review_deals": needs_review,
+        "inactive_deals": inactive,
         "deals": deals,
         "agent_activity": agent_activity[-20:],  # last 20 events
     }
@@ -998,17 +1078,20 @@ async def _load_report_inputs(deal_id: str):
     deal = await redis_store.get_deal(deal_id)
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
-    if deal.get("status") not in {"completed", "ready"}:
+    # needs_review = the run finished but some tasks failed or were blocked. Deliverables can still
+    # be built (marked as drafts); client release stays gated on reviewer approval.
+    if deal.get("status") not in {"completed", "ready", "needs_review"}:
         raise HTTPException(status_code=409, detail="Complete the analysis before generating deliverables.")
     from app.core.tasks.task_manager import get_task_manager
     from app.core.reports.document_planner import build_report_agent_results
 
     task_lists = await get_task_manager().get_lists_for_deal(deal_id)
     saved_tasks = [item for task_list in task_lists for item in task_list.items]
-    if task_lists and (
-        not any(item.status == "done" and isinstance(item.result, dict) for item in saved_tasks)
-        or any(item.status != "done" or not isinstance(item.result, dict) for item in saved_tasks)
-    ):
+    has_results = any(item.status == "done" and isinstance(item.result, dict) for item in saved_tasks)
+    all_finished = not any(item.status != "done" or not isinstance(item.result, dict) for item in saved_tasks)
+    # A needs_review run is allowed to have failed/blocked tasks (it still needs one real result);
+    # any other status must have every task finished.
+    if task_lists and (not has_results or not (all_finished or deal.get("status") == "needs_review")):
         raise HTTPException(
             status_code=409,
             detail="Saved analysis still has unfinished or unpersisted tasks; finish or review the run before generating deliverables.",
@@ -1445,7 +1528,9 @@ async def download_deal_bundle(deal_id: str, _: bool = Depends(require_admin_tok
 
 
 @app.get("/api/v1/deals/{deal_id}/documents/{fmt}")
-async def download_deal_document(deal_id: str, fmt: str, _: bool = Depends(require_admin_token)):
+async def download_deal_document(
+    deal_id: str, fmt: str, draft: bool = False, _: bool = Depends(require_admin_token)
+):
     """
     Download a single cached document by format (pdf, pptx, xlsx).
     Returns cached bytes instantly — no regeneration.
@@ -1471,14 +1556,20 @@ async def download_deal_document(deal_id: str, fmt: str, _: bool = Depends(requi
         )
 
     meta = await doc_store.get_document_meta(deal_id, fmt)
-    _require_approved_report(meta)
+    is_draft = bool(draft) and bool(meta) and (meta or {}).get("release_status") != "approved"
+    if not is_draft:
+        _require_approved_report(meta)
     safe_name = (meta or {}).get("safe_filename", "report")
-    filename = f"DealForge_{safe_name}.{fmt}"
+    # A draft is for internal review only: the name says so and the header lets clients detect it.
+    filename = f"DealForge_{safe_name}{'_DRAFT_not_approved' if is_draft else ''}.{fmt}"
+    headers = {**REPORT_DOWNLOAD_HEADERS, "Content-Disposition": f'attachment; filename="{filename}"'}
+    if is_draft:
+        headers["X-Release-Status"] = "draft-not-approved"
 
     return Response(
         content=content,
         media_type=DocumentStore.get_content_type(fmt),
-        headers={**REPORT_DOWNLOAD_HEADERS, "Content-Disposition": f'attachment; filename="{filename}"'},
+        headers=headers,
     )
 
 
@@ -2713,6 +2804,17 @@ async def get_deal_tasks(deal_id: str):
     return {"deal_id": deal_id, "todo_lists": [tl.to_dict() for tl in lists]}
 
 
+def export_download_headers(filename_base: str, extension: str, approved: bool) -> Dict[str, str]:
+    """Download headers for an on-the-fly export: unapproved reports are named and flagged as drafts."""
+    headers = {
+        **REPORT_DOWNLOAD_HEADERS,
+        "Content-Disposition": f'attachment; filename="DealForge_{filename_base}{"" if approved else "_DRAFT_not_approved"}.{extension}"',
+    }
+    if not approved:
+        headers["X-Release-Status"] = "draft-not-approved"
+    return headers
+
+
 @app.get("/api/v1/deals/{deal_id}/exports/docx")
 async def download_analysis_docx(deal_id: str, _: bool = Depends(require_admin_token)):
     """Synthesize persisted agent results and download a validated evidence-led DOCX."""
@@ -2780,13 +2882,16 @@ async def download_analysis_docx(deal_id: str, _: bool = Depends(require_admin_t
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     filename_base = re.sub(r"[^A-Za-z0-9_-]+", "_", report_deal.get("target_company", "deal-report")).strip("_") or "deal-report"
+    # Same rule as the Dashboard downloads: until a reviewer approves the reports, the file is a draft.
+    from app.core.document_store import DocumentStore
+
+    meta = await DocumentStore.get_instance().get_document_meta(deal_id, "docx")
+    approved = bool(meta) and (meta or {}).get("release_status") == "approved"
+    headers = export_download_headers(filename_base, "docx", approved)
     return Response(
         content=content,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={
-            **REPORT_DOWNLOAD_HEADERS,
-            "Content-Disposition": f'attachment; filename="DealForge_{filename_base}.docx"',
-        },
+        headers=headers,
     )
 
 
@@ -3121,6 +3226,21 @@ async def chat_respond(request: Request):
     }
 
 
+_NO_CLARIFICATION = re.compile(
+    r"\b(?:(?:do\s*n[o']?t|don't|never|no\s+need\s+to|without)\s+(?:ask|asking)?\s*(?:me\s+)?(?:any\s+)?"
+    r"(?:clarif\w*|follow[- ]?up)\s*(?:questions?)?"
+    r"|no\s+(?:clarif\w*|follow[- ]?up)\s+questions?"
+    r"|skip\s+(?:the\s+)?(?:clarif\w*|questions)"
+    r"|proceed\s+(?:directly|straight)\s+to\s+(?:the\s+)?plan(?:ning)?)",
+    re.IGNORECASE,
+)
+
+
+def declines_clarification(prompt: str) -> bool:
+    """True when the user has told the Scrum Master not to ask questions first."""
+    return bool(_NO_CLARIFICATION.search(prompt or ""))
+
+
 @app.post("/api/v1/chat/clarify")
 async def chat_clarify(request: Request):
     """
@@ -3145,7 +3265,7 @@ async def chat_clarify(request: Request):
     if str(company_name or "").strip().lower() in {"", "target company", "the target", "unknown"}:
         company_name = _explicit_company_name(prompt) or "Target Company"
     clarification_round = body.get("clarification_round", 0)
-    user_skipped = body.get("user_skipped", False)
+    user_skipped = bool(body.get("user_skipped", False)) or declines_clarification(prompt)
     skipped_questions = body.get("skipped_questions", [])
 
     from app.agents.project_manager import ProjectManagerAgent
@@ -3368,6 +3488,19 @@ async def _await_agent_execution(execution, agent_type: str, timeout_seconds: in
         ) from exc
 
 
+def _with_tools_used(result: Any) -> Any:
+    """Agent data plus the tools it actually called (name, outcome), for the report and the UI."""
+    data = getattr(result, "data", None)
+    calls = getattr(result, "tool_calls", None)
+    if not isinstance(data, dict) or not isinstance(calls, list) or not calls or "tools_used" in data:
+        return data
+    used = [
+        {"name": str(c.get("name")), "success": bool(c.get("success")), **({"error": c["error"]} if c.get("error") else {})}
+        for c in calls if isinstance(c, dict) and c.get("name")
+    ]
+    return {**data, "tools_used": used} if used else data
+
+
 @app.post("/api/v1/chat/execute-task")
 async def chat_execute_task(request: Request):
     """Execute a single task from the scrum master's plan via the assigned agent."""
@@ -3401,6 +3534,7 @@ async def chat_execute_task(request: Request):
     ))
 
     upstream_results: List[Dict[str, Any]] = []
+    sibling_results: List[Dict[str, Any]] = []
     if task_list_id and task_id:
         task_manager = get_task_manager()
         todo = await task_manager.get_todo_list(task_list_id)
@@ -3413,6 +3547,13 @@ async def chat_execute_task(request: Request):
             raise HTTPException(status_code=404, detail="Task is not part of the approved plan")
         completed_ids = {item.id for item in todo.items if item.status == "done"}
         unmet_dependencies = [dependency for dependency in planned_task.depends_on if dependency not in completed_ids]
+        if unmet_dependencies and planned_task.assigned_agent == "investment_memo_agent":
+            # The IC memo is the final synthesis step: it may run on partial
+            # inputs (and must say what is missing) once every prerequisite has
+            # finished and at least one produced a result.
+            finished = {item.id for item in todo.items if item.status in {"done", "blocked", "failed"}}
+            if completed_ids & set(planned_task.depends_on) and set(unmet_dependencies) <= finished:
+                unmet_dependencies = []
         if unmet_dependencies:
             raise HTTPException(
                 status_code=409,
@@ -3431,6 +3572,11 @@ async def chat_execute_task(request: Request):
             for item in todo.items
             if item.id in planned_task.depends_on and item.status == "done" and isinstance(item.result, dict)
         ]
+        sibling_results = [
+            {"agent_type": item.assigned_agent, "data": item.result}
+            for item in todo.items
+            if item.id != task_id and item.status == "done" and isinstance(item.result, dict)
+        ]
 
     # Prefer an explicitly supplied public ticker in the user/task text over
     # heuristic company-name extraction, which can select an unrelated phrase.
@@ -3438,16 +3584,20 @@ async def chat_execute_task(request: Request):
     if not ticker and company_name.strip().lower() not in {"target company", "the target", "unknown"}:
         ticker = company_name
 
-    # Fallback to todo_list metadata if ticker is missing
+    # Fallback to todo_list metadata if ticker is missing, or if all we have is
+    # a company-name hint (not a symbol) and the approved plan stored the real one.
     deal_id = body.get("deal_id")
-    if not ticker and deal_id:
+    from app.core.valuation_inputs import normalize_ticker
+
+    _is_symbol = lambda t: bool(normalize_ticker(t))  # noqa: E731
+    if (not ticker or not _is_symbol(ticker)) and deal_id:
         tm = get_task_manager()
         lists = await tm.get_lists_for_deal(deal_id)
         if lists:
             # Use the most recent list
             latest_list = sorted(lists, key=lambda x: x.created_at, reverse=True)[0]
-            if not ticker:
-                ticker = latest_list.ticker
+            if not ticker or _is_symbol(latest_list.ticker):
+                ticker = normalize_ticker(latest_list.ticker) or latest_list.ticker or ticker
             if not company_name:
                 company_name = latest_list.company_name
 
@@ -3518,6 +3668,13 @@ async def chat_execute_task(request: Request):
                 except Exception as exc:
                     logger.debug("execute_task_graph_context_unavailable", error=str(exc))
             agent._current_context = agent_context
+            from app.core.valuation_inputs import MODELLING_AGENTS, shared_assumptions_note
+
+            if resolved_type in MODELLING_AGENTS and not input_only:
+                shared = shared_assumptions_note(upstream_results + sibling_results)
+                if shared:
+                    agent_context["shared_assumptions"] = shared
+                    task_description = task_description + "\n\n" + shared
             if input_only or resolved_type == "financial_analyst":
                 execution = agent.run(task_description, context=agent_context)
             else:
@@ -3580,7 +3737,7 @@ async def chat_execute_task(request: Request):
             "reasoning": result.reasoning,
             "confidence": result.confidence,
             "execution_time_ms": result.execution_time_ms,
-            "data": result.data,
+            "data": _with_tools_used(result),
             "provider": actual_provider,
             "used_fallback": used_fallback,
             "task_title": task_title,
