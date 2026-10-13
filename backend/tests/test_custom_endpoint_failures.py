@@ -10,6 +10,7 @@ from app.core.llm.gemini_client import OpenAIClient, looks_like_chat_failure
     "Sorry, something went wrong. Please try your request again.",
     "I encountered an error doing what you asked. Could you try again?",
     "I'm sorry, I can't help with that.",
+    "I'm having a hard time fulfilling your request right now. Please try again later.",
 ])
 def test_canned_chat_errors_are_recognised(text):
     assert looks_like_chat_failure(text)

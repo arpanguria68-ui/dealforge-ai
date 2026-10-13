@@ -294,7 +294,7 @@ Respond ONLY with the JSON, no other text.
 # replies that read like that are failures, never an answer to hand to the next stage.
 _CHAT_FAILURE = re.compile(
     r"(something went wrong|encountered an error|an error occurred|try (?:your request|again)|"
-    r"i(?:'m| am) (?:sorry|unable|having trouble)|can(?:'|no)t (?:help|assist) with that|"
+    r"i(?:'m| am) (?:sorry|unable|having (?:trouble|a hard time))|can(?:'|no)t (?:help|assist) with that|"
     r"unable to (?:process|complete|generate)|rate limit|too many requests)",
     re.IGNORECASE,
 )
