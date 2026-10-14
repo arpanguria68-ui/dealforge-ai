@@ -42,11 +42,12 @@ TOOL_GROUPS = [
     ('Outputs', ['build_document', 'generate_report', 'generate_ic_memo', 'generate_deal_deck', 'generate_meeting_memo']),
 ]
 NAV = [('index.html', 'Overview'), ('docs/product-tour.html', 'Product tour'), ('docs/architecture.html', 'Architecture'),
-       ('docs/agents.html', 'Agents'), ('docs/tools-and-data.html', 'Tools &amp; data'),
+       ('docs/agents.html', 'Agents'), ('docs/knowledge-and-rag.html', 'Knowledge &amp; RAG'), ('docs/tools-and-data.html', 'Tools &amp; data'),
        ('docs/quality-and-controls.html', 'Quality &amp; controls'), ('docs/reports.html', 'Reports'),
        ('docs/api.html', 'API'), ('docs/getting-started.html', 'Get started')]
 SIDE = [('Start here', [('docs/getting-started.html', 'Getting started'), ('docs/product-tour.html', 'Product tour')]),
         ('How it works', [('docs/architecture.html', 'Architecture'), ('docs/agents.html', 'Agent catalog'),
+                          ('docs/knowledge-and-rag.html', 'Knowledge &amp; RAG (PageIndex)'),
                           ('docs/tools-and-data.html', 'Tools &amp; data sources')]),
         ('Trust', [('docs/quality-and-controls.html', 'Quality &amp; controls'), ('docs/reports.html', 'Reports &amp; review gate')]),
         ('Reference', [('docs/api.html', 'API reference'), ('docs/status.html', 'Status &amp; limits')])]
@@ -204,7 +205,7 @@ def page_index():
         ('🛡️', 'It checks its own work', 'Memo figures are traced to recorded evidence, DCFs are compared across agents, broken DCF bridges are recomputed, and unusable model replies are rejected.'),
         ('📄', 'Word, PowerPoint, Excel, PDF', 'Edited reports (not agent dumps) with a football field, evidence tables, source register and a review gate: drafts stay drafts until a reviewer approves.'),
         ('📊', 'Pipeline dashboard', 'Valuation vs market EV, sourcing and tool-call counters, review flags and the exact reconciliation warnings, per deal.'),
-        ('🗂️', 'Knowledge base', 'Local tree-index RAG (no vector DB needed), hybrid BM25 + dense + tree search, and a deal knowledge graph that feeds the risk register.'),
+        ('🗂️', 'RAG with PageIndex', 'Deal documents become a section tree (no vector DB needed). Hybrid tree + BM25 + dense search, deal-scoped, with optional Laya rerank, plus a knowledge graph that feeds the risk register. <a href="docs/knowledge-and-rag.html">How it works</a>'),
         ('🔁', 'Any model, your keys', 'Local-first routing with cloud fallback, Gemini, Claude, OpenAI, Mistral, Groq, OpenRouter, NVIDIA, Vertex, Ollama, LM Studio or any OpenAI-compatible endpoint.'),
     ]
     cards = ''.join(f'<div class="card"><div class="ico">{i}</div><h3>{t}</h3><p>{d}</p></div>' for i, t, d in features)
@@ -535,6 +536,46 @@ def page_agents():
     write('docs/agents.html', shell('docs/agents.html', 'Agent catalog', body, 'All 29 DealForge AI agents with roles and tool allow-lists, generated from the code registry.'))
 
 
+def page_knowledge():
+    body = f"""
+<h1>Knowledge &amp; RAG (PageIndex)</h1>
+<p>Agents do not read whole files. Uploaded deal documents are turned into a <strong>section tree</strong> with <a href="https://github.com/VectifyAI/PageIndex">PageIndex</a> (vectorless, structure-based RAG), and a hybrid search combines three signals to pull the few passages an agent needs. No vector database is required.</p>
+<h2>Pipeline</h2>
+{flow([('Ingest', 'Documents arrive by upload (<code>/documents/upload</code>, bulk, URL, directory) or batch knowledge-base ingestion. PDF, Word, Markdown and plain text are indexed; the knowledge-base ingester also reads Excel and PowerPoint. Each document is tagged with its <code>deal_id</code>. Search queries are passed through the secret redaction used for briefs.'),
+         ('Build the tree', 'For PDFs and Markdown the PageIndex library builds a hierarchical table-of-contents tree with node summaries (an LLM does the summarising, so it needs a key). When the library is not installed or fails, a built-in structure-aware chunker takes over: paragraphs, then sentences, about 1500 characters per chunk with 200 characters of overlap, headings kept as node titles and section paths kept for citations.'),
+         ('Store locally', 'Trees are JSON files in a local storage directory with a catalog. <code>PAGEINDEX_MODE=local</code> (default) is self-hosted; <code>cloud</code> uses the VectifyAI API.'),
+         ('Search', 'A query is scored three ways and the rankings are fused (below). Results come back with excerpts, scores and metadata (document, section path, page).'),
+         ('Rerank (optional)', 'The Laya classifier can re-rank the fused top results in one batched pass. If Laya is off or fails, the fused order is kept.')])}
+<h2>Hybrid search</h2>
+{table(['Signal', 'What it is'], [
+        ['Tree', 'Keyword and entity scoring over the PageIndex tree nodes (titles, summaries, text)'],
+        ['BM25', 'Lexical ranking over the chunks'],
+        ['Dense', 'Cosine similarity of embeddings: <code>sentence-transformers</code> (<code>all-MiniLM-L6-v2</code>) when installed, otherwise hashed TF-IDF vectors from the standard library'],
+        ['Fusion', 'Three-way Reciprocal Rank Fusion. Weights are tunable with <code>RAG_W_TREE</code>, <code>RAG_W_BM25</code>, <code>RAG_W_DENSE</code> or in Settings'],
+        ['Rerank', '<code>RAG_LAYA_RERANK</code> (default on) re-scores the top <code>RAG_RERANK_N</code> (default 30); <code>RAG_DENSE=false</code> switches dense off'],
+    ])}
+<h2>How agents use it</h2>
+<ul>
+<li>The <code>document_search</code> tool and each agent's context retrieval query the index. Retrieval is <strong>scoped to the active deal</strong>; cross-deal memory is opt-in (for example for due diligence), so one deal's documents do not leak into another's analysis. A test enforces this.</li>
+<li>The orchestrator's retrieval node and the IC memo grounding use the retrieved passages as evidence.</li>
+<li>Clarification memory stores earlier questions and answers so the Scrum Master can ask better ones.</li>
+</ul>
+<h2>Deal knowledge graph</h2>
+<p>Separately from document RAG, agents write facts, entities and risks to a per-deal <strong>knowledge graph</strong> (SQLite by default, Neo4j optional via <code>KG_BACKEND</code>). Graph Q&amp;A reads the deal's current facts through a parameterised, read-only API and has the model answer only from those facts. It no longer lets the model write Cypher. The graph feeds the cross-agent risk register.</p>
+<h2>Endpoints</h2>
+{table(['Method', 'Path', 'Purpose'], [
+        ['<code>POST</code>', '<code>/api/v1/documents/upload</code>, <code>/upload/bulk</code>, <code>/url</code>, <code>/directory</code>', 'Index documents'],
+        ['<code>GET</code>', '<code>/api/v1/pageindex/documents</code>, <code>/pageindex/stats</code>', 'Inventory and statistics'],
+        ['<code>POST</code>', '<code>/api/v1/knowledge/ingest</code>', 'Batch-ingest a directory or the configured knowledge bases (admin token if enforced)'],
+        ['<code>GET</code>', '<code>/api/v1/knowledge/status</code>, <code>/knowledge/search?q=…</code>', 'Status and search'],
+        ['<code>GET</code>', '<code>/api/v1/deals/{{id}}/knowledge-graph</code>', 'Current graph facts for a deal'],
+    ])}
+<p>The <strong>Knowledge</strong> tab in the UI is the front end for the index: upload, list, delete and search.</p>
+<div class="note warn"><p><strong>Limits:</strong> the tree summaries need an LLM key when the PageIndex library is used. Tree scoring at query time is keyword-based, not an LLM walk of the tree. Dense retrieval falls back to hashed TF-IDF when <code>sentence-transformers</code> is not installed. Retrieval quality has not been benchmarked on a labelled question set.</p></div>
+"""
+    write('docs/knowledge-and-rag.html', shell('docs/knowledge-and-rag.html', 'Knowledge & RAG', body, 'How DealForge AI indexes deal documents with PageIndex and retrieves evidence with hybrid tree, BM25 and dense search.'))
+
+
 def page_tools():
     sections = ''
     for name, ids in TOOL_GROUPS:
@@ -765,6 +806,7 @@ if __name__ == '__main__':
     page_product_tour()
     page_architecture()
     page_agents()
+    page_knowledge()
     page_tools()
     page_quality()
     page_reports()
